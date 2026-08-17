@@ -420,7 +420,11 @@ fn transcript_derived_sessions(
 ///
 /// `now` is injected rather than read from a clock here, so that a liveness verdict is
 /// deterministic under test rather than depending on when the test happened to run.
-pub fn collect(world: &dyn World, now: SystemTime) -> Result<Snapshot, CollectError> {
+pub fn collect(
+    world: &dyn World,
+    now: SystemTime,
+    thresholds: &Thresholds,
+) -> Result<Snapshot, CollectError> {
     let observation = world.process_snapshot().map_err(CollectError::World)?;
 
     // Check the observation against itself before drawing any conclusion from it.
@@ -440,8 +444,6 @@ pub fn collect(world: &dyn World, now: SystemTime) -> Result<Snapshot, CollectEr
         claude_namespaces: world.recorded_namespaces(),
         codex_sessions: world.codex_sessions(),
     };
-
-    let thresholds = Thresholds::default();
 
     // Sessions from processes — discovered by scanning the process table.
     let process_sessions: Vec<Session> = observation
@@ -468,7 +470,7 @@ pub fn collect(world: &dyn World, now: SystemTime) -> Result<Snapshot, CollectEr
                     // over an untrustworthy one never gets this far.
                     snapshot_trustworthy: true,
                 },
-                &thresholds,
+                thresholds,
             );
 
             Some(Session {
@@ -490,7 +492,7 @@ pub fn collect(world: &dyn World, now: SystemTime) -> Result<Snapshot, CollectEr
         &observation,
         world,
         now,
-        &thresholds,
+        thresholds,
         &detectors,
     );
 

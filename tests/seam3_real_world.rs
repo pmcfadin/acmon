@@ -8,6 +8,7 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+use acmon::liveness::Thresholds;
 use acmon::workspace::NamespaceUnmatched;
 use acmon::world::{PathUnavailable, ResourceSource, ResourcesUnavailable, Unmeasured};
 use acmon::{collect, Identity, RealWorld, World};
@@ -43,7 +44,7 @@ fn the_real_process_table_contains_the_observing_process() {
 fn collection_over_the_real_machine_yields_only_recognised_clis() {
     let world = RealWorld::new();
 
-    let snapshot = collect(&world, SystemTime::now())
+    let snapshot = collect(&world, SystemTime::now(), &Thresholds::default())
         .expect("collection over the real machine should succeed");
 
     for session in &snapshot.sessions {
@@ -382,7 +383,7 @@ fn every_workspace_attribution_on_this_machine_is_true_in_both_directions() {
     // presented: a calm "no session here" for a workspace that had one.
     let world = RealWorld::new();
     let recorded = world.recorded_namespaces().expect("listable");
-    let snapshot = collect(&world, SystemTime::now())
+    let snapshot = collect(&world, SystemTime::now(), &Thresholds::default())
         .expect("collection over the real machine should succeed");
 
     for session in &snapshot.sessions {
@@ -672,7 +673,7 @@ fn no_session_may_be_stalled_while_its_process_is_resident() {
     // Invariant: a session with a resident process can be ACTIVE, WAITING, or UNKNOWN,
     // but never STALLED. STALLED requires the absence of a process, which is observable.
     let world = RealWorld::new();
-    let snapshot = collect(&world, SystemTime::now())
+    let snapshot = collect(&world, SystemTime::now(), &Thresholds::default())
         .expect("collection over the real machine should succeed");
 
     for session in &snapshot.sessions {
@@ -692,7 +693,7 @@ fn every_transcript_derived_session_has_process_resident_false() {
     // Invariant: a transcript-derived session exists precisely because its process is
     // gone. The liveness logic depends on this being false to reach the STALLED verdict.
     let world = RealWorld::new();
-    let snapshot = collect(&world, SystemTime::now())
+    let snapshot = collect(&world, SystemTime::now(), &Thresholds::default())
         .expect("collection over the real machine should succeed");
 
     // An empty result is legitimate — this machine may have no transcript-derived

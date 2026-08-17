@@ -150,6 +150,56 @@ impl Default for Thresholds {
     }
 }
 
+/// The environment variables that override the defaults.
+pub const QUIET_THRESHOLD_VARIABLE: &str = "ACMON_QUIET_SECONDS";
+pub const STALL_THRESHOLD_VARIABLE: &str = "ACMON_STALL_SECONDS";
+
+impl Thresholds {
+    /// Build thresholds from two optional textual values, falling back to the defaults.
+    ///
+    /// A value that is present but unreadable is an **error**, never a silent fall back to
+    /// the default. Someone who sets a threshold and gets the default anyway would be
+    /// reading verdicts produced by a rule they think they replaced — a plausible wrong
+    /// answer of exactly the kind this project exists to remove.
+    ///
+    /// Pure, so it can be tested without touching the process environment, which is global
+    /// and would make tests race each other.
+    pub fn from_values(quiet: Option<&str>, stall: Option<&str>) -> Result<Self, String> {
+        let defaults = Thresholds::default();
+        let parse = |value: Option<&str>, name: &str, fallback: Duration| match value {
+            None => Ok(fallback),
+            Some(text) => text
+                .trim()
+                .parse::<u64>()
+                .map(Duration::from_secs)
+                .map_err(|e| format!("{name} is {text:?}, which is not a number of seconds: {e}")),
+        };
+
+        let quiet = parse(quiet, QUIET_THRESHOLD_VARIABLE, defaults.quiet)?;
+        let stall = parse(stall, STALL_THRESHOLD_VARIABLE, defaults.stall)?;
+
+        // A stall threshold below the quiet one would make the states inconsistent: a
+        // session could be past "probably dead" while still inside "probably working".
+        if stall < quiet {
+            return Err(format!(
+                "{STALL_THRESHOLD_VARIABLE} ({}s) is below {QUIET_THRESHOLD_VARIABLE} ({}s), \
+                 which would put a session past stalled while still counting as active",
+                stall.as_secs(),
+                quiet.as_secs()
+            ));
+        }
+        Ok(Thresholds { quiet, stall })
+    }
+
+    /// Read the thresholds this machine is configured with.
+    pub fn from_environment() -> Result<Self, String> {
+        Thresholds::from_values(
+            std::env::var(QUIET_THRESHOLD_VARIABLE).ok().as_deref(),
+            std::env::var(STALL_THRESHOLD_VARIABLE).ok().as_deref(),
+        )
+    }
+}
+
 /// The observations needed to classify a session's liveness.
 ///
 /// Everything is an argument — no clocks, no I/O, no process enumeration happens here. The
@@ -193,14 +243,16 @@ pub struct Observation {
 /// | otherwise | UNKNOWN | process absent before stall threshold |
 pub fn classify(observation: &Observation, thresholds: &Thresholds) -> Verdict {
     // Row 1: If we cannot tell how long the transcript has been silent, we know nothing.
-    if observation.silence.is_none() {
+    //
+    // Bound here rather than checked and unwrapped separately: the row order below is
+    // load-bearing, and a separate unwrap would become a panic the moment someone inserted
+    // a row between the check and the use.
+    let Some(silence) = observation.silence else {
         return Verdict {
             state: State::Unknown,
             method: Method::TranscriptActivityUnknown,
         };
-    }
-
-    let silence = observation.silence.unwrap();
+    };
 
     // Row 2: If the snapshot is untrustworthy and the process is not resident, we cannot
     // conclude that the process is absent — it might have been missed by the enumeration.

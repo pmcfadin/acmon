@@ -330,3 +330,60 @@ fn default_stall_threshold_exceeds_measured_maximum_silence_followed_by_resumpti
         thresholds.stall
     );
 }
+
+#[test]
+fn thresholds_come_from_configuration_when_it_is_given() {
+    let configured = Thresholds::from_values(Some("60"), Some("7200"))
+        .expect("two readable values are a valid configuration");
+
+    assert_eq!(configured.quiet, Duration::from_secs(60));
+    assert_eq!(configured.stall, Duration::from_secs(7_200));
+}
+
+#[test]
+fn an_unset_threshold_falls_back_to_the_measured_default() {
+    let defaults = Thresholds::default();
+
+    assert_eq!(
+        Thresholds::from_values(None, None),
+        Ok(defaults),
+        "configuring nothing must give exactly the documented defaults"
+    );
+    assert_eq!(
+        Thresholds::from_values(Some("60"), None)
+            .expect("valid")
+            .stall,
+        defaults.stall,
+        "configuring one threshold must not disturb the other"
+    );
+}
+
+#[test]
+fn a_threshold_that_cannot_be_read_is_refused_rather_than_ignored() {
+    // The failure that matters. Silently falling back would hand someone verdicts
+    // produced by the rule they thought they had replaced — right-looking, and wrong.
+    for bad in ["", "ten", "10m", "-5", "1.5", "  "] {
+        assert!(
+            Thresholds::from_values(Some(bad), None).is_err(),
+            "{bad:?} is not a number of seconds and must be refused, not ignored"
+        );
+        assert!(
+            Thresholds::from_values(None, Some(bad)).is_err(),
+            "{bad:?} must be refused for the stall threshold too"
+        );
+    }
+}
+
+#[test]
+fn a_stall_threshold_below_the_quiet_one_is_refused() {
+    // The states would contradict each other: a session could be past "probably dead"
+    // while still inside "recently active".
+    let inverted = Thresholds::from_values(Some("600"), Some("60"));
+
+    assert!(
+        inverted.is_err(),
+        "an inverted pair must be refused, got {inverted:?}"
+    );
+    // Equal is not inverted, and is allowed.
+    assert!(Thresholds::from_values(Some("600"), Some("600")).is_ok());
+}
