@@ -4,7 +4,7 @@
 //! `proc_pidpath`. Nothing is invented: the executable paths, the version-string
 //! basenames, and the near-miss processes all occurred.
 
-use acmon::{collect, ProcessRecord, ProcessSnapshot, World, WorldError};
+use acmon::{collect, CollectError, ProcessRecord, ProcessSnapshot, World, WorldError};
 
 struct FakeWorld {
     snapshot: Result<ProcessSnapshot, WorldError>,
@@ -81,4 +81,38 @@ fn lists_every_live_claude_session() {
         snapshot.sessions.iter().all(|s| s.cli == "claude"),
         "ticket #2 recognises only Claude; Codex arrives in #5"
     );
+}
+
+#[test]
+fn a_snapshot_missing_its_own_observer_is_a_failure_not_an_idle_machine() {
+    // The enumeration died part-way, so the observer is absent from its own results.
+    // Nine Claude sessions are genuinely running, but this snapshot cannot see them.
+    let truncated: Vec<ProcessRecord> = captured_process_table()
+        .into_iter()
+        .filter(|r| r.pid != 99999)
+        .collect();
+    let world = FakeWorld::with(truncated, 99999);
+
+    let result = collect(&world);
+
+    assert!(
+        matches!(result, Err(CollectError::UntrustworthySnapshot { .. })),
+        "a snapshot lacking its own observer must be rejected, not reported as \
+         a machine with no sessions; got {result:?}"
+    );
+}
+
+#[test]
+fn a_machine_with_no_agent_sessions_reports_zero_rather_than_failing() {
+    // The observer is present, so the snapshot is trustworthy. It simply contains no
+    // agent CLI. That must be reported as zero sessions, not as an error — otherwise
+    // "nothing running" and "cannot tell" collapse into the same answer.
+    let world = FakeWorld::with(
+        vec![rec(99999, "/Users/pmcfadin/projects/acmon/target/debug/acmon")],
+        99999,
+    );
+
+    let snapshot = collect(&world).expect("a trustworthy but empty snapshot is not an error");
+
+    assert_eq!(snapshot.sessions.len(), 0);
 }

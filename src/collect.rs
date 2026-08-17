@@ -20,11 +20,24 @@ pub struct Snapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CollectError {
     World(WorldError),
+    /// The process enumeration did not contain the process that produced it, so it
+    /// died part-way. Its contents prove nothing — in particular, the absence of
+    /// sessions in it does not mean there are none.
+    UntrustworthySnapshot { observer_pid: i32 },
 }
 
 /// Collect a snapshot of the agent sessions on this machine.
 pub fn collect(world: &dyn World) -> Result<Snapshot, CollectError> {
     let observation = world.process_snapshot().map_err(CollectError::World)?;
+
+    // Check the observation against itself before drawing any conclusion from it.
+    // Reasoning from absence is only safe once we know we could see anything at all.
+    if !observation.contains_observer() {
+        return Err(CollectError::UntrustworthySnapshot {
+            observer_pid: observation.observer_pid,
+        });
+    }
+
     let detectors = embedded_detectors();
 
     let mut sessions: Vec<Session> = observation

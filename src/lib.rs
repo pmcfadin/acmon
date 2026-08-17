@@ -2,6 +2,7 @@
 
 pub mod collect;
 pub mod detect;
+pub mod render;
 pub mod world;
 
 pub use collect::{collect, CollectError, Session, Snapshot};
