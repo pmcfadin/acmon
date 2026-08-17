@@ -10,4 +10,5 @@ id = "claude"
 # The executable's basename is a version string (e.g. "2.1.233"), so the identity
 # lives in the containing path, not the filename. Observed:
 #   /Users/<user>/.local/share/claude/versions/2.1.233
-exe_contains = ["/claude/versions/"]
+#   /Users/<user>/.claude/security/agent-sdk-venv/lib/python3.14/site-packages/claude_agent_sdk/_bundled/claude
+exe_contains = ["/claude/versions/", "/claude_agent_sdk/_bundled/claude"]
