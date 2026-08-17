@@ -406,7 +406,7 @@ per-subagent tokens and duration.
 | Orphaned children escape accounting | Per-session CPU understated by an unknown margin | Measure the rate; state the limitation in output |
 | Falcon unmeasurable | Attribution covers only the visible portion | Say so explicitly wherever shares are shown |
 | Commit→Turn linkage is timestamp-based | Outcome attribution is approximate | Ship session-level first (exact); flag turn-level as estimated |
-| Cost/MB measured 4.4x above the prior model | Findings could mis-price the tax | Multiple runs; report residuals; never a single model |
+| ~~Cost/MB 4.4x above the prior model~~ **was my arithmetic error** | Slope reproduces (~10 ms/MB); fixed cost doubled to ~131 ms | Tax is driven by exec *count*, not binary size. Report residuals; never a single model |
 | OTel schema is undocumented and may change | v3 breaks on a Claude Code update | Version-tag ingest; degrade to UNKNOWN on unknown fields |
 | Codex has no telemetry | Turn-level data is Claude-only | Git outcomes cover Codex retrospectively |
 | Dev-loop exec tax on this repo | Every `cargo build` is a fresh inode | Apply the project's own discipline; never reflexive `cargo clean` |

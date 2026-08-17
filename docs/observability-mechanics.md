@@ -575,15 +575,35 @@ Three caveats, all load-bearing:
    seconds. The authorization *decision* still serializes, which is why 12 parallel
    cold execs yield only 1.25x.
 
-### Cost per MB — a second correction
+### Cost per MB — the slope holds, the fixed cost doubled
 
-This burst measured **38.1 ms/MB** (4.72 s of overhead across 124 MB), against the
-8.6 ms/MB in `process_changes_for_perf.md` — **4.4x worse**. The documented model
-predicted 132 ms for a 6.19 MB binary; the measured median was 193.6 ms.
+An earlier version of this section claimed **38.1 ms/MB**, "4.4x worse than
+documented". **That was an arithmetic error**: it divided total burst overhead
+(4.72 s) by total bytes presented (124 MB), which attributes per-exec *fixed* cost to
+file *size*. Most of that overhead was fixed cost paid 20 times, not size sensitivity.
 
-Either the original slope was fitted over a range dominated by very large files, or
-the stack has become more expensive. Combined with the intercept ambiguity above,
-treat any single linear model as a rough guide and always report residuals.
+Two clean measurements, each a median of repeated trials at low load:
+
+| Binary | Size | Cold exec | Warm exec |
+| --- | --- | --- | --- |
+| stripped Rust release binary | 0.49 MB | 136.4 ms | 4.8 ms |
+| copy of `rg` | 6.19 MB | 193.6 ms | 5.1 ms |
+
+Fitting those two points: **≈131 ms fixed + ≈10.0 ms/MB.**
+
+Compared with the 79 ms + 8.6 ms/MB in `process_changes_for_perf.md`, the **slope
+reproduces well** (10.0 vs 8.6) while the **fixed cost has roughly doubled**
+(131 vs 79). Note also that a 12.6x increase in size bought only a 1.4x increase in
+cost, which is what a dominant fixed term looks like.
+
+**This changes the practical conclusion.** The tax is dominated by *how many times you
+exec*, not by *how large the binary is*. That strengthens the case against
+write-then-run scripts (each is a fresh inode paying full fixed cost regardless of
+size) and further weakens the argument for a process-per-test runner, which multiplies
+exec count while leaving binary count unchanged.
+
+Two points is still a two-point fit. Report coefficients with residuals, and keep
+"measured floor" and "regression intercept" distinct (see above).
 
 ### Methodology trap: verify exit codes
 
@@ -668,8 +688,8 @@ __PAGEZERO` and **no `__DWARF`** — debug info is already split.
 | Do `hook_execution_*` events carry a duration? | Would price the 12 registered hook events directly | Attributes seen, duration not confirmed |
 | Does commit→turn timestamp correlation work in practice? | Turn-level outcome attribution depends on it (§3.5) | Untested |
 | Did a commit survive (revert / squash / rebase)? | "Committed" is output, not success | Not designed |
-| Why is cost/MB 38.1 rather than 8.6? | 4.4x discrepancy against the prior model (§6) | Unexplained; single run |
-| Rust release binary size and its own cold-exec cost | The tool would pay the tax it measures | Not run |
+| ~~Why is cost/MB 38.1 rather than 8.6?~~ | Was a discrepancy against the prior model | **RESOLVED: arithmetic error on my part.** Slope is ~10.0 ms/MB (close to 8.6); the *fixed* cost doubled to ~131 ms |
+| ~~Rust release binary size and its own cold-exec cost~~ | The tool pays the tax it measures | **RESOLVED:** stripped release binary 0.49 MB, cold 136.4 ms vs warm 4.8 ms (28.6x). Paid once per released version |
 | Why does `mcp_server_connection` take 73 s? | Observed once; a 73 s startup stall is worth explaining | Unexplained |
 
 ---
