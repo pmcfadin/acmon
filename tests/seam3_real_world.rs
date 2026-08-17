@@ -353,7 +353,10 @@ fn the_recorded_namespaces_on_this_machine_are_listable_and_hold_no_underscores(
     assert!(
         recorded.iter().all(|n| !n.contains('_')),
         "a recorded namespace contains an underscore, which contradicts the mapping rule: {:?}",
-        recorded.iter().filter(|n| n.contains('_')).collect::<Vec<_>>()
+        recorded
+            .iter()
+            .filter(|n| n.contains('_'))
+            .collect::<Vec<_>>()
     );
 }
 
