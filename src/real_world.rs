@@ -271,10 +271,16 @@ fn recently_active_codex_ids(index: &std::path::Path, now: i64) -> Result<Vec<St
 
 /// Find the transcript file for each wanted id, reading directory entries only.
 ///
-/// Descends newest date directory first and stops as soon as every wanted id is found,
-/// so in practice this touches one or two directories. An id with no file is simply
-/// absent from the result: the index outlives the transcripts it points at, and that is
-/// not an error.
+/// No transcript is opened here, so the store's contents are never scanned — but be
+/// precise about what bounds the walk, because it is not the recency window. The walk
+/// stops when every wanted id has been found, and descends the newest date directory
+/// first, so a session updated recently is normally found in the first directory or two.
+/// The pathological case is a session created long ago and updated today: its file lives
+/// in its *creation* date's directory (§4.4), so reaching it means descending past the
+/// newer ones. An id with no file at all is the worst case, since nothing can satisfy it
+/// and the remaining directories are all visited; that is bounded by the number of date
+/// directories, and such an id is simply absent from the result rather than an error,
+/// because the index outlives the transcripts it points at.
 fn locate_codex_transcripts(
     sessions: &std::path::Path,
     wanted: &[String],
@@ -314,12 +320,36 @@ fn locate_codex_transcripts(
 
 /// Read a Codex session's workspace from the first record of its transcript.
 ///
-/// Exactly one line is read, and exactly one field is taken from it. The record type is
-/// checked first: if the first line is not the metadata record, this is an error rather
-/// than an attempt to look further into a file that holds conversation content.
+/// Exactly one line is read from the file, and [`workspace_from_first_record`] takes
+/// exactly one field from it.
 fn read_codex_workspace(path: &std::path::Path) -> Result<String, String> {
     use std::io::BufRead;
 
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut first_line = String::new();
+    std::io::BufReader::new(file)
+        .read_line(&mut first_line)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+
+    workspace_from_first_record(&first_line).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Take the workspace out of a Codex transcript's first record.
+///
+/// The record type is checked first: if this is not the metadata record then something is
+/// wrong with the file, and the answer is an error rather than looking further into a file
+/// whose later records hold conversation.
+///
+/// **On what is unavoidably read.** The first record is a single JSON object, and one of
+/// its sibling fields is `base_instructions` — the model's system prompt. Reaching `cwd`
+/// means streaming past that field, because JSON has no index and, as observed, the
+/// fields are ordered alphabetically so `base_instructions` comes first. What *is*
+/// controlled: only `cwd` and `type` are deserialised, so nothing else is ever
+/// materialised as a value; the record is dropped at the end of this function; and no
+/// error path can quote a field this does not deserialise, which is asserted by a test
+/// rather than merely intended. Conversation records — the turns themselves — are never
+/// read at all, since only the first line is ever fetched.
+fn workspace_from_first_record(line: &str) -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct FirstRecord {
         r#type: String,
@@ -330,23 +360,16 @@ fn read_codex_workspace(path: &std::path::Path) -> Result<String, String> {
         cwd: String,
     }
 
-    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut first_line = String::new();
-    std::io::BufReader::new(file)
-        .read_line(&mut first_line)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-
-    let record: FirstRecord = serde_json::from_str(&first_line)
-        .map_err(|e| format!("{}: first record is not readable: {e}", path.display()))?;
+    let record: FirstRecord =
+        serde_json::from_str(line).map_err(|e| format!("first record is not readable: {e}"))?;
     if record.r#type != "session_meta" {
         return Err(format!(
-            "{}: first record is {:?}, not session_meta",
-            path.display(),
+            "first record is {:?}, not session_meta",
             record.r#type
         ));
     }
     if record.payload.cwd.is_empty() {
-        return Err(format!("{}: session_meta records no cwd", path.display()));
+        return Err("session_meta records no cwd".to_string());
     }
     Ok(record.payload.cwd)
 }
@@ -500,7 +523,58 @@ impl World for RealWorld {
 /// exists to eliminate, so it is tested where it lives.
 #[cfg(test)]
 mod tests {
-    use super::parse_ps_cpu_time;
+    use super::{parse_ps_cpu_time, workspace_from_first_record};
+
+    /// A first record shaped like the real thing, including the sibling field that holds
+    /// the model's system prompt. The marker text stands in for it.
+    fn first_record_with(cwd: &str, secret: &str) -> String {
+        format!(
+            r#"{{"type":"session_meta","payload":{{"base_instructions":"{secret}",
+               "cli_version":"1.2.3","cwd":{cwd},"originator":"cli"}},
+               "timestamp":"2026-08-17T10:30:46Z"}}"#
+        )
+    }
+
+    #[test]
+    fn takes_the_workspace_and_leaves_everything_else() {
+        let record = first_record_with(
+            "\"/Users/pmcfadin/Documents/Codex/2026-08-17/he\"",
+            "SENSITIVE-SYSTEM-PROMPT",
+        );
+
+        assert_eq!(
+            workspace_from_first_record(&record),
+            Ok("/Users/pmcfadin/Documents/Codex/2026-08-17/he".to_string())
+        );
+    }
+
+    #[test]
+    fn no_error_message_can_quote_a_field_this_does_not_deserialise() {
+        // The sharp end of "no conversation content is read, stored, or displayed".
+        // Reaching cwd means streaming past base_instructions, so the guarantee that
+        // matters is that no failure path can ever echo it outward. serde's type errors
+        // do quote offending values, so this is asserted rather than assumed.
+        const SECRET: &str = "SENSITIVE-SYSTEM-PROMPT";
+        let malformed = [
+            // cwd of the wrong type: the error quotes the value it found.
+            first_record_with("12345", SECRET),
+            // cwd absent entirely.
+            format!(r#"{{"type":"session_meta","payload":{{"base_instructions":"{SECRET}"}}}}"#),
+            // not the metadata record at all.
+            format!(r#"{{"type":"response_item","payload":{{"base_instructions":"{SECRET}"}}}}"#),
+            // truncated JSON, as a half-written line would be.
+            format!(r#"{{"type":"session_meta","payload":{{"base_instructions":"{SECRET}"#),
+        ];
+
+        for record in malformed {
+            let error = workspace_from_first_record(&record)
+                .expect_err("each of these records is unusable");
+            assert!(
+                !error.contains(SECRET),
+                "an error message leaked a field that is never deserialised: {error}"
+            );
+        }
+    }
 
     /// Expected values are worked out by hand, not recomputed the way the parser does.
     /// The first two inputs are real `ps` output captured from this machine.

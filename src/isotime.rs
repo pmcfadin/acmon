@@ -32,7 +32,11 @@ pub fn unix_seconds_from_iso8601(text: &str) -> Result<i64, String> {
     let minute: i64 = minute.parse().map_err(|_| malformed())?;
     let second: i64 = second.parse().map_err(|_| malformed())?;
 
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    // Days per month, not merely 1..=31. `days_from_civil` below shifts the year to start
+    // in March, so an impossible day rolls silently into the next month: 31 February
+    // becomes 3 March, two days adrift. That is a plausible wrong time rather than an
+    // error, and two days is more than enough to cross a recency threshold.
+    if !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) {
         return Err(malformed());
     }
     if hour > 23 || minute > 59 || second > 60 {
@@ -40,6 +44,25 @@ pub fn unix_seconds_from_iso8601(text: &str) -> Result<i64, String> {
     }
 
     Ok(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// How many days a month has, in a given year.
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        // Not a month. The caller checks the range too, so this is unreachable; zero is
+        // the safe answer because it makes every day of it invalid.
+        _ => 0,
+    }
+}
+
+/// The Gregorian rule in full: every fourth year, except centuries, except every fourth
+/// century. Getting the exceptions wrong shifts a date by a day for a whole century.
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 /// Days since 1970-01-01 for a proleptic Gregorian date.
@@ -69,6 +92,11 @@ mod tests {
             ("2026-08-17T17:31:42Z", 1_786_987_902),
             // A leap day, which is where hand-rolled date arithmetic usually breaks.
             ("2024-02-29T12:00:00Z", 1_709_208_000),
+            // 2000 was a leap year despite being a century, because it divides by 400.
+            // A rule that only excluded centuries would reject this valid date.
+            ("2000-02-29T12:00:00Z", 951_825_600),
+            // 2100 is not a leap year, so the day after 28 February is 1 March.
+            ("2100-03-01T00:00:00Z", 4_107_542_400),
             ("1970-01-01T00:00:00Z", 0),
         ];
 
@@ -90,6 +118,16 @@ mod tests {
             "2026-08-32T00:00:00Z",      // day 32
             "2026-08-17T25:00:00Z",      // hour 25
             "not-a-date",
+            // Days that do not exist in their month. Each of these would otherwise roll
+            // forward into the next month and come back as a plausible time: 31 February
+            // 2026 as 3 March, and 29 February 2026 as 1 March, both days adrift.
+            "2026-02-31T12:00:00Z",
+            "2026-02-29T12:00:00Z", // 2026 is not a leap year
+            "2026-04-31T12:00:00Z",
+            "2026-06-31T12:00:00Z",
+            "2026-09-31T12:00:00Z",
+            "2026-11-31T12:00:00Z",
+            "1900-02-29T12:00:00Z", // a century that is not a leap year
         ] {
             assert!(
                 unix_seconds_from_iso8601(input).is_err(),
