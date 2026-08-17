@@ -4,10 +4,17 @@
 //! `proc_pidpath`. Nothing is invented: the executable paths, the version-string
 //! basenames, and the near-miss processes all occurred.
 
+use std::collections::HashMap;
+use std::time::Duration;
+
+use acmon::world::{ResourceSource, Resources, ResourcesUnavailable, Unmeasured};
 use acmon::{collect, CollectError, ProcessRecord, ProcessSnapshot, World, WorldError};
 
 struct FakeWorld {
     snapshot: Result<ProcessSnapshot, WorldError>,
+    /// Per-pid resource readings. A pid with no entry gets [`measured_ledger`], so a
+    /// test only has to state the readings it actually asserts on.
+    ledgers: HashMap<i32, Result<Resources, ResourcesUnavailable>>,
 }
 
 impl FakeWorld {
@@ -17,13 +24,47 @@ impl FakeWorld {
                 records,
                 observer_pid,
             }),
+            ledgers: HashMap::new(),
         }
     }
 
     fn with_error(error: WorldError) -> Self {
         FakeWorld {
             snapshot: Err(error),
+            ledgers: HashMap::new(),
         }
+    }
+
+    fn ledger(mut self, pid: i32, reading: Result<Resources, ResourcesUnavailable>) -> Self {
+        self.ledgers.insert(pid, reading);
+        self
+    }
+}
+
+/// The ledger of session 69046, measured and recorded in
+/// `docs/observability-mechanics.md` §2.6 — real numbers from a real session, including
+/// the 19.4x child-to-own CPU ratio that motivates this ticket.
+fn measured_ledger() -> Resources {
+    Resources {
+        source: ResourceSource::Rusage,
+        own_cpu: Ok(Duration::from_secs(1_669)),
+        children_cpu: Ok(Duration::from_secs(32_317)),
+        current_memory: Ok(482_000_000),
+        peak_memory: Ok(622_000_000),
+        bytes_written: Ok(166_000_000),
+    }
+}
+
+/// The ledger of session 264 from the same table — the opposite shape, a session that
+/// does most of its work itself.
+fn measured_ledger_of_a_session_that_delegates_little() -> Resources {
+    Resources {
+        source: ResourceSource::Rusage,
+        own_cpu: Ok(Duration::from_secs(637)),
+        children_cpu: Ok(Duration::from_secs(101)),
+        current_memory: Ok(419_000_000),
+        peak_memory: Ok(587_000_000),
+        bytes_written: Ok(34_000_000),
     }
 }
 
@@ -35,6 +76,13 @@ impl World for FakeWorld {
 
     fn process_snapshot(&self) -> Result<ProcessSnapshot, WorldError> {
         self.snapshot.clone()
+    }
+
+    fn resources(&self, pid: i32) -> Result<Resources, ResourcesUnavailable> {
+        self.ledgers
+            .get(&pid)
+            .cloned()
+            .unwrap_or_else(|| Ok(measured_ledger()))
     }
 }
 
@@ -173,6 +221,118 @@ fn processes_with_unreadable_paths_are_excluded_but_reason_is_recorded() {
     assert!(
         unreadable_record.exe_path.is_err(),
         "an unreadable path must be Err with a reason, not None"
+    );
+}
+
+#[test]
+fn each_session_carries_the_readings_of_its_own_pid() {
+    // Two sessions of opposite shape. The point is not that the numbers arrive but
+    // that they arrive on the right row: a monitor that reads the ledger of one pid
+    // and prints it against another is worse than one that prints nothing.
+    let world = FakeWorld::with(
+        vec![
+            rec(
+                69046,
+                "/Users/pmcfadin/.local/share/claude/versions/2.1.233",
+            ),
+            rec(264, "/Users/pmcfadin/.local/share/claude/versions/2.1.233"),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .ledger(69046, Ok(measured_ledger()))
+    .ledger(
+        264,
+        Ok(measured_ledger_of_a_session_that_delegates_little()),
+    );
+
+    let snapshot = collect(&world).expect("collection should succeed");
+
+    let heavy_delegator = snapshot
+        .sessions
+        .iter()
+        .find(|s| s.pid == 69046)
+        .expect("session 69046");
+    let self_worker = snapshot
+        .sessions
+        .iter()
+        .find(|s| s.pid == 264)
+        .expect("session 264");
+
+    assert_eq!(
+        heavy_delegator.resources.as_ref().unwrap().children_cpu,
+        Ok(Duration::from_secs(32_317))
+    );
+    assert_eq!(
+        self_worker.resources.as_ref().unwrap().children_cpu,
+        Ok(Duration::from_secs(101))
+    );
+}
+
+#[test]
+fn a_session_whose_ledger_cannot_be_read_is_still_listed_with_a_reason() {
+    // The session was detected, so it exists and must appear. What must not happen is
+    // that it silently vanishes from the table, or appears with zeroes — an idle
+    // session and an unreadable one would then look identical.
+    let world = FakeWorld::with(
+        vec![
+            rec(
+                69046,
+                "/Users/pmcfadin/.local/share/claude/versions/2.1.233",
+            ),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .ledger(69046, Err(ResourcesUnavailable::ProcessExited));
+
+    let snapshot = collect(&world).expect("collection should succeed");
+
+    assert_eq!(
+        snapshot.sessions.len(),
+        1,
+        "the session must still be listed"
+    );
+    assert_eq!(
+        snapshot.sessions[0].resources,
+        Err(ResourcesUnavailable::ProcessExited)
+    );
+}
+
+#[test]
+fn a_coarser_reading_keeps_what_it_has_and_says_why_the_rest_is_missing() {
+    // The fallback source for a process owned by another user reports cumulative own
+    // CPU and resident size, and nothing else. The figures it cannot see must carry
+    // that as their reason rather than defaulting to zero, which would report a
+    // process with busy children as having none.
+    let coarse = Resources {
+        source: ResourceSource::Ps,
+        own_cpu: Ok(Duration::from_secs(42)),
+        children_cpu: Err(Unmeasured::NotReportedBy(ResourceSource::Ps)),
+        current_memory: Ok(12_000_000),
+        peak_memory: Err(Unmeasured::NotReportedBy(ResourceSource::Ps)),
+        bytes_written: Err(Unmeasured::NotReportedBy(ResourceSource::Ps)),
+    };
+    let world = FakeWorld::with(
+        vec![
+            rec(
+                69046,
+                "/Users/pmcfadin/.local/share/claude/versions/2.1.233",
+            ),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .ledger(69046, Ok(coarse));
+
+    let snapshot = collect(&world).expect("collection should succeed");
+    let reading = snapshot.sessions[0].resources.as_ref().unwrap();
+
+    assert_eq!(reading.own_cpu, Ok(Duration::from_secs(42)));
+    assert_eq!(
+        reading.children_cpu,
+        Err(Unmeasured::NotReportedBy(ResourceSource::Ps)),
+        "an unreadable child total must state its reason, never read as zero"
     );
 }
 

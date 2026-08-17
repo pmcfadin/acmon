@@ -1,7 +1,7 @@
 //! Seam 1 — turning an observation of the world into a snapshot.
 
 use crate::detect::embedded_detectors;
-use crate::world::{World, WorldError};
+use crate::world::{Resources, ResourcesUnavailable, World, WorldError};
 
 /// One agent CLI process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,6 +9,11 @@ pub struct Session {
     pub pid: i32,
     /// Which CLI this is, taken from the detector that matched.
     pub cli: String,
+    /// What this session has consumed, or why that could not be read.
+    ///
+    /// A session with an unreadable ledger is still a session, and is still listed. It
+    /// is never dropped and never shown as idle.
+    pub resources: Result<Resources, ResourcesUnavailable>,
 }
 
 /// Everything observed in one collection.
@@ -75,6 +80,7 @@ pub fn collect(world: &dyn World) -> Result<Snapshot, CollectError> {
             Some(Session {
                 pid: record.pid,
                 cli: detector.id.clone(),
+                resources: world.resources(record.pid),
             })
         })
         .collect();

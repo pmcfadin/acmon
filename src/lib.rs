@@ -2,6 +2,7 @@
 
 pub mod collect;
 pub mod detect;
+pub mod machtime;
 pub mod real_world;
 pub mod render;
 pub mod world;

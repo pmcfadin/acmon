@@ -7,8 +7,9 @@ fn main() -> ExitCode {
 
     match collect(&world) {
         Ok(snapshot) => {
-            let height = render::required_height(&snapshot);
-            for line in render::render_to_lines(&snapshot, world.output_width(), height) {
+            let width = world.output_width();
+            let height = render::required_height(&snapshot, width);
+            for line in render::render_to_lines(&snapshot, width, height) {
                 println!("{line}");
             }
             ExitCode::SUCCESS

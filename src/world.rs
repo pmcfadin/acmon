@@ -47,6 +47,104 @@ impl ProcessSnapshot {
     }
 }
 
+/// Which reader produced a set of figures.
+///
+/// The source is part of the reading, not a detail behind it: the two readers do not
+/// measure the same thing, and only one of them can see a process's children at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceSource {
+    /// `proc_pid_rusage()` — the full ledger, own and children, for processes owned by
+    /// the calling user.
+    Rusage,
+    /// `ps(1)` — cumulative own CPU and resident size, and nothing else. The fallback
+    /// for processes owned by another user, where the full ledger is refused without
+    /// elevated privileges.
+    Ps,
+}
+
+impl std::fmt::Display for ResourceSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResourceSource::Rusage => write!(f, "proc_pid_rusage"),
+            ResourceSource::Ps => write!(f, "ps"),
+        }
+    }
+}
+
+/// Why one figure within a reading is missing.
+///
+/// Rendered in place of the number, so each variant has to be true and has to be short.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unmeasured {
+    /// The reader that answered does not report this figure at all.
+    NotReportedBy(ResourceSource),
+    /// The process exited before this figure could be read.
+    ProcessExited,
+    /// The process is alive, but this figure is not readable by this user.
+    PermissionDenied,
+}
+
+impl std::fmt::Display for Unmeasured {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unmeasured::NotReportedBy(ResourceSource::Ps) => write!(f, "ps-blind"),
+            Unmeasured::NotReportedBy(ResourceSource::Rusage) => write!(f, "unreported"),
+            Unmeasured::ProcessExited => write!(f, "exited"),
+            Unmeasured::PermissionDenied => write!(f, "no-perm"),
+        }
+    }
+}
+
+/// One process's resource ledger, as far as it could be read.
+///
+/// Each figure is separately present-or-absent because the fallback reader supplies
+/// only some of them. An absent figure carries a reason; none of them defaults to zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resources {
+    /// Which reader answered, and therefore what could have been seen at all.
+    pub source: ResourceSource,
+    /// CPU consumed by this process itself, user plus system.
+    ///
+    /// For an agent session this is reasoning and orchestration — not the builds, tests
+    /// and hooks it launches, which land in [`Resources::children_cpu`].
+    pub own_cpu: Result<std::time::Duration, Unmeasured>,
+    /// CPU consumed by children this process has reaped, recursively — grandchildren
+    /// included.
+    ///
+    /// **A floor, never a total.** Work that detached or was orphaned before being
+    /// reaped never enters the ledger, so the true figure is this or more. See
+    /// `docs/observability-mechanics.md` §2.4.
+    pub children_cpu: Result<std::time::Duration, Unmeasured>,
+    /// Current physical footprint, in bytes. A point sample, not a cumulative counter.
+    pub current_memory: Result<u64, Unmeasured>,
+    /// Largest physical footprint reached in this process's lifetime, in bytes.
+    pub peak_memory: Result<u64, Unmeasured>,
+    /// Bytes written to disk over this process's lifetime.
+    pub bytes_written: Result<u64, Unmeasured>,
+}
+
+/// Why no figure at all could be read for a process.
+///
+/// Distinct from a [`Resources`] full of [`Unmeasured`] fields: that says the reading
+/// happened and was partial, this says no reading happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourcesUnavailable {
+    /// The process exited between being listed and being read. Confirmed, not assumed.
+    ProcessExited,
+    /// The process is alive, but every available reader refused or failed. Carries what
+    /// the readers said, so the reason is reportable rather than merely categorised.
+    AllReadersFailed(String),
+}
+
+impl std::fmt::Display for ResourcesUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResourcesUnavailable::ProcessExited => write!(f, "exited"),
+            ResourcesUnavailable::AllReadersFailed(_) => write!(f, "unreadable"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorldError {
     /// The process table could not be enumerated at all.
@@ -80,6 +178,17 @@ pub trait World {
     /// is true rather than assuming, because a confidently wrong reason is worse than
     /// an admitted unknown.
     fn process_snapshot(&self) -> Result<ProcessSnapshot, WorldError>;
+
+    /// Read one process's resource ledger.
+    ///
+    /// Separate from [`World::process_snapshot`] because it is asked only about the
+    /// processes that turned out to matter, and because a pid can exit in between —
+    /// which is a reportable state, not an error to swallow.
+    ///
+    /// Implementations MUST prefer the reader that can see children, and fall back to a
+    /// coarser one only when the full ledger is refused. A figure the answering reader
+    /// cannot supply is [`Unmeasured::NotReportedBy`], never zero.
+    fn resources(&self, pid: i32) -> Result<Resources, ResourcesUnavailable>;
 
     /// The width available for output, in columns.
     ///
