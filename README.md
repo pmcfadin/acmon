@@ -1,4 +1,4 @@
-# agentic_coding_monitor
+# acmon
 
 Measuring what AI coding agents actually cost on a managed macOS developer machine —
 and how much of that cost is the machine's fault rather than the work's.

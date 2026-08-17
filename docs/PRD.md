@@ -2,7 +2,7 @@
 
 **Status:** Draft for review
 **Date:** 2026-08-16
-**Working name:** `acmon` (**undecided** — needed for the binary, crate, and Homebrew formula)
+**Name:** `acmon` — the binary, the crate, and the eventual Homebrew formula
 **Evidence base:** [`observability-mechanics.md`](./observability-mechanics.md) — every
 capability claimed here was measured; anything unverified is labelled.
 
@@ -339,7 +339,7 @@ baseline.
 
 - **NF11** Single Rust binary, no runtime dependencies.
 - **NF12** `probe` must work on a fresh managed Mac with no configuration.
-- **NF13** Embedded default catalog plus `~/.config/<tool>/` overrides, surviving
+- **NF13** Embedded default catalog plus `~/.config/acmon/` overrides, surviving
   `brew upgrade`.
 - **NF14** No `sudo` anywhere in the core paths.
 
@@ -413,8 +413,8 @@ per-subagent tokens and duration.
 | Codex has no telemetry | Turn-level data is Claude-only | Git outcomes cover Codex retrospectively |
 | Dev-loop exec tax on this repo | Every `cargo build` is a fresh inode | Apply the project's own discipline; never reflexive `cargo clean` |
 
-**Open, needing a decision:** the tool's name; whether to adopt resources into v1;
-whether to pull git outcomes into v1 or wait for v3.
+**Open, needing a decision:** whether to adopt resources into v1 (§7 proposes yes);
+whether to pull git outcomes into v1 or wait for v3; which license.
 
 ---
 
