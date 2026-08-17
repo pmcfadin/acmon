@@ -218,10 +218,27 @@ Everything useful is a **log event** on `/v1/logs`. Observed catalog:
 `claude_code.bash.subprocess`, `claude_code.tool.execution`,
 `claude_code.tool.blocked_on_user`. Never observed in any run.
 
-This last point matters: there is **no confirmed direct signal for "this session is
-blocked waiting on a human."** A non-interactive `claude -p` cannot block, so the
-absence may be an artifact of how it was tested — **UNVERIFIED in an interactive
-session.**
+This last point matters: there is **no usable direct signal for "this session is
+blocked waiting on a human."**
+
+Tested four ways, including a genuine interactive session driven through a pty (which
+did start a real turn — `user_prompt`, `api_request` and `tool_result` all arrived).
+`claude_code.tool.blocked_on_user` was **never emitted in any run.**
+
+Worse for the idea, the nearest alternative does not help either. `tool_decision`
+arrives *alongside* `tool_result` carrying an already-resolved value
+(`decision='accept'`), so it reports what was decided, not that something is
+currently pending. Even forcing a permission prompt would not give a "waiting now"
+signal from it.
+
+**Design consequence:** `WAITING` must be inferred — stale transcript, plus a
+resident session process, plus no live build — for both CLIs. Record which method
+produced each verdict so an inferred state is never mistaken for an asserted one. If
+a direct signal appears in a future version, it slots in without redesign.
+
+(Two earlier attempts at this test were void: the first never submitted the prompt,
+the second was killed by a harness timeout. Neither was evidence of absence. Only the
+run that demonstrably started a turn counts.)
 
 Incidental observation: one `mcp_server_connection` reported `duration_ms=73341`
 — 73 seconds to connect. Worth investigating separately.

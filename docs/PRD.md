@@ -183,12 +183,9 @@ One collector, two schedulers. There is no daemon that holds state.
 
 Discovery, registry, detectors, both state machines, resources, TUI, notify.
 
-**Proposed change to an earlier decision:** the agreed v1 slice excluded resource
-metrics. I now recommend including them, because they turned out to need *no new
-subsystem* — the same process enumeration that finds sessions also reads their
-ledger, at microsecond cost and with no root. They are also the project's strongest
-differentiator (§2.3). **This is a proposal, not a settled decision — say if you'd
-rather hold v1 to liveness only.**
+Resource metrics are **in** v1 (decided). They need no new subsystem — the same
+process enumeration that finds sessions also reads its ledger, at microsecond cost
+and with no root — and they are the project's strongest differentiator (§2.3).
 
 ### v2 — Probes, findings, report
 
@@ -235,9 +232,10 @@ baseline.
 ### State (v1)
 
 - **F10** Classify Sessions and Workspaces independently per §4.
-- **F11** `WAITING` uses a direct signal where available and inference otherwise,
-  and **records which method produced the verdict**, so weaker evidence reads as
-  weaker.
+- **F11** `WAITING` is **inferred** (stale transcript + resident session + no live
+  build) for both CLIs — no direct signal exists (measured). Every verdict records
+  which method produced it, so an inferred state never reads as asserted, and a
+  future direct signal slots in without redesign.
 - **F12** Never assert `STALLED` without a trustworthy process snapshot. Report
   `UNKNOWN` instead.
 - **F13** Include a self-sentinel: an all-process snapshot must contain the
@@ -368,7 +366,7 @@ baseline.
 | 17 | Direct WAITING signal where available, method labelled |
 | 18 | Split Session / Workspace state machines |
 | 19 | Built-in verified publish + configurable local command |
-| 20 | v1 = liveness slice (**§7 proposes adding resources**) |
+| 20 | v1 = liveness **+ per-session resources** |
 
 `ratatui` was asserted rather than chosen — flag if you disagree.
 
@@ -404,7 +402,7 @@ per-subagent tokens and duration.
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| `blocked_on_user` may not exist in practice | `WAITING` stays inferential for both CLIs | Test interactively before building on it; inference already works |
+| ~~`blocked_on_user` may not exist~~ **confirmed absent** | `WAITING` is inferential for both CLIs | Closed by test. Inference works; F11 labels the method so inferred never reads as asserted |
 | Orphaned children escape accounting | Per-session CPU understated by an unknown margin | Measure the rate; state the limitation in output |
 | Falcon unmeasurable | Attribution covers only the visible portion | Say so explicitly wherever shares are shown |
 | Commit→Turn linkage is timestamp-based | Outcome attribution is approximate | Ship session-level first (exact); flag turn-level as estimated |
@@ -413,8 +411,8 @@ per-subagent tokens and duration.
 | Codex has no telemetry | Turn-level data is Claude-only | Git outcomes cover Codex retrospectively |
 | Dev-loop exec tax on this repo | Every `cargo build` is a fresh inode | Apply the project's own discipline; never reflexive `cargo clean` |
 
-**Open, needing a decision:** whether to adopt resources into v1 (§7 proposes yes);
-whether to pull git outcomes into v1 or wait for v3; which license.
+**Open, needing a decision:** whether to pull git outcomes into v1 or wait for v3;
+which license.
 
 ---
 
