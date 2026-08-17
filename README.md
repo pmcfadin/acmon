@@ -83,4 +83,4 @@ assumption still unverified is whether an interactive session emits a direct
 
 ## License
 
-Not yet chosen.
+[Apache License 2.0](LICENSE). Copyright 2026 Patrick McFadin.
