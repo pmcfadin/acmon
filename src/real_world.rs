@@ -9,7 +9,7 @@ use libproc::processes::{pids_by_type, ProcFilter};
 
 use crate::machtime::{MachTicks, MachTimebase};
 use crate::world::{
-    ExePathUnavailable, ProcessRecord, ProcessSnapshot, ResourceSource, Resources,
+    PathUnavailable, ProcessRecord, ProcessSnapshot, ResourceSource, Resources,
     ResourcesUnavailable, Unmeasured, World, WorldError,
 };
 
@@ -62,6 +62,88 @@ fn read_timebase() -> MachTimebase {
         info.denom
     );
     MachTimebase::new(info.numer, info.denom)
+}
+
+/// `PROC_PIDVNODEPATHINFO` from `<sys/proc_info.h>` line 741.
+const PROC_PIDVNODEPATHINFO: libc::c_int = 9;
+
+/// `MAXPATHLEN`, the size of the `vip_path` array.
+const MAXPATHLEN: usize = 1024;
+
+/// `size_of(struct vnode_info)` from `<sys/proc_info.h>` line 309: a `vinfo_stat`
+/// (136 bytes) followed by two `int`s and an `fsid_t`.
+const VNODE_INFO_SIZE: usize = 152;
+
+/// `struct vnode_info_path` — a `vnode_info` followed by the path.
+///
+/// The leading struct is carried as opaque bytes because none of its twenty-odd fields
+/// is wanted; only its *size* matters, since it sets the offset the path is read from.
+#[repr(C)]
+struct VnodeInfoPath {
+    _vnode_info: [u8; VNODE_INFO_SIZE],
+    /// `char vip_path[MAXPATHLEN]`, NUL-terminated.
+    path: [libc::c_char; MAXPATHLEN],
+}
+
+/// `struct proc_vnodepathinfo` — the working directory, then the root directory.
+#[repr(C)]
+struct ProcVnodePathInfo {
+    current_directory: VnodeInfoPath,
+    _root_directory: VnodeInfoPath,
+}
+
+/// `PROC_PIDVNODEPATHINFO_SIZE` is `sizeof(struct proc_vnodepathinfo)` = 2 × (152 + 1024).
+///
+/// This only proves the Rust declaration is self-consistent with the arithmetic above;
+/// it cannot prove the arithmetic matches the kernel. What proves that is the seam-3
+/// test comparing a cwd read this way against the same process's own view of it — a
+/// wrong offset there yields a plausible-looking path, not an obvious error.
+const _: () = assert!(std::mem::size_of::<ProcVnodePathInfo>() == 2352);
+
+extern "C" {
+    fn proc_pidinfo(
+        pid: libc::c_int,
+        flavor: libc::c_int,
+        arg: u64,
+        buffer: *mut libc::c_void,
+        buffersize: libc::c_int,
+    ) -> libc::c_int;
+}
+
+/// Read a process's current working directory.
+///
+/// `libproc::proc_pid::pidcwd` exists but is a stub on macOS that always returns an
+/// error, so the underlying call is made directly.
+fn read_cwd(pid: i32) -> Result<String, PathUnavailable> {
+    let mut info: ProcVnodePathInfo = unsafe { std::mem::zeroed() };
+    let capacity = std::mem::size_of::<ProcVnodePathInfo>() as libc::c_int;
+    let written = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut info as *mut ProcVnodePathInfo).cast(),
+            capacity,
+        )
+    };
+
+    // Insist on a completely filled buffer. A partial fill would leave the path field
+    // holding whatever the kernel did not write, which is indistinguishable from a real
+    // answer once it is a string.
+    if written == capacity {
+        let path = unsafe { std::ffi::CStr::from_ptr(info.current_directory.path.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        if !path.is_empty() {
+            return Ok(path);
+        }
+    }
+
+    if process_exists(pid) {
+        Err(PathUnavailable::PermissionDenied)
+    } else {
+        Err(PathUnavailable::ProcessExited)
+    }
 }
 
 /// Whether a pid still refers to a live process.
@@ -162,10 +244,15 @@ impl World for RealWorld {
                 // that is true rather than merely plausible.
                 let exe_path = match proc_pid::pidpath(pid) {
                     Ok(path) if !path.is_empty() => Ok(path),
-                    _ if process_exists(pid) => Err(ExePathUnavailable::PermissionDenied),
-                    _ => Err(ExePathUnavailable::ProcessExited),
+                    _ if process_exists(pid) => Err(PathUnavailable::PermissionDenied),
+                    _ => Err(PathUnavailable::ProcessExited),
                 };
-                ProcessRecord { pid, exe_path }
+                ProcessRecord {
+                    pid,
+                    exe_path,
+                    // Same pass, same moment: see the field's documentation.
+                    cwd: read_cwd(pid),
+                }
             })
             .collect();
 
@@ -207,6 +294,31 @@ impl World for RealWorld {
                 })
             }
         }
+    }
+
+    fn recorded_namespaces(&self) -> Result<Vec<String>, WorldError> {
+        let home = std::env::var("HOME")
+            .map_err(|e| WorldError::NamespaceListing(format!("HOME is not readable: {e}")))?;
+        let root = std::path::Path::new(&home).join(".claude").join("projects");
+
+        let entries = std::fs::read_dir(&root)
+            .map_err(|e| WorldError::NamespaceListing(format!("{}: {e}", root.display())))?;
+
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .map_err(|e| WorldError::NamespaceListing(format!("{}: {e}", root.display())))?;
+            // Directory names only. The transcripts inside hold conversation content and
+            // are never opened.
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                // Lossy rather than skipped: a name that is not valid UTF-8 still has to
+                // appear, because a namespace missing from this list reads downstream as
+                // a workspace with no transcript. A working directory read from the
+                // kernel is converted the same way, so the two still meet.
+                names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        Ok(names)
     }
 
     fn output_width(&self) -> u16 {

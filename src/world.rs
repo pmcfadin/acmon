@@ -3,12 +3,12 @@
 //! Everything else in the crate consumes [`World`], so the rest of the codebase is
 //! pure and testable from captured fixtures.
 
-/// Why an executable path could not be read.
+/// Why a path belonging to a process could not be read.
 ///
 /// Each variant must be TRUE when reported. A reason that is merely plausible is
 /// worse than no reason at all: it reads as a finding rather than as ignorance.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExePathUnavailable {
+pub enum PathUnavailable {
     /// The process no longer exists. Confirmed after the failed read, not guessed.
     ProcessExited,
     /// The process still exists but its path could not be read.
@@ -23,7 +23,14 @@ pub struct ProcessRecord {
     ///
     /// An unmeasurable value is reported as absent with a stated reason — never an
     /// empty string. This is the overriding rule from AGENTS.md.
-    pub exe_path: Result<String, ExePathUnavailable>,
+    pub exe_path: Result<String, PathUnavailable>,
+    /// The process's current working directory, or the reason it could not be obtained.
+    ///
+    /// Read in the same pass as [`ProcessRecord::exe_path`], deliberately. Resolving it
+    /// in a second pass reports processes that merely exited in between as unreadable —
+    /// six such phantoms were observed while writing
+    /// `docs/observability-mechanics.md` §4.1.
+    pub cwd: Result<String, PathUnavailable>,
 }
 
 /// A whole-machine process enumeration.
@@ -88,7 +95,7 @@ impl std::fmt::Display for Unmeasured {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Unmeasured::NotReportedBy(ResourceSource::Ps) => write!(f, "ps-blind"),
-            Unmeasured::NotReportedBy(ResourceSource::Rusage) => write!(f, "unreported"),
+            Unmeasured::NotReportedBy(ResourceSource::Rusage) => write!(f, "unlogged"),
             Unmeasured::ProcessExited => write!(f, "exited"),
             Unmeasured::PermissionDenied => write!(f, "no-perm"),
         }
@@ -140,7 +147,7 @@ impl std::fmt::Display for ResourcesUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ResourcesUnavailable::ProcessExited => write!(f, "exited"),
-            ResourcesUnavailable::AllReadersFailed(_) => write!(f, "unreadable"),
+            ResourcesUnavailable::AllReadersFailed(_) => write!(f, "refused"),
         }
     }
 }
@@ -149,6 +156,11 @@ impl std::fmt::Display for ResourcesUnavailable {
 pub enum WorldError {
     /// The process table could not be enumerated at all.
     ProcessEnumeration(String),
+    /// The recorded transcript namespaces could not be listed.
+    ///
+    /// Not fatal to a collection: the sessions are still observable, only their
+    /// workspaces cannot be attributed to a transcript.
+    NamespaceListing(String),
 }
 
 impl std::fmt::Display for WorldError {
@@ -156,6 +168,9 @@ impl std::fmt::Display for WorldError {
         match self {
             WorldError::ProcessEnumeration(msg) => {
                 write!(f, "process enumeration failed: {}", msg)
+            }
+            WorldError::NamespaceListing(msg) => {
+                write!(f, "could not list recorded transcript namespaces: {}", msg)
             }
         }
     }
@@ -173,8 +188,8 @@ pub trait World {
     /// it's gathered in a single syscall.
     ///
     /// A process that exits mid-enumeration reports
-    /// [`ExePathUnavailable::ProcessExited`] and one that is merely unreadable reports
-    /// [`ExePathUnavailable::PermissionDenied`]. Implementations MUST establish which
+    /// [`PathUnavailable::ProcessExited`] and one that is merely unreadable reports
+    /// [`PathUnavailable::PermissionDenied`]. Implementations MUST establish which
     /// is true rather than assuming, because a confidently wrong reason is worse than
     /// an admitted unknown.
     fn process_snapshot(&self) -> Result<ProcessSnapshot, WorldError>;
@@ -189,6 +204,16 @@ pub trait World {
     /// coarser one only when the full ledger is refused. A figure the answering reader
     /// cannot supply is [`Unmeasured::NotReportedBy`], never zero.
     fn resources(&self, pid: i32) -> Result<Resources, ResourcesUnavailable>;
+
+    /// List the transcript namespaces recorded on this machine.
+    ///
+    /// Read once per collection rather than once per session: it is a single directory
+    /// listing, and asking repeatedly would multiply the cost by the session count for
+    /// an answer that cannot change in between.
+    ///
+    /// Only the directory *names* are read. No transcript is opened — they contain
+    /// conversation content, which this tool never reads.
+    fn recorded_namespaces(&self) -> Result<Vec<String>, WorldError>;
 
     /// The width available for output, in columns.
     ///

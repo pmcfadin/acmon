@@ -2,12 +2,22 @@
 
 use std::time::Duration;
 
-use acmon::render::{render_to_lines, required_height};
+use acmon::render::{minimum_width, render_to_lines, required_height};
+use acmon::workspace::{Workspace, WorkspaceUnknown};
 use acmon::world::{ResourceSource, Resources, ResourcesUnavailable, Unmeasured};
 use acmon::{Session, Snapshot};
 
-/// A width that fits the whole table. The narrow case is its own test.
-const WIDE: u16 = 100;
+/// A width that fits the whole table with room to spare. The narrow cases have their
+/// own tests.
+const WIDE: u16 = 120;
+
+/// A workspace that exists, recorded under the namespace it really has on disk.
+fn measured_workspace() -> Result<Workspace, WorkspaceUnknown> {
+    Ok(Workspace {
+        path: "/Users/pmcfadin/projects/agentic_coding_monitor".to_string(),
+        namespace: Ok("-Users-pmcfadin-projects-agentic-coding-monitor".to_string()),
+    })
+}
 
 /// The ledger of session 69046, measured in `docs/observability-mechanics.md` §2.6.
 fn measured_ledger() -> Resources {
@@ -29,6 +39,7 @@ fn snapshot_of(pids: &[i32]) -> Snapshot {
                 pid,
                 cli: "claude".to_string(),
                 resources: Ok(measured_ledger()),
+                workspace: measured_workspace(),
             })
             .collect(),
     }
@@ -40,6 +51,18 @@ fn snapshot_with(reading: Result<Resources, ResourcesUnavailable>) -> Snapshot {
             pid: 264,
             cli: "claude".to_string(),
             resources: reading,
+            workspace: measured_workspace(),
+        }],
+    }
+}
+
+fn snapshot_in(workspace: Result<Workspace, WorkspaceUnknown>) -> Snapshot {
+    Snapshot {
+        sessions: vec![Session {
+            pid: 264,
+            cli: "claude".to_string(),
+            resources: Ok(measured_ledger()),
+            workspace,
         }],
     }
 }
@@ -126,15 +149,15 @@ fn states_that_child_totals_are_floors_because_detached_work_escapes() {
 }
 
 #[test]
-fn the_floor_caveat_survives_a_width_too_narrow_to_hold_it_on_one_line() {
-    // The table fits from 73 columns; the caveat is 76 characters. Between those the
-    // caveat has to wrap. Losing its tail to a clipped line would leave the numbers
-    // looking complete, which is the failure the caveat exists to prevent.
-    let text = rendered(&snapshot_of(&[69046]), 74);
+fn the_floor_caveat_stays_whole_at_the_narrowest_width_that_renders() {
+    // The boundary case, taken from the code rather than hardcoded so it follows any
+    // future change to the columns. Losing the caveat's tail here would leave the
+    // numbers looking complete, which is the failure it exists to prevent.
+    let text = rendered(&snapshot_of(&[69046]), minimum_width());
 
     assert!(
         text.contains("floors,"),
-        "the caveat's first line must survive; got:\n{text}"
+        "the caveat must survive at the minimum width; got:\n{text}"
     );
     assert!(
         text.contains("totals."),
@@ -143,6 +166,62 @@ fn the_floor_caveat_survives_a_width_too_narrow_to_hold_it_on_one_line() {
     assert!(
         text.contains('┘'),
         "the table must still be closed off, not pushed off the bottom; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_row_names_the_directory_the_session_is_working_in() {
+    let text = rendered(&snapshot_of(&[69046]), WIDE);
+
+    assert!(
+        text.contains("/Users/pmcfadin/projects/agentic_coding_monitor"),
+        "the workspace directory should appear in full when it fits; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_path_too_long_for_its_column_is_cut_from_the_left_and_marked() {
+    // The tail of a path is what distinguishes one workspace from another; the head is
+    // shared by everything under the same home directory. An unmarked cut could name a
+    // directory that exists and is not this one.
+    let long = "/Users/pmcfadin/projects/workforceos/.claude/worktrees/obs-increment-3";
+    let text = rendered(
+        &snapshot_in(Ok(Workspace {
+            path: long.to_string(),
+            namespace: Ok(
+                "-Users-pmcfadin-projects-workforceos--claude-worktrees-obs-increment-3"
+                    .to_string(),
+            ),
+        })),
+        minimum_width(),
+    );
+
+    assert!(
+        !text.contains(long),
+        "the path cannot fit at this width, so it must not be claimed in full; got:\n{text}"
+    );
+    assert!(
+        text.contains('…'),
+        "a shortened path must be marked as shortened; got:\n{text}"
+    );
+    assert!(
+        text.contains("increment-3"),
+        "the distinctive tail must be what survives; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_session_whose_workspace_is_unknown_says_so_with_a_reason() {
+    // Never blank, and never a guess. A blank column would read as the root directory.
+    let text = rendered(&snapshot_in(Err(WorkspaceUnknown::PermissionDenied)), WIDE);
+
+    assert!(
+        text.contains("unknown"),
+        "an undetermined workspace must say so explicitly; got:\n{text}"
+    );
+    assert!(
+        text.contains("no-perm"),
+        "and must give the reason; got:\n{text}"
     );
 }
 

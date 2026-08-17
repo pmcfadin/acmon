@@ -4,10 +4,11 @@ Measuring what AI coding agents actually cost on a managed macOS developer machi
 and how much of that cost is the machine's fault rather than the work's. See
 [`README.md`](README.md).
 
-**Status:** v1 implementation in progress. Ticket #2 (live session table) is closed;
-#13 records the one criterion it met in effect rather than in letter. Ticket #4
-(per-session CPU and memory, including children) is built and passing its criteria on
-`main`. Ask GitHub what is unblocked rather than trusting this line.
+**Status:** v1 implementation in progress. Tickets #2 (live session table) and #4
+(per-session CPU and memory, including children) are closed; #13 records the one #2
+criterion met in effect rather than in letter. Ticket #3 (workspace attribution) is
+built and passing its criteria on `main`. Ask GitHub what is unblocked rather than
+trusting this line.
 
 ## Orientation
 

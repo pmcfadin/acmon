@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use acmon::workspace::{NamespaceUnmatched, WorkspaceUnknown};
 use acmon::world::{ResourceSource, Resources, ResourcesUnavailable, Unmeasured};
 use acmon::{collect, CollectError, ProcessRecord, ProcessSnapshot, World, WorldError};
 
@@ -15,6 +16,21 @@ struct FakeWorld {
     /// Per-pid resource readings. A pid with no entry gets [`measured_ledger`], so a
     /// test only has to state the readings it actually asserts on.
     ledgers: HashMap<i32, Result<Resources, ResourcesUnavailable>>,
+    /// The transcript namespaces this machine is pretending to have recorded.
+    namespaces: Result<Vec<String>, WorldError>,
+}
+
+/// Namespaces that genuinely exist in `~/.claude/projects` on the machine these
+/// fixtures came from — including one recorded with capitals its live cwd does not have.
+fn recorded_namespaces() -> Vec<String> {
+    [
+        "-Users-pmcfadin-projects-agentic-coding-monitor",
+        "-Users-pmcfadin-projects-WorkforceOS",
+        "-Users-pmcfadin-projects-workforceos-mvp",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 impl FakeWorld {
@@ -25,6 +41,7 @@ impl FakeWorld {
                 observer_pid,
             }),
             ledgers: HashMap::new(),
+            namespaces: Ok(recorded_namespaces()),
         }
     }
 
@@ -32,11 +49,17 @@ impl FakeWorld {
         FakeWorld {
             snapshot: Err(error),
             ledgers: HashMap::new(),
+            namespaces: Ok(recorded_namespaces()),
         }
     }
 
     fn ledger(mut self, pid: i32, reading: Result<Resources, ResourcesUnavailable>) -> Self {
         self.ledgers.insert(pid, reading);
+        self
+    }
+
+    fn without_namespace_listing(mut self, why: &str) -> Self {
+        self.namespaces = Err(WorldError::NamespaceListing(why.to_string()));
         self
     }
 }
@@ -84,20 +107,32 @@ impl World for FakeWorld {
             .cloned()
             .unwrap_or_else(|| Ok(measured_ledger()))
     }
+
+    fn recorded_namespaces(&self) -> Result<Vec<String>, WorldError> {
+        self.namespaces.clone()
+    }
 }
 
+/// A record in a directory that really exists on the machine these fixtures came from.
+/// Tests that care which directory it is use [`rec_in`].
 fn rec(pid: i32, exe: &str) -> ProcessRecord {
+    rec_in(pid, exe, "/Users/pmcfadin/projects/agentic_coding_monitor")
+}
+
+fn rec_in(pid: i32, exe: &str, cwd: &str) -> ProcessRecord {
     ProcessRecord {
         pid,
         exe_path: Ok(exe.to_string()),
+        cwd: Ok(cwd.to_string()),
     }
 }
 
 fn rec_unreadable(pid: i32) -> ProcessRecord {
-    use acmon::ExePathUnavailable;
+    use acmon::PathUnavailable;
     ProcessRecord {
         pid,
-        exe_path: Err(ExePathUnavailable::PermissionDenied),
+        exe_path: Err(PathUnavailable::PermissionDenied),
+        cwd: Err(PathUnavailable::PermissionDenied),
     }
 }
 
@@ -349,5 +384,175 @@ fn world_errors_propagate_as_collect_errors() {
     assert!(
         matches!(result, Err(CollectError::World(_))),
         "world errors must propagate through collect; got {result:?}"
+    );
+}
+
+/// A record whose executable is readable — so it is detected as a session — but whose
+/// working directory is not. That combination is what makes the workspace unknown.
+fn rec_without_cwd(pid: i32, exe: &str) -> ProcessRecord {
+    use acmon::PathUnavailable;
+    ProcessRecord {
+        pid,
+        exe_path: Ok(exe.to_string()),
+        cwd: Err(PathUnavailable::PermissionDenied),
+    }
+}
+
+const CLAUDE_EXE: &str = "/Users/pmcfadin/.local/share/claude/versions/2.1.233";
+
+#[test]
+fn each_session_shows_the_directory_it_is_working_in() {
+    // As with the resource ledger, the point is that the value lands on the right row.
+    // Both directories and both namespaces below exist on a real machine.
+    let world = FakeWorld::with(
+        vec![
+            rec_in(
+                69046,
+                CLAUDE_EXE,
+                "/Users/pmcfadin/projects/agentic_coding_monitor",
+            ),
+            rec_in(264, CLAUDE_EXE, "/Users/pmcfadin/projects/workforceos"),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    );
+
+    let snapshot = collect(&world).expect("collection should succeed");
+    let find = |pid: i32| {
+        snapshot
+            .sessions
+            .iter()
+            .find(|s| s.pid == pid)
+            .unwrap_or_else(|| panic!("session {pid}"))
+            .workspace
+            .as_ref()
+            .expect("a readable cwd yields a workspace")
+            .clone()
+    };
+
+    assert_eq!(
+        find(69046).path,
+        "/Users/pmcfadin/projects/agentic_coding_monitor"
+    );
+    assert_eq!(find(264).path, "/Users/pmcfadin/projects/workforceos");
+}
+
+#[test]
+fn a_workspace_is_attributed_to_the_namespace_recorded_for_it() {
+    // The underscore and capitalisation rules, exercised through collection rather than
+    // through the mapping function alone: this is where a wrong rule would have shown
+    // up as a session with no transcript.
+    let world = FakeWorld::with(
+        vec![
+            rec_in(
+                69046,
+                CLAUDE_EXE,
+                "/Users/pmcfadin/projects/agentic_coding_monitor",
+            ),
+            rec_in(264, CLAUDE_EXE, "/Users/pmcfadin/projects/workforceos"),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    );
+
+    let snapshot = collect(&world).expect("collection should succeed");
+    let namespace_of = |pid: i32| {
+        snapshot
+            .sessions
+            .iter()
+            .find(|s| s.pid == pid)
+            .unwrap()
+            .workspace
+            .as_ref()
+            .unwrap()
+            .namespace
+            .clone()
+    };
+
+    assert_eq!(
+        namespace_of(69046),
+        Ok("-Users-pmcfadin-projects-agentic-coding-monitor".to_string()),
+        "underscores in the path map to hyphens in the namespace"
+    );
+    assert_eq!(
+        namespace_of(264),
+        Ok("-Users-pmcfadin-projects-WorkforceOS".to_string()),
+        "and the recorded spelling is kept, capitals and all"
+    );
+}
+
+#[test]
+fn a_workspace_with_no_recorded_namespace_says_so_and_shows_what_it_looked_for() {
+    let world = FakeWorld::with(
+        vec![
+            rec_in(69046, CLAUDE_EXE, "/Users/pmcfadin/projects/never_opened"),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    );
+
+    let snapshot = collect(&world).expect("collection should succeed");
+    let workspace = snapshot.sessions[0].workspace.as_ref().unwrap();
+
+    assert_eq!(
+        workspace.path, "/Users/pmcfadin/projects/never_opened",
+        "the directory is still known even when its transcript is not"
+    );
+    assert_eq!(
+        workspace.namespace,
+        Err(NamespaceUnmatched::NotRecorded {
+            mapped: "-Users-pmcfadin-projects-never-opened".to_string()
+        }),
+        "an unmatched namespace must show what was looked for, so it can be checked"
+    );
+}
+
+#[test]
+fn a_session_whose_working_directory_is_unreadable_shows_an_explicit_unknown() {
+    // The session exists and is listed. Its workspace is not blank and not guessed.
+    let world = FakeWorld::with(
+        vec![
+            rec_without_cwd(69046, CLAUDE_EXE),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    );
+
+    let snapshot = collect(&world).expect("collection should succeed");
+
+    assert_eq!(snapshot.sessions.len(), 1, "the session is still listed");
+    assert_eq!(
+        snapshot.sessions[0].workspace,
+        Err(WorkspaceUnknown::PermissionDenied)
+    );
+}
+
+#[test]
+fn a_failure_to_list_recorded_namespaces_is_not_a_workspace_without_a_transcript() {
+    // Two different facts: "this workspace has no transcript" and "we could not look".
+    // Collapsing them would report the first when the second is true.
+    let world = FakeWorld::with(
+        vec![
+            rec_in(
+                69046,
+                CLAUDE_EXE,
+                "/Users/pmcfadin/projects/agentic_coding_monitor",
+            ),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .without_namespace_listing("~/.claude/projects is not readable");
+
+    let snapshot = collect(&world).expect("an unlistable transcript store is not fatal");
+    let workspace = snapshot.sessions[0].workspace.as_ref().unwrap();
+
+    assert!(
+        matches!(
+            workspace.namespace,
+            Err(NamespaceUnmatched::ListingFailed(_))
+        ),
+        "got {:?}",
+        workspace.namespace
     );
 }

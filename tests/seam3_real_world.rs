@@ -8,7 +8,8 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use acmon::world::{ExePathUnavailable, ResourceSource, ResourcesUnavailable, Unmeasured};
+use acmon::workspace::NamespaceUnmatched;
+use acmon::world::{PathUnavailable, ResourceSource, ResourcesUnavailable, Unmeasured};
 use acmon::{collect, RealWorld, World};
 
 #[test]
@@ -73,7 +74,7 @@ fn an_unavailable_path_states_a_reason_that_is_actually_true() {
     let observation = world.process_snapshot().expect("enumeration");
 
     for record in &observation.records {
-        if record.exe_path == Err(ExePathUnavailable::ProcessExited) {
+        if record.exe_path == Err(PathUnavailable::ProcessExited) {
             let alive = unsafe { libc::kill(record.pid, 0) == 0 };
             assert!(
                 !alive,
@@ -283,4 +284,109 @@ fn a_pid_that_has_exited_is_reported_as_exited_rather_than_as_idle() {
         Err(ResourcesUnavailable::ProcessExited),
         "a reaped pid has no ledger, and that is not the same as a ledger of zeroes"
     );
+}
+
+#[test]
+fn a_working_directory_is_read_in_the_same_pass_as_the_identity() {
+    // §4.1: resolving cwd in a second pass produced six "unreadable" entries that were
+    // simply dead processes. The value is checked against an independent source — what
+    // this process itself believes its directory to be.
+    let world = RealWorld::new();
+    let independent = std::env::current_dir().expect("this process has a working directory");
+
+    let observation = world.process_snapshot().expect("enumeration");
+    let mine = observation
+        .records
+        .iter()
+        .find(|r| r.pid == observation.observer_pid)
+        .expect("the observer appears in its own snapshot");
+
+    assert_eq!(
+        mine.cwd.as_ref().map(String::as_str),
+        Ok(independent.to_str().expect("a UTF-8 path")),
+        "the cwd read from the kernel must match what this process reports for itself"
+    );
+}
+
+#[test]
+fn an_unreadable_working_directory_is_absent_with_a_reason_never_an_empty_string() {
+    // Roughly a third of processes on a real machine belong to another user and are not
+    // readable. Those must carry a reason, not an empty string that reads as "root".
+    let world = RealWorld::new();
+
+    let observation = world.process_snapshot().expect("enumeration");
+
+    assert!(
+        observation
+            .records
+            .iter()
+            .all(|r| r.cwd.as_ref().map(String::as_str) != Ok("")),
+        "an unreadable cwd must be absent, never an empty string"
+    );
+    let readable = observation.records.iter().filter(|r| r.cwd.is_ok()).count();
+    assert!(
+        readable > 0,
+        "no cwd was readable at all, so this proves nothing about the reader"
+    );
+    assert!(
+        readable < observation.records.len(),
+        "every cwd on the machine was readable, which means the failure path is untested \
+         here — expected some processes to belong to another user"
+    );
+}
+
+#[test]
+fn the_recorded_namespaces_on_this_machine_are_listable_and_hold_no_underscores() {
+    // §4.3's corroboration, re-checked on the machine running the tests rather than
+    // taken on trust from the document: if any recorded namespace contained an
+    // underscore, the mapping rule would be wrong.
+    let world = RealWorld::new();
+
+    let recorded = world
+        .recorded_namespaces()
+        .expect("the transcript store should be listable");
+
+    assert!(
+        !recorded.is_empty(),
+        "no namespaces were listed at all, so nothing below proves anything"
+    );
+    assert!(
+        recorded.iter().all(|n| !n.contains('_')),
+        "a recorded namespace contains an underscore, which contradicts the mapping rule: {:?}",
+        recorded.iter().filter(|n| n.contains('_')).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn every_workspace_attribution_on_this_machine_is_true_in_both_directions() {
+    // Invariants, not counts. A resolved namespace must really be one of the recorded
+    // ones, and an unresolved one must really be absent — the second direction is what
+    // catches a matcher that is too strict, which is how the underscore defect
+    // presented: a calm "no session here" for a workspace that had one.
+    let world = RealWorld::new();
+    let recorded = world.recorded_namespaces().expect("listable");
+    let snapshot = collect(&world).expect("collection over the real machine should succeed");
+
+    for session in &snapshot.sessions {
+        let Ok(workspace) = &session.workspace else {
+            continue; // A workspace that could not be read is covered by its own test.
+        };
+        match &workspace.namespace {
+            Ok(resolved) => assert!(
+                recorded.contains(resolved),
+                "session {} claims namespace {resolved}, which is not in the listing",
+                session.pid
+            ),
+            Err(NamespaceUnmatched::NotRecorded { mapped }) => assert!(
+                !recorded.iter().any(|n| n.eq_ignore_ascii_case(mapped)),
+                "session {} in {} was reported as having no recorded namespace, but {mapped} \
+                 is in the listing — the match is too strict",
+                session.pid,
+                workspace.path
+            ),
+            Err(NamespaceUnmatched::ListingFailed(why)) => {
+                panic!("the listing succeeded above, so this cannot be: {why}")
+            }
+        }
+    }
 }

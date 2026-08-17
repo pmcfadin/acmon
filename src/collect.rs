@@ -1,7 +1,10 @@
 //! Seam 1 — turning an observation of the world into a snapshot.
 
 use crate::detect::embedded_detectors;
-use crate::world::{Resources, ResourcesUnavailable, World, WorldError};
+use crate::workspace::{
+    namespace_for, recorded_namespace, NamespaceUnmatched, Workspace, WorkspaceUnknown,
+};
+use crate::world::{PathUnavailable, Resources, ResourcesUnavailable, World, WorldError};
 
 /// One agent CLI process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +17,8 @@ pub struct Session {
     /// A session with an unreadable ledger is still a session, and is still listed. It
     /// is never dropped and never shown as idle.
     pub resources: Result<Resources, ResourcesUnavailable>,
+    /// Which directory this session is working in, or why that is unknown.
+    pub workspace: Result<Workspace, WorkspaceUnknown>,
 }
 
 /// Everything observed in one collection.
@@ -57,6 +62,33 @@ impl std::error::Error for CollectError {
     }
 }
 
+/// Work out a session's workspace from its working directory.
+///
+/// Three outcomes, and they are deliberately distinct: the workspace is known and has a
+/// recorded transcript; it is known and has none; or it is not known at all. Collapsing
+/// any two of them would report a directory the session is not in, or none at all.
+fn workspace_of(
+    cwd: &Result<String, PathUnavailable>,
+    recorded: &Result<Vec<String>, WorldError>,
+) -> Result<Workspace, WorkspaceUnknown> {
+    let path = cwd.as_ref().map_err(WorkspaceUnknown::from)?;
+
+    let namespace = match recorded {
+        Ok(namespaces) => {
+            recorded_namespace(path, namespaces).ok_or_else(|| NamespaceUnmatched::NotRecorded {
+                mapped: namespace_for(path),
+            })
+        }
+        // Could not look, which is not the same as looked and found nothing.
+        Err(why) => Err(NamespaceUnmatched::ListingFailed(why.to_string())),
+    };
+
+    Ok(Workspace {
+        path: path.clone(),
+        namespace,
+    })
+}
+
 /// Collect a snapshot of the agent sessions on this machine.
 pub fn collect(world: &dyn World) -> Result<Snapshot, CollectError> {
     let observation = world.process_snapshot().map_err(CollectError::World)?;
@@ -71,6 +103,10 @@ pub fn collect(world: &dyn World) -> Result<Snapshot, CollectError> {
 
     let detectors = embedded_detectors();
 
+    // Listed once, not once per session: the answer cannot change between sessions in a
+    // single collection, and a directory listing is not free.
+    let recorded = world.recorded_namespaces();
+
     let mut sessions: Vec<Session> = observation
         .records
         .iter()
@@ -81,6 +117,7 @@ pub fn collect(world: &dyn World) -> Result<Snapshot, CollectError> {
                 pid: record.pid,
                 cli: detector.id.clone(),
                 resources: world.resources(record.pid),
+                workspace: workspace_of(&record.cwd, &recorded),
             })
         })
         .collect();

@@ -28,27 +28,55 @@ use crate::world::Resources;
 const FLOOR_CAVEAT: &str =
     "Child CPU omits detached and orphaned work, so these are floors, not totals.";
 
-/// Column headers and widths, in order. The width has to hold the widest value *or*
-/// the longest reason for a value's absence, since a reason is printed in its place.
-const COLUMNS: [(&str, u16); 7] = [
-    ("PID", 7),
-    ("CLI", 8),
-    ("OWN CPU", 10),
-    ("CHILD CPU", 10),
-    ("MEM", 10),
-    ("PEAK", 10),
-    ("WRITTEN", 10),
+/// The fixed columns, in order. Each width holds that column's widest value *or* the
+/// longest reason for a value's absence, since a reason is printed in the value's place.
+const FIXED_COLUMNS: [(&str, u16); 7] = [
+    ("PID", 6),
+    ("CLI", 6),
+    ("OWN CPU", 9),
+    ("CHILD CPU", 9),
+    ("MEM", 8),
+    ("PEAK", 8),
+    ("WRITTEN", 8),
 ];
+
+/// The last column, which absorbs whatever width is left over.
+const WORKSPACE_HEADER: &str = "WORKSPACE";
+
+/// The narrowest the workspace column may be.
+///
+/// Sized to hold `unknown: no-perm`, the longest thing that can appear there other than
+/// a path — and paths are shortened with a visible mark, while a reason must not be.
+const WORKSPACE_MIN: u16 = 16;
 
 /// One space between columns, matching `ratatui`'s default spacing.
 const COLUMN_SPACING: u16 = 1;
 
-/// The narrowest terminal that can hold the table without truncating a number.
-fn minimum_width() -> u16 {
-    let content: u16 = COLUMNS.iter().map(|(_, w)| w).sum();
-    let separators = COLUMN_SPACING * (COLUMNS.len() as u16 - 1);
+/// Everything a row spends that is not a column's own content: borders and separators.
+fn row_overhead() -> u16 {
+    let columns = FIXED_COLUMNS.len() as u16 + 1;
     let borders = 2;
-    content + separators + borders
+    COLUMN_SPACING * (columns - 1) + borders
+}
+
+fn fixed_content_width() -> u16 {
+    FIXED_COLUMNS.iter().map(|(_, w)| w).sum()
+}
+
+/// The narrowest terminal that can hold the table without truncating a number.
+pub fn minimum_width() -> u16 {
+    fixed_content_width() + WORKSPACE_MIN + row_overhead()
+}
+
+/// How much room the workspace column gets at a given total width.
+///
+/// Derived rather than declared, and used both for the column constraint and for
+/// shortening the path, so the two cannot disagree — if they did, `ratatui` would cut
+/// the path silently and unmarked.
+fn workspace_width(total: u16) -> u16 {
+    total
+        .saturating_sub(fixed_content_width() + row_overhead())
+        .max(WORKSPACE_MIN)
 }
 
 /// Calculate the required height to render a snapshot without blank rows.
@@ -88,14 +116,24 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot) {
         Layout::vertical([Constraint::Min(3), Constraint::Length(caveat_height)]).areas(area);
 
     let title = format!(" acmon — {} agent session(s) ", snapshot.sessions.len());
-    let rows: Vec<Row> = snapshot.sessions.iter().map(row_for).collect();
-    let constraints: Vec<Constraint> = COLUMNS
+    let workspace_width = workspace_width(area.width);
+    let rows: Vec<Row> = snapshot
+        .sessions
+        .iter()
+        .map(|session| row_for(session, workspace_width))
+        .collect();
+
+    let mut constraints: Vec<Constraint> = FIXED_COLUMNS
         .iter()
         .map(|(_, width)| Constraint::Length(*width))
         .collect();
+    constraints.push(Constraint::Length(workspace_width));
+
+    let mut headers: Vec<&str> = FIXED_COLUMNS.iter().map(|(header, _)| *header).collect();
+    headers.push(WORKSPACE_HEADER);
 
     let table = Table::new(rows, constraints)
-        .header(Row::new(COLUMNS.map(|(header, _)| header)))
+        .header(Row::new(headers))
         .column_spacing(COLUMN_SPACING)
         .block(Block::default().borders(Borders::ALL).title(title));
 
@@ -106,8 +144,9 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot) {
     );
 }
 
-/// One session's row: its identity, then its ledger or the reason it has none.
-fn row_for(session: &Session) -> Row<'static> {
+/// One session's row: its identity, its ledger or the reason it has none, then where it
+/// is working or the reason that is unknown.
+fn row_for(session: &Session, workspace_width: u16) -> Row<'static> {
     let figures = match &session.resources {
         Ok(resources) => figures_of(resources),
         // Nothing was read. Every figure carries the same reason rather than the row
@@ -121,9 +160,32 @@ fn row_for(session: &Session) -> Row<'static> {
         ],
     };
 
+    let workspace = match &session.workspace {
+        Ok(workspace) => shorten_from_the_left(&workspace.path, workspace_width),
+        Err(unknown) => unknown.to_string(),
+    };
+
     let mut cells = vec![session.pid.to_string(), session.cli.clone()];
     cells.extend(figures);
+    cells.push(workspace);
     Row::new(cells)
+}
+
+/// Keep the end of a path, marking that the beginning was dropped.
+///
+/// The tail carries a workspace's identity; the head is shared by everything under the
+/// same home directory. An unmarked cut could name a directory that exists and is not
+/// this one, which is the same class of defect as a truncated CPU total.
+fn shorten_from_the_left(text: &str, width: u16) -> String {
+    let width = width as usize;
+    let characters: Vec<char> = text.chars().collect();
+    if characters.len() <= width || width == 0 {
+        return text.to_string();
+    }
+    let kept: String = characters[characters.len() - (width - 1)..]
+        .iter()
+        .collect();
+    format!("…{kept}")
 }
 
 fn figures_of(resources: &Resources) -> [String; 5] {
