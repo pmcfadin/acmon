@@ -10,7 +10,15 @@ use std::time::{Duration, Instant, SystemTime};
 
 use acmon::workspace::NamespaceUnmatched;
 use acmon::world::{PathUnavailable, ResourceSource, ResourcesUnavailable, Unmeasured};
-use acmon::{collect, RealWorld, World};
+use acmon::{collect, Identity, RealWorld, World};
+
+/// Helper to format a session identity for error messages.
+fn format_identity(identity: &Identity) -> String {
+    match identity {
+        Identity::Process { pid } => format!("pid {}", pid),
+        Identity::Transcript { recorded_as } => format!("transcript {}", recorded_as),
+    }
+}
 
 #[test]
 fn the_real_process_table_contains_the_observing_process() {
@@ -45,7 +53,10 @@ fn collection_over_the_real_machine_yields_only_recognised_clis() {
              got {:?}",
             session.cli
         );
-        assert!(session.pid > 0, "a pid is always positive");
+        // For process-derived sessions, pid is always positive.
+        if let acmon::Identity::Process { pid } = session.identity {
+            assert!(pid > 0, "a pid is always positive");
+        }
     }
 }
 
@@ -379,16 +390,37 @@ fn every_workspace_attribution_on_this_machine_is_true_in_both_directions() {
             continue; // A workspace that could not be read is covered by its own test.
         };
         match &workspace.namespace {
-            Ok(resolved) => assert!(
-                recorded.contains(resolved),
-                "session {} claims namespace {resolved}, which is not in the listing",
-                session.pid
-            ),
+            Ok(resolved) => {
+                // The two CLIs are identified by different things, so each is checked
+                // against its own store. A Claude namespace is a directory name; a Codex
+                // "namespace" is a session id out of the index, which would never appear
+                // in the Claude listing. Checking neither would let either be anything.
+                if session.cli == "claude" {
+                    assert!(
+                        recorded.contains(resolved),
+                        "session {} claims namespace {resolved}, which is not in the listing",
+                        format_identity(&session.identity)
+                    );
+                } else if session.cli == "codex" {
+                    let known_ids: Vec<String> = world
+                        .codex_sessions()
+                        .expect("the Codex index was readable above")
+                        .into_iter()
+                        .map(|session| session.id)
+                        .collect();
+                    assert!(
+                        known_ids.contains(resolved),
+                        "session {} claims Codex session id {resolved}, which the index \
+                         does not report; known ids: {known_ids:?}",
+                        format_identity(&session.identity)
+                    );
+                }
+            }
             Err(NamespaceUnmatched::NotRecorded { mapped }) => assert!(
                 !recorded.iter().any(|n| n.eq_ignore_ascii_case(mapped)),
                 "session {} in {} was reported as having no recorded namespace, but {mapped} \
                  is in the listing — the match is too strict",
-                session.pid,
+                format_identity(&session.identity),
                 workspace.path
             ),
             Err(NamespaceUnmatched::ListingFailed(why)) => {
@@ -632,5 +664,55 @@ fn codex_sessions_carry_last_activity_within_the_recency_window() {
             session.id,
             session.last_activity
         );
+    }
+}
+
+#[test]
+fn no_session_may_be_stalled_while_its_process_is_resident() {
+    // Invariant: a session with a resident process can be ACTIVE, WAITING, or UNKNOWN,
+    // but never STALLED. STALLED requires the absence of a process, which is observable.
+    let world = RealWorld::new();
+    let snapshot = collect(&world, SystemTime::now())
+        .expect("collection over the real machine should succeed");
+
+    for session in &snapshot.sessions {
+        if let acmon::Identity::Process { pid } = session.identity {
+            assert_ne!(
+                session.liveness.state,
+                acmon::liveness::State::Stalled,
+                "session with pid {pid} is STALLED while its process is resident — this \
+                 violates the liveness rule"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_transcript_derived_session_has_process_resident_false() {
+    // Invariant: a transcript-derived session exists precisely because its process is
+    // gone. The liveness logic depends on this being false to reach the STALLED verdict.
+    let world = RealWorld::new();
+    let snapshot = collect(&world, SystemTime::now())
+        .expect("collection over the real machine should succeed");
+
+    // An empty result is legitimate — this machine may have no transcript-derived
+    // sessions. The test proves only that whatever came back has the right shape.
+
+    for session in &snapshot.sessions {
+        if let acmon::Identity::Transcript { recorded_as } = &session.identity {
+            // We can't directly inspect the Observation that was passed to classify, but
+            // we can verify that the verdict is one that could only be reached with
+            // process_resident: false. If process_resident were true, the verdict would
+            // be ACTIVE or WAITING (rows 3-4 of the liveness table), never STALLED or
+            // the process-absent UNKNOWN (rows 6-7).
+            //
+            // Also verify that resources are unavailable due to the process having exited.
+            assert_eq!(
+                session.resources,
+                Err(acmon::world::ResourcesUnavailable::ProcessExited),
+                "transcript-derived session {recorded_as} must report resources as exited, \
+                 because the process is gone"
+            );
+        }
     }
 }

@@ -95,6 +95,17 @@ pub enum WorkspaceUnknown {
     ProcessExited,
     /// The process is alive but its working directory is not readable by this user.
     PermissionDenied,
+    /// The workspace path cannot be derived from a transcript namespace because the
+    /// namespace mapping is not invertible. Three distinct characters (`/`, `.`, `_`)
+    /// collapse onto `-`, so a namespace like `-a-b-c` could have come from any of
+    /// `_/a.b_c`, `/a/b/c`, `-a-b-c`, etc. The program must not attempt to reverse the
+    /// mapping or probe the filesystem for candidates — that would report a guessed path
+    /// as known, which is worse than admitting it is unknown.
+    ///
+    /// This applies only to Claude Code's transcript namespaces. Codex records the
+    /// workspace path inside the transcript, so a transcript-derived Codex session's
+    /// workspace is known.
+    NotInvertible,
 }
 
 impl From<&PathUnavailable> for WorkspaceUnknown {
@@ -111,6 +122,7 @@ impl std::fmt::Display for WorkspaceUnknown {
         match self {
             WorkspaceUnknown::ProcessExited => write!(f, "unknown: exited"),
             WorkspaceUnknown::PermissionDenied => write!(f, "unknown: no-perm"),
+            WorkspaceUnknown::NotInvertible => write!(f, "not-invertible"),
         }
     }
 }

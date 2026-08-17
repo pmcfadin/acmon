@@ -16,7 +16,8 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
 
-use crate::collect::{Session, Snapshot};
+use crate::collect::{Identity, Session, Snapshot};
+use crate::workspace::WorkspaceUnknown;
 use crate::world::Resources;
 
 /// The caveat that travels with every child-CPU figure.
@@ -210,16 +211,31 @@ fn row_for(session: &Session, workspace_width: u16) -> Row<'static> {
         ],
     };
 
+    // For a transcript-derived session, show the namespace in the workspace column if
+    // the workspace is unknown due to the namespace being not invertible. Otherwise
+    // show the workspace path or the reason it is unknown.
     let workspace = match &session.workspace {
         Ok(workspace) => shorten_from_the_left(&workspace.path, workspace_width),
+        Err(WorkspaceUnknown::NotInvertible) => {
+            // For a transcript-derived Claude session, show the namespace itself
+            // rather than the unknown-reason text. A human reading the namespace can
+            // see which directory it is; the program must not claim to know, but
+            // withholding it entirely would make the row useless.
+            if let Identity::Transcript { recorded_as } = &session.identity {
+                shorten_from_the_left(recorded_as, workspace_width)
+            } else {
+                WorkspaceUnknown::NotInvertible.to_string()
+            }
+        }
         Err(unknown) => unknown.to_string(),
     };
 
-    let mut cells = vec![
-        session.pid.to_string(),
-        session.cli.clone(),
-        state_cell(&session.liveness),
-    ];
+    let pid_cell = match &session.identity {
+        Identity::Process { pid } => pid.to_string(),
+        Identity::Transcript { .. } => "gone".to_string(),
+    };
+
+    let mut cells = vec![pid_cell, session.cli.clone(), state_cell(&session.liveness)];
     cells.extend(figures);
     cells.push(workspace);
     Row::new(cells)

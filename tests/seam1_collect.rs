@@ -41,11 +41,13 @@ fn recorded_namespaces() -> Vec<String> {
 }
 
 /// A real Codex session observed on this machine, safe to use as a fixture.
+/// Default activity is old enough (more than 48 hours before fixture_now) that it
+/// won't be discovered as a transcript-derived session unless a test sets a more recent time.
 fn recorded_codex_sessions() -> Vec<CodexSession> {
     vec![CodexSession {
         id: "01a010c6-9c79-76d1-82da-3fad4bbf3bc4".to_string(),
         workspace: "/Users/pmcfadin/Documents/Codex/2026-08-17/he".to_string(),
-        last_activity: SystemTime::UNIX_EPOCH + Duration::from_secs(1_723_900_800),
+        last_activity: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 - 48 * 3600),
     }]
 }
 
@@ -88,7 +90,6 @@ impl FakeWorld {
         self
     }
 
-    #[allow(dead_code)] // Will be used once liveness integration is wired up
     fn namespace_activity(
         mut self,
         namespace: String,
@@ -158,7 +159,13 @@ impl World for FakeWorld {
         self.namespace_activities
             .get(namespace)
             .cloned()
-            .unwrap_or_else(|| Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)))
+            // Default to very old activity (more than 48 hours before fixture_now), so
+            // transcripts are not discovered as transcript-derived sessions unless a test
+            // explicitly sets a more recent time. The discovery window is 2x the stall
+            // threshold (24 hours), so 48 hours ensures transcripts won't be discovered.
+            .unwrap_or_else(|| {
+                Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 - 48 * 3600))
+            })
     }
 
     fn codex_sessions(&self) -> Result<Vec<CodexSession>, WorldError> {
@@ -230,10 +237,20 @@ fn lists_every_live_session_of_both_clis_and_nothing_else() {
 
     let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
 
-    let found: Vec<(i32, &str)> = snapshot
+    let found: Vec<(String, &str)> = snapshot
         .sessions
         .iter()
-        .map(|s| (s.pid, s.cli.as_str()))
+        .map(|s| {
+            (
+                match &s.identity {
+                    acmon::Identity::Process { pid } => format!("pid:{}", pid),
+                    acmon::Identity::Transcript { recorded_as } => {
+                        format!("transcript:{}", recorded_as)
+                    }
+                },
+                s.cli.as_str(),
+            )
+        })
         .collect();
 
     assert_eq!(
@@ -345,12 +362,12 @@ fn each_session_carries_the_readings_of_its_own_pid() {
     let heavy_delegator = snapshot
         .sessions
         .iter()
-        .find(|s| s.pid == 69046)
+        .find(|s| has_pid(s, 69046))
         .expect("session 69046");
     let self_worker = snapshot
         .sessions
         .iter()
-        .find(|s| s.pid == 264)
+        .find(|s| has_pid(s, 264))
         .expect("session 264");
 
     assert_eq!(
@@ -481,7 +498,7 @@ fn each_session_shows_the_directory_it_is_working_in() {
         snapshot
             .sessions
             .iter()
-            .find(|s| s.pid == pid)
+            .find(|s| has_pid(s, pid))
             .unwrap_or_else(|| panic!("session {pid}"))
             .workspace
             .as_ref()
@@ -519,7 +536,7 @@ fn a_workspace_is_attributed_to_the_namespace_recorded_for_it() {
         snapshot
             .sessions
             .iter()
-            .find(|s| s.pid == pid)
+            .find(|s| has_pid(s, pid))
             .unwrap()
             .workspace
             .as_ref()
@@ -669,13 +686,11 @@ fn the_real_codex_cli_is_a_session() {
 
     let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
 
-    assert_eq!(
-        snapshot
-            .sessions
-            .iter()
-            .map(|s| (s.pid, s.cli.as_str()))
-            .collect::<Vec<_>>(),
-        vec![(59293, "codex")]
+    assert_eq!(snapshot.sessions.len(), 1, "expected one codex session");
+    assert_eq!(snapshot.sessions[0].cli, "codex");
+    assert!(
+        has_pid(&snapshot.sessions[0], 59293),
+        "expected session with pid 59293"
     );
 }
 
@@ -693,12 +708,8 @@ fn no_desktop_application_or_helper_is_ever_a_session() {
 
     assert!(
         snapshot.sessions.is_empty(),
-        "none of these is a session, got {:?}",
-        snapshot
-            .sessions
-            .iter()
-            .map(|s| (s.pid, s.cli.as_str()))
-            .collect::<Vec<_>>()
+        "none of these is a session, got {} sessions",
+        snapshot.sessions.len()
     );
 }
 
@@ -718,7 +729,10 @@ fn the_codex_cli_is_told_apart_from_a_helper_in_the_same_directory() {
     let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
 
     assert_eq!(snapshot.sessions.len(), 1, "only the CLI is a session");
-    assert_eq!(snapshot.sessions[0].pid, 59293);
+    assert!(
+        has_pid(&snapshot.sessions[0], 59293),
+        "expected session with pid 59293"
+    );
 }
 
 #[test]
@@ -760,12 +774,7 @@ fn the_codex_cli_is_recognised_wherever_it_is_installed() {
     assert_eq!(
         snapshot.sessions.len(),
         2,
-        "the same CLI at two installation roots is two sessions, got {:?}",
-        snapshot
-            .sessions
-            .iter()
-            .map(|s| (s.pid, s.cli.as_str()))
-            .collect::<Vec<_>>()
+        "the same CLI at two installation roots is two sessions"
     );
     assert!(snapshot.sessions.iter().all(|s| s.cli == "codex"));
 }
@@ -786,12 +795,8 @@ fn a_codex_binary_inside_an_application_bundle_is_not_a_cli_session() {
 
     assert!(
         snapshot.sessions.is_empty(),
-        "a bundled binary is not a CLI session, got {:?}",
-        snapshot
-            .sessions
-            .iter()
-            .map(|s| (s.pid, s.cli.as_str()))
-            .collect::<Vec<_>>()
+        "a bundled binary is not a CLI session, got {} sessions",
+        snapshot.sessions.len()
     );
 }
 
@@ -948,6 +953,11 @@ fn silent_for(seconds: u64) -> SystemTime {
     fixture_now() - Duration::from_secs(seconds)
 }
 
+/// Helper to check if a session has a specific process pid.
+fn has_pid(session: &acmon::Session, pid: i32) -> bool {
+    matches!(&session.identity, acmon::Identity::Process { pid: p } if *p == pid)
+}
+
 const CLAUDE_NAMESPACE: &str = "-Users-pmcfadin-projects-agentic-coding-monitor";
 
 #[test]
@@ -1058,5 +1068,206 @@ fn a_codex_sessions_silence_comes_from_the_index_rather_than_a_transcript_read()
         snapshot.sessions[0].liveness.state,
         State::Waiting,
         "forty-five minutes of silence with the process still there is waiting"
+    );
+}
+
+#[test]
+fn a_transcript_silent_past_stall_with_no_process_is_stalled() {
+    // The core acceptance criterion: a transcript that has been silent for longer than
+    // the stall threshold, with no live process for it, is STALLED. This is what makes
+    // ticket #6's summary — "Kill a session and it becomes STALLED on the next
+    // collection" — actually true.
+    let world = FakeWorld::with(
+        vec![rec_in(
+            88429,
+            "/Users/pmcfadin/projects/acmon/target/debug/acmon",
+            "/Users/pmcfadin/projects/acmon", // Observer is in a different workspace
+        )],
+        88429,
+    )
+    .namespace_activity(CLAUDE_NAMESPACE.to_string(), Ok(silent_for(13 * 3600))); // 13 hours
+
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
+
+    let transcript_session = snapshot
+        .sessions
+        .iter()
+        .find(|s| matches!(s.identity, acmon::Identity::Transcript { .. }))
+        .expect("a transcript-derived session should exist");
+
+    assert_eq!(
+        transcript_session.liveness.state,
+        State::Stalled,
+        "a transcript silent past the stall threshold with no process is STALLED"
+    );
+    assert_eq!(transcript_session.cli, "claude");
+}
+
+#[test]
+fn a_transcript_with_a_live_process_appears_once_and_is_not_stalled() {
+    // The same transcript as above, but with a live process for it. It must appear
+    // exactly once (not duplicated as both process-derived and transcript-derived), and
+    // the verdict must come from the process-derived session, not the transcript.
+    let world = FakeWorld::with(
+        vec![
+            rec(69046, CLAUDE_EXE),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .namespace_activity(CLAUDE_NAMESPACE.to_string(), Ok(silent_for(13 * 3600))); // 13 hours
+
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
+
+    let claude_sessions: Vec<_> = snapshot
+        .sessions
+        .iter()
+        .filter(|s| s.cli == "claude")
+        .collect();
+
+    assert_eq!(
+        claude_sessions.len(),
+        1,
+        "the session must appear exactly once, not as both process-derived and \
+         transcript-derived"
+    );
+    assert!(
+        matches!(claude_sessions[0].identity, acmon::Identity::Process { .. }),
+        "the session must be process-derived, not transcript-derived"
+    );
+    assert_ne!(
+        claude_sessions[0].liveness.state,
+        State::Stalled,
+        "a session with a live process is not STALLED, regardless of transcript silence"
+    );
+}
+
+#[test]
+fn a_transcript_past_stall_with_work_in_workspace_is_not_stalled() {
+    // Acceptance criterion: "A live build or review process running in a workspace
+    // prevents a false STALLED". This rule can only be tested when the session itself
+    // has no process, because otherwise process_resident alone would prevent STALLED.
+    let world = FakeWorld::with(
+        vec![
+            // A build running in the same directory the transcript is for.
+            rec_in(
+                12345,
+                "/usr/bin/cargo",
+                "/Users/pmcfadin/projects/agentic_coding_monitor",
+            ),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .namespace_activity(CLAUDE_NAMESPACE.to_string(), Ok(silent_for(13 * 3600))); // 13 hours
+
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
+
+    let transcript_session = snapshot
+        .sessions
+        .iter()
+        .find(|s| matches!(s.identity, acmon::Identity::Transcript { .. }))
+        .expect("a transcript-derived session should exist");
+
+    assert_eq!(
+        transcript_session.liveness.state,
+        State::Waiting,
+        "work running in the workspace prevents a false STALLED verdict"
+    );
+}
+
+#[test]
+fn a_transcript_derived_claude_session_reports_workspace_as_not_invertible() {
+    // A transcript-derived Claude session cannot report its workspace path, because the
+    // namespace mapping is not invertible: `-a-b-c` could have come from `_`, `.`, `-`,
+    // or `/`. The session must report this as a specific reason, not as a generic
+    // "unknown" or a guessed path.
+    let world = FakeWorld::with(
+        vec![rec(
+            88429,
+            "/Users/pmcfadin/projects/acmon/target/debug/acmon",
+        )],
+        88429,
+    )
+    .namespace_activity(CLAUDE_NAMESPACE.to_string(), Ok(silent_for(5 * 3600))); // 5 hours
+
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
+
+    let transcript_session = snapshot
+        .sessions
+        .iter()
+        .find(|s| matches!(s.identity, acmon::Identity::Transcript { .. }))
+        .expect("a transcript-derived session should exist");
+
+    assert_eq!(
+        transcript_session.workspace,
+        Err(WorkspaceUnknown::NotInvertible),
+        "a transcript-derived Claude session must report NotInvertible, not a guessed path"
+    );
+}
+
+#[test]
+fn a_transcript_derived_codex_session_reports_its_workspace_from_the_transcript() {
+    // A transcript-derived Codex session has its workspace recorded in the transcript,
+    // so the workspace path is known even though the process is gone.
+    let world = FakeWorld::with(
+        vec![rec(
+            88429,
+            "/Users/pmcfadin/projects/acmon/target/debug/acmon",
+        )],
+        88429,
+    )
+    .with_codex_sessions(Ok(vec![CodexSession {
+        id: CODEX_SESSION_ID.to_string(),
+        workspace: CODEX_WORKSPACE.to_string(),
+        last_activity: silent_for(5 * 3600), // 5 hours
+    }]));
+
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
+
+    let transcript_session = snapshot
+        .sessions
+        .iter()
+        .find(|s| s.cli == "codex" && matches!(s.identity, acmon::Identity::Transcript { .. }))
+        .expect("a transcript-derived Codex session should exist");
+
+    assert_eq!(
+        transcript_session
+            .workspace
+            .as_ref()
+            .expect("workspace is known")
+            .path,
+        CODEX_WORKSPACE,
+        "a transcript-derived Codex session knows its workspace from the transcript"
+    );
+}
+
+#[test]
+fn a_transcript_silent_for_less_than_stall_with_no_process_is_unknown() {
+    // A transcript that is silent but has not yet crossed the stall threshold is
+    // UNKNOWN, not STALLED. The stall threshold is 12 hours; this transcript has been
+    // silent for 6 hours.
+    let world = FakeWorld::with(
+        vec![rec_in(
+            88429,
+            "/Users/pmcfadin/projects/acmon/target/debug/acmon",
+            "/Users/pmcfadin/projects/acmon", // Observer is in a different workspace
+        )],
+        88429,
+    )
+    .namespace_activity(CLAUDE_NAMESPACE.to_string(), Ok(silent_for(6 * 3600))); // 6 hours
+
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
+
+    let transcript_session = snapshot
+        .sessions
+        .iter()
+        .find(|s| matches!(s.identity, acmon::Identity::Transcript { .. }))
+        .expect("a transcript-derived session should exist");
+
+    assert_eq!(
+        transcript_session.liveness.state,
+        State::Unknown,
+        "a transcript silent for less than the stall threshold is UNKNOWN, not STALLED"
     );
 }

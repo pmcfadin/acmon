@@ -11,10 +11,21 @@ use crate::world::{
     CodexSession, PathUnavailable, Resources, ResourcesUnavailable, World, WorldError,
 };
 
-/// One agent CLI process.
+/// A session's identity: either a live process, or a transcript without one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Identity {
+    /// Found in the process enumeration.
+    Process { pid: i32 },
+    /// Found in the transcript store, with no live process. For Claude this is the
+    /// namespace directory name; for Codex it is the session id.
+    Transcript { recorded_as: String },
+}
+
+/// One agent CLI session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
-    pub pid: i32,
+    /// How this session was discovered: either from a process, or from a transcript.
+    pub identity: Identity,
     /// Which CLI this is, taken from the detector that matched.
     pub cli: String,
     /// What this session has consumed, or why that could not be read.
@@ -205,7 +216,7 @@ fn silence_of(
 /// pass that found the sessions.
 fn work_running_in(
     workspace_path: &str,
-    session_pid: i32,
+    session_identity: &Identity,
     records: &[crate::ProcessRecord],
 ) -> bool {
     let inside = |candidate: &str| {
@@ -215,9 +226,194 @@ fn work_running_in(
                 && candidate.as_bytes()[workspace_path.len()] == b'/'
     };
 
+    let session_pid = match session_identity {
+        Identity::Process { pid } => Some(*pid),
+        Identity::Transcript { .. } => None,
+    };
+
     records.iter().any(|record| {
-        record.pid != session_pid && record.cwd.as_deref().map(inside).unwrap_or(false)
+        (session_pid != Some(record.pid)) && record.cwd.as_deref().map(inside).unwrap_or(false)
     })
+}
+
+/// Whether any process is working in a workspace that maps to a given namespace.
+///
+/// For transcript-derived Claude sessions, we can't reverse the namespace mapping to get
+/// a path, but we can check if any process's cwd maps forward to the namespace.
+fn work_running_in_namespace(
+    namespace: &str,
+    records: &[crate::ProcessRecord],
+    detectors: &[crate::Detector],
+) -> bool {
+    records.iter().any(|record| {
+        // Only consider non-agent processes as "work". An agent process in that
+        // workspace is a session, not work.
+        let is_agent = record
+            .exe_path
+            .as_ref()
+            .ok()
+            .and_then(|exe| detectors.iter().find(|d| d.matches(exe)))
+            .is_some();
+
+        !is_agent
+            && record
+                .cwd
+                .as_ref()
+                .ok()
+                .map(|cwd| namespace_for(cwd).eq_ignore_ascii_case(namespace))
+                .unwrap_or(false)
+    })
+}
+
+/// Discover sessions from transcript stores that have no live process.
+///
+/// Only transcripts active within a reasonable window are candidates. The window is
+/// 2x the stall threshold to catch sessions that are solidly stalled while still
+/// bounding the work — a transcript silent for 25 hours on a 12-hour threshold is
+/// genuinely abandoned and need not be checked every collection.
+fn transcript_derived_sessions(
+    sources: &AttributionSources,
+    process_sessions: &[Session],
+    observation: &crate::ProcessSnapshot,
+    world: &dyn World,
+    now: SystemTime,
+    thresholds: &Thresholds,
+    detectors: &[crate::Detector],
+) -> Vec<Session> {
+    let mut transcript_sessions = Vec::new();
+
+    // Only transcripts active within this window are candidates, which is what bounds the
+    // work — otherwise every namespace ever recorded would be a candidate forever.
+    //
+    // Twice the stall threshold, not once: a session becomes STALLED the moment its silence
+    // passes `stall`, so a window equal to `stall` would exclude it at exactly the instant
+    // it became worth reporting, and STALLED would be unreachable again.
+    //
+    // The ceiling has a consequence worth knowing: a session silent for longer than this
+    // window drops out of the table entirely rather than staying STALLED. It is reported
+    // while it is news and then it is gone. Remembering it for longer means persisting
+    // state between runs, which is ticket #8.
+    let discovery_window = thresholds.stall * 2;
+
+    // Claude Code transcripts: one namespace directory per workspace.
+    if let Ok(namespaces) = &sources.claude_namespaces {
+        for namespace in namespaces {
+            // Skip if a process-derived session already claims this namespace.
+            let already_claimed = process_sessions.iter().any(|session| {
+                session.cli == "claude"
+                    && session
+                        .workspace
+                        .as_ref()
+                        .ok()
+                        .and_then(|w| w.namespace.as_ref().ok())
+                        .map(|n| n == namespace)
+                        .unwrap_or(false)
+            });
+            if already_claimed {
+                continue;
+            }
+
+            // Only transcripts active within the discovery window are candidates.
+            let last_activity = match world.namespace_activity(namespace) {
+                Ok(time) => time,
+                Err(_) => continue, // Cannot determine activity, skip it.
+            };
+            let silence = now.duration_since(last_activity).unwrap_or(Duration::ZERO);
+            if silence <= discovery_window {
+                let identity = Identity::Transcript {
+                    recorded_as: namespace.clone(),
+                };
+
+                // A transcript-derived Claude session has no derivable workspace path,
+                // because the namespace mapping is not invertible. Report the reason.
+                let workspace = Err(WorkspaceUnknown::NotInvertible);
+
+                // For checking if work is running, we check if any non-agent process has
+                // a cwd that maps to this namespace.
+                let work_running =
+                    work_running_in_namespace(namespace, &observation.records, detectors);
+
+                let liveness = classify(
+                    &Observation {
+                        silence: Some(silence),
+                        process_resident: false,
+                        work_running_in_workspace: work_running,
+                        snapshot_trustworthy: true,
+                    },
+                    thresholds,
+                );
+
+                transcript_sessions.push(Session {
+                    identity,
+                    cli: "claude".to_string(),
+                    resources: Err(ResourcesUnavailable::ProcessExited),
+                    workspace,
+                    liveness,
+                });
+            }
+        }
+    }
+
+    // Codex transcripts: session index reports workspace and last_activity.
+    if let Ok(codex_sessions) = &sources.codex_sessions {
+        for codex_session in codex_sessions {
+            // Skip if a process-derived session already claims this session id.
+            let already_claimed = process_sessions.iter().any(|session| {
+                session.cli == "codex"
+                    && session
+                        .workspace
+                        .as_ref()
+                        .ok()
+                        .and_then(|w| w.namespace.as_ref().ok())
+                        .map(|n| n == &codex_session.id)
+                        .unwrap_or(false)
+            });
+            if already_claimed {
+                continue;
+            }
+
+            // Only sessions active within the discovery window are candidates.
+            let silence = now
+                .duration_since(codex_session.last_activity)
+                .unwrap_or(Duration::ZERO);
+            if silence <= discovery_window {
+                let identity = Identity::Transcript {
+                    recorded_as: codex_session.id.clone(),
+                };
+
+                // A transcript-derived Codex session has its workspace recorded in the
+                // transcript, so it is known.
+                let workspace = Ok(Workspace {
+                    path: codex_session.workspace.clone(),
+                    namespace: Ok(codex_session.id.clone()),
+                });
+
+                let liveness = classify(
+                    &Observation {
+                        silence: Some(silence),
+                        process_resident: false,
+                        work_running_in_workspace: workspace
+                            .as_ref()
+                            .ok()
+                            .map(|w| work_running_in(&w.path, &identity, &observation.records))
+                            .unwrap_or(false),
+                        snapshot_trustworthy: true,
+                    },
+                    thresholds,
+                );
+
+                transcript_sessions.push(Session {
+                    identity,
+                    cli: "codex".to_string(),
+                    resources: Err(ResourcesUnavailable::ProcessExited),
+                    workspace,
+                    liveness,
+                });
+            }
+        }
+    }
+
+    transcript_sessions
 }
 
 /// Collect a snapshot of the agent sessions on this machine.
@@ -247,24 +443,26 @@ pub fn collect(world: &dyn World, now: SystemTime) -> Result<Snapshot, CollectEr
 
     let thresholds = Thresholds::default();
 
-    let mut sessions: Vec<Session> = observation
+    // Sessions from processes — discovered by scanning the process table.
+    let process_sessions: Vec<Session> = observation
         .records
         .iter()
         .filter_map(|record| {
             let exe = record.exe_path.as_ref().ok()?;
             let detector = detectors.iter().find(|d| d.matches(exe))?;
             let workspace = workspace_of(&detector.id, &record.cwd, &sources);
+            let identity = Identity::Process { pid: record.pid };
 
             let liveness = classify(
                 &Observation {
                     silence: silence_of(&workspace, &detector.id, &sources, world, now),
                     // This session was found *in* the enumeration, so its process was
-                    // observed to be there. See the note on STALLED below.
+                    // observed to be there.
                     process_resident: true,
                     work_running_in_workspace: workspace
                         .as_ref()
                         .ok()
-                        .map(|w| work_running_in(&w.path, record.pid, &observation.records))
+                        .map(|w| work_running_in(&w.path, &identity, &observation.records))
                         .unwrap_or(false),
                     // The enumeration was checked against itself above, and a collection
                     // over an untrustworthy one never gets this far.
@@ -274,7 +472,7 @@ pub fn collect(world: &dyn World, now: SystemTime) -> Result<Snapshot, CollectEr
             );
 
             Some(Session {
-                pid: record.pid,
+                identity: identity.clone(),
                 cli: detector.id.clone(),
                 resources: world.resources(record.pid),
                 workspace,
@@ -283,6 +481,31 @@ pub fn collect(world: &dyn World, now: SystemTime) -> Result<Snapshot, CollectEr
         })
         .collect();
 
-    sessions.sort_by_key(|s| s.pid);
+    // Sessions from transcripts — discovered by scanning the transcript stores.
+    // Only transcripts active within the stall threshold are candidates, and only
+    // those not already claimed by a process-derived session.
+    let transcript_sessions = transcript_derived_sessions(
+        &sources,
+        &process_sessions,
+        &observation,
+        world,
+        now,
+        &thresholds,
+        &detectors,
+    );
+
+    let mut sessions = process_sessions;
+    sessions.extend(transcript_sessions);
+
+    // Sort by identity for stable output: processes by pid, transcripts by recorded_as.
+    sessions.sort_by(|a, b| match (&a.identity, &b.identity) {
+        (Identity::Process { pid: a_pid }, Identity::Process { pid: b_pid }) => a_pid.cmp(b_pid),
+        (Identity::Transcript { recorded_as: a }, Identity::Transcript { recorded_as: b }) => {
+            a.cmp(b)
+        }
+        (Identity::Process { .. }, Identity::Transcript { .. }) => std::cmp::Ordering::Less,
+        (Identity::Transcript { .. }, Identity::Process { .. }) => std::cmp::Ordering::Greater,
+    });
+
     Ok(Snapshot { sessions })
 }

@@ -6,7 +6,7 @@ use acmon::liveness::{Method, State, Verdict};
 use acmon::render::{minimum_width, render_to_lines, required_height};
 use acmon::workspace::{Workspace, WorkspaceUnknown};
 use acmon::world::{ResourceSource, Resources, ResourcesUnavailable, Unmeasured};
-use acmon::{Session, Snapshot};
+use acmon::{Identity, Session, Snapshot};
 
 /// A width that fits the whole table with room to spare. The narrow cases have their
 /// own tests.
@@ -46,7 +46,7 @@ fn snapshot_of(pids: &[i32]) -> Snapshot {
         sessions: pids
             .iter()
             .map(|&pid| Session {
-                pid,
+                identity: Identity::Process { pid },
                 cli: "claude".to_string(),
                 resources: Ok(measured_ledger()),
                 workspace: measured_workspace(),
@@ -59,7 +59,7 @@ fn snapshot_of(pids: &[i32]) -> Snapshot {
 fn snapshot_with(reading: Result<Resources, ResourcesUnavailable>) -> Snapshot {
     Snapshot {
         sessions: vec![Session {
-            pid: 264,
+            identity: Identity::Process { pid: 264 },
             cli: "claude".to_string(),
             resources: reading,
             workspace: measured_workspace(),
@@ -71,7 +71,7 @@ fn snapshot_with(reading: Result<Resources, ResourcesUnavailable>) -> Snapshot {
 fn snapshot_in(workspace: Result<Workspace, WorkspaceUnknown>) -> Snapshot {
     Snapshot {
         sessions: vec![Session {
-            pid: 264,
+            identity: Identity::Process { pid: 264 },
             cli: "claude".to_string(),
             resources: Ok(measured_ledger()),
             workspace,
@@ -309,7 +309,7 @@ fn a_terminal_too_narrow_for_the_numbers_says_so_instead_of_truncating() {
 fn snapshot_in_state(verdict: Verdict) -> Snapshot {
     Snapshot {
         sessions: vec![Session {
-            pid: 264,
+            identity: Identity::Process { pid: 264 },
             cli: "claude".to_string(),
             resources: Ok(measured_ledger()),
             workspace: measured_workspace(),
@@ -423,5 +423,77 @@ fn a_state_is_never_abbreviated_to_fit() {
     assert!(
         text.contains("STALLED"),
         "the full state must survive at the narrowest renderable width; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_transcript_derived_row_shows_gone_not_a_number() {
+    // A transcript-derived session has no pid because the process exited. The PID column
+    // must show something short and true — "gone" is the intended word — never blank,
+    // and never a fabricated number like 0 or -1.
+    let text = rendered(
+        &Snapshot {
+            sessions: vec![Session {
+                identity: Identity::Transcript {
+                    recorded_as: "-Users-pmcfadin-projects-agentic-coding-monitor".to_string(),
+                },
+                cli: "claude".to_string(),
+                resources: Err(ResourcesUnavailable::ProcessExited),
+                workspace: Err(WorkspaceUnknown::NotInvertible),
+                liveness: Verdict {
+                    state: State::Stalled,
+                    method: Method::NoProcessAndSilencePastStall,
+                },
+            }],
+        },
+        WIDE,
+    );
+
+    assert!(
+        text.contains("gone"),
+        "the PID column must show 'gone' for a transcript-derived session; got:\n{text}"
+    );
+    for fabrication in ["0", "-1", "N/A"] {
+        assert!(
+            !text.contains(fabrication),
+            "the PID column must not show a fabricated number like {fabrication}; got:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn a_transcript_derived_claude_row_shows_its_namespace_in_the_workspace_column() {
+    // A transcript-derived Claude session cannot show a workspace path (the namespace
+    // mapping is not invertible), but the namespace itself should appear in the
+    // workspace column. A human reading `-Users-pmcfadin-projects-agentic-coding-monitor`
+    // can see which directory it is; the program must not claim to know, but withholding
+    // it entirely would make the row useless.
+    let namespace = "-Users-pmcfadin-projects-agentic-coding-monitor";
+    let text = rendered(
+        &Snapshot {
+            sessions: vec![Session {
+                identity: Identity::Transcript {
+                    recorded_as: namespace.to_string(),
+                },
+                cli: "claude".to_string(),
+                resources: Err(ResourcesUnavailable::ProcessExited),
+                workspace: Err(WorkspaceUnknown::NotInvertible),
+                liveness: Verdict {
+                    state: State::Stalled,
+                    method: Method::NoProcessAndSilencePastStall,
+                },
+            }],
+        },
+        WIDE,
+    );
+
+    assert!(
+        text.contains("agentic-coding-monitor"),
+        "the workspace column must show the namespace verbatim; got:\n{text}"
+    );
+    assert!(
+        !text.contains("not-invertible"),
+        "the workspace column must not show the error reason when the namespace is available; \
+         got:\n{text}"
     );
 }

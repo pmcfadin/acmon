@@ -10,7 +10,7 @@ pub mod render;
 pub mod workspace;
 pub mod world;
 
-pub use collect::{collect, CollectError, Session, Snapshot};
+pub use collect::{collect, CollectError, Identity, Session, Snapshot};
 pub use detect::Detector;
 pub use real_world::RealWorld;
 pub use world::{PathUnavailable, ProcessRecord, ProcessSnapshot, World, WorldError};
