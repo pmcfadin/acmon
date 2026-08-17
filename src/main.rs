@@ -7,9 +7,10 @@ fn main() -> ExitCode {
 
     match collect(&world) {
         Ok(snapshot) => {
-            // Height: a bordered block, a header row, and one row per session.
-            let height = (snapshot.sessions.len() + 4) as u16;
-            for line in render::render_to_lines(&snapshot, 78, height) {
+            let height = render::required_height(&snapshot);
+            // Standard terminal width; no crossterm dependency needed for one-shot output
+            let width = 80;
+            for line in render::render_to_lines(&snapshot, width, height) {
                 println!("{line}");
             }
             ExitCode::SUCCESS
@@ -17,7 +18,7 @@ fn main() -> ExitCode {
         Err(error) => {
             // Say what went wrong. Never print an empty table on failure — that would
             // be indistinguishable from a machine with no agents running.
-            eprintln!("acmon: could not collect a trustworthy snapshot: {error:?}");
+            eprintln!("acmon: {}", error);
             ExitCode::FAILURE
         }
     }
