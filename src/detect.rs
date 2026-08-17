@@ -15,7 +15,9 @@ pub struct Detector {
 
 impl Detector {
     pub fn matches(&self, exe_path: &str) -> bool {
-        self.exe_contains.iter().any(|needle| exe_path.contains(needle))
+        self.exe_contains
+            .iter()
+            .any(|needle| exe_path.contains(needle))
     }
 }
 

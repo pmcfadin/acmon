@@ -30,7 +30,6 @@ impl World for FakeWorld {
 fn rec(pid: i32, exe: &str) -> ProcessRecord {
     ProcessRecord {
         pid,
-        ppid: 1,
         exe_path: Some(exe.to_string()),
     }
 }
@@ -108,7 +107,10 @@ fn a_machine_with_no_agent_sessions_reports_zero_rather_than_failing() {
     // agent CLI. That must be reported as zero sessions, not as an error — otherwise
     // "nothing running" and "cannot tell" collapse into the same answer.
     let world = FakeWorld::with(
-        vec![rec(99999, "/Users/pmcfadin/projects/acmon/target/debug/acmon")],
+        vec![rec(
+            99999,
+            "/Users/pmcfadin/projects/acmon/target/debug/acmon",
+        )],
         99999,
     );
 

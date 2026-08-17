@@ -1,24 +1,24 @@
-// TEMPORARY SPIKE — discovers what the OS reports as an executable path.
-// Replaced by the real implementation in the TDD cycles that follow.
-use libproc::processes::{pids_by_type, ProcFilter};
-use libproc::proc_pid;
+use std::process::ExitCode;
 
-fn main() {
-    let pids = pids_by_type(ProcFilter::All).expect("listpids");
-    println!("total pids visible: {}", pids.len());
-    let mut interesting = 0;
-    for pid in pids {
-        let p = pid as i32;
-        match proc_pid::pidpath(p) {
-            Ok(path) => {
-                let l = path.to_lowercase();
-                if l.contains("claude") || l.contains("codex") || l.contains("cursor") || l.contains("gemini") {
-                    interesting += 1;
-                    println!("  pid={p:<7} {path}");
-                }
+use acmon::{collect, render, RealWorld};
+
+fn main() -> ExitCode {
+    let world = RealWorld::new();
+
+    match collect(&world) {
+        Ok(snapshot) => {
+            // Height: a bordered block, a header row, and one row per session.
+            let height = (snapshot.sessions.len() + 4) as u16;
+            for line in render::render_to_lines(&snapshot, 78, height) {
+                println!("{line}");
             }
-            Err(_) => {}
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            // Say what went wrong. Never print an empty table on failure — that would
+            // be indistinguishable from a machine with no agents running.
+            eprintln!("acmon: could not collect a trustworthy snapshot: {error:?}");
+            ExitCode::FAILURE
         }
     }
-    println!("agent-ish exe paths: {interesting}");
 }

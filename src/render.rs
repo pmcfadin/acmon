@@ -34,8 +34,7 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot) {
 ///
 /// Used by tests, and by anything that wants the output without a terminal.
 pub fn render_to_lines(snapshot: &Snapshot, width: u16, height: u16) -> Vec<String> {
-    let mut terminal =
-        Terminal::new(TestBackend::new(width, height)).expect("in-memory terminal");
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("in-memory terminal");
     terminal
         .draw(|frame| draw(frame, snapshot))
         .expect("drawing into an in-memory buffer cannot fail");

@@ -7,7 +7,6 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessRecord {
     pub pid: i32,
-    pub ppid: i32,
     /// `None` when the path could not be read.
     ///
     /// Never an empty string: an unreadable path must not be representable in the

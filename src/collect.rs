@@ -23,7 +23,9 @@ pub enum CollectError {
     /// The process enumeration did not contain the process that produced it, so it
     /// died part-way. Its contents prove nothing — in particular, the absence of
     /// sessions in it does not mean there are none.
-    UntrustworthySnapshot { observer_pid: i32 },
+    UntrustworthySnapshot {
+        observer_pid: i32,
+    },
 }
 
 /// Collect a snapshot of the agent sessions on this machine.

@@ -353,7 +353,14 @@ the snapshot failed silently and its emptiness means nothing.
 
 **`lsof` cannot identify Claude Code.** The process sets its title to its version
 string, so `lsof` reports the command as `2.1.233`. Identity must come from a second
-source (argv or exe path), joined by pid — which reintroduces a race.
+source, joined by pid — which reintroduces a race.
+
+**And that second source must be the resolved executable path, not argv.** `pgrep -f`
+silently fails on long argv. A genuine Claude session observed with a 2,033-byte argv
+(a large `--settings` JSON blob) matched **none** of `pgrep -f 'bin/claude'`,
+`pgrep -f 'claude'`, or `pgrep -f 'local/bin'`, while `proc_pidpath` returned its path
+correctly. Any argv-based detector has an invisible blind spot proportional to how
+much configuration a session was launched with.
 
 **Atomicity matters.** Enumerating processes and then resolving cwd in a later pass
 produced 6 "unreadable cwd" entries that were simply *dead processes*. Get identity
@@ -639,6 +646,11 @@ here were taken at 3 hours' uptime and are not comparable to 10-day figures.
 | 2 | Slug comparison is case-sensitive | `WorkforceOS` namespace never matches `workforceos` cwd |
 | 3 | `pgrep -f 'Resources/codex'` matches `/Applications/ChatGPT.app/.../Resources/codex` | False positive on the desktop app, and **misses the real CLI entirely** (its path ends `bin/codex`) |
 | 4 | `pgrep -f '/\.codex/'` matches the Computer Use helper | False positive |
+| 5 | Detection is `pgrep -f`, which fails on long argv | A real session with a 2,033-byte argv matched **no** `pgrep -f` pattern at all. Sessions launched with large settings blobs are simply invisible |
+
+Bug 5 was found by the replacement tool on its first real run against this machine:
+it reported 14 Claude sessions where `pgrep` reported 13, and the extra one was
+genuine.
 
 Bugs 3 and 4 are the serious pair. In `classify()`, a resident session downgrades a
 stale lane from `STALLED` to `WAITING`. Because the ChatGPT desktop app is
