@@ -79,6 +79,8 @@ fn captured_process_table() -> Vec<ProcessRecord> {
         rec(63202, "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/Contents/MacOS/Cursor Helper"),
         rec(21023, "/Users/pmcfadin/.local/share/cursor-agent/versions/2026.05.01-eea359f/node"),
         // --- Agent SDK's bundled Claude CLI — a distinct build from the versioned one
+        // FIXME(pids): 89000/89001 are placeholders, not observations. Replace
+        // when an Agent SDK process is running. The PATHS below are genuine.
         rec(89000, "/Users/pmcfadin/.claude/security/agent-sdk-venv/lib/python3.14/site-packages/claude_agent_sdk/_bundled/claude"),
         rec(89001, "/Users/pmcfadin/.claude/security/agent-sdk-venv/lib/python3.14/site-packages/claude_agent_sdk/_bundled/claude"),
         // --- the observing process itself, captured from a real test run
