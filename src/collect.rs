@@ -4,8 +4,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::detect::embedded_detectors;
 use crate::liveness::{classify, Observation, Thresholds, Verdict};
+use crate::vcs::WorkspaceState;
 use crate::workspace::{
-    namespace_for, recorded_namespace, NamespaceUnmatched, Workspace, WorkspaceUnknown,
+    namespace_for, recorded_namespace, NamespaceResolution, NamespaceUnmatched, Workspace,
+    WorkspaceUnknown,
 };
 use crate::world::{
     CodexSession, PathUnavailable, Resources, ResourcesUnavailable, World, WorldError,
@@ -40,10 +42,59 @@ pub struct Session {
     pub liveness: Verdict,
 }
 
+/// One workspace, as the at-risk panel needs to see it.
+///
+/// A workspace is a directory an agent works in. Being a git repository — or a linked
+/// worktree of one — is an *attribute* recorded here, never a precondition for appearing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceReport {
+    /// The repository root when one was found, otherwise the directory as observed.
+    ///
+    /// The root rather than the observed directory, because several processes working in
+    /// different subdirectories of one repository are in ONE workspace, and reporting them
+    /// separately would inflate the panel with duplicates of the same risk.
+    pub path: String,
+    /// Whether this workspace holds work that exists nowhere else, and whether anything is
+    /// driving it.
+    pub state: WorkspaceState,
+    /// A linked worktree rather than a repository's primary working tree.
+    ///
+    /// Recorded because it is true and because it tells a human where the real `.git` is —
+    /// and because two thirds of the git workspaces on the machine behind
+    /// `docs/observability-mechanics.md` §4.6 are linked worktrees, so a design that
+    /// treated them as a special case would ignore the majority of them.
+    pub linked_worktree: bool,
+    /// How many entries version control reported as uncommitted.
+    ///
+    /// `None` exactly when `state` is [`WorkspaceState::Unknown`], whose reason is the
+    /// explanation. It is never `Some(0)` standing in for "could not tell".
+    pub uncommitted_entries: Option<usize>,
+}
+
 /// Everything observed in one collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub sessions: Vec<Session>,
+    /// Every workspace that was located, whatever its state.
+    ///
+    /// Deliberately includes CLEAN workspaces. The at-risk panel has to be able to say how
+    /// many workspaces it checked, because an empty panel must read as "checked and clear"
+    /// rather than as possibly broken.
+    pub workspaces: Vec<WorkspaceReport>,
+    /// Recorded transcript namespaces that could not be turned into a directory, and what
+    /// the search concluded about each.
+    ///
+    /// Never silently dropped. A workspace whose path could not be established has an
+    /// unknown version-control state, and unknown is not clean. Of 109 namespaces on the
+    /// machine behind the mechanics document, 77 land here — mostly deleted worktrees and
+    /// expired temporary directories.
+    pub unlocated: Vec<(String, NamespaceResolution)>,
+    /// Whether the directory sweep that finds workspaces ran to completion.
+    ///
+    /// `false` means coverage is partial and the panel must say so. A truncated list of
+    /// at-risk workspaces presented as exhaustive is the calm, plausible, wrong answer this
+    /// project exists to remove.
+    pub sweep_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +257,22 @@ fn silence_of(
     Some(now.duration_since(last_activity).unwrap_or(Duration::ZERO))
 }
 
+/// Whether a candidate path lies inside a workspace path.
+///
+/// `candidate` is inside `workspace_path` when it equals it or is a subdirectory of it.
+/// Compared case-insensitively because APFS is case-insensitive but case-preserving.
+///
+/// Extracted from `work_running_in` and reused by workspace classification, because a
+/// workspace counted as driven by one rule and stranded by the other would be the
+/// Duplicated Code smell — and worse, the two copies could drift so that detection and
+/// classification disagree about what "inside" means.
+fn is_inside(candidate: &str, workspace_path: &str) -> bool {
+    candidate.eq_ignore_ascii_case(workspace_path)
+        || candidate.len() > workspace_path.len()
+            && candidate[..workspace_path.len()].eq_ignore_ascii_case(workspace_path)
+            && candidate.as_bytes()[workspace_path.len()] == b'/'
+}
+
 /// Whether any process other than the session itself is working in its workspace.
 ///
 /// This is what stops a build or a test run from being mistaken for a dead session:
@@ -219,20 +286,18 @@ fn work_running_in(
     session_identity: &Identity,
     records: &[crate::ProcessRecord],
 ) -> bool {
-    let inside = |candidate: &str| {
-        candidate.eq_ignore_ascii_case(workspace_path)
-            || candidate.len() > workspace_path.len()
-                && candidate[..workspace_path.len()].eq_ignore_ascii_case(workspace_path)
-                && candidate.as_bytes()[workspace_path.len()] == b'/'
-    };
-
     let session_pid = match session_identity {
         Identity::Process { pid } => Some(*pid),
         Identity::Transcript { .. } => None,
     };
 
     records.iter().any(|record| {
-        (session_pid != Some(record.pid)) && record.cwd.as_deref().map(inside).unwrap_or(false)
+        (session_pid != Some(record.pid))
+            && record
+                .cwd
+                .as_deref()
+                .map(|cwd| is_inside(cwd, workspace_path))
+                .unwrap_or(false)
     })
 }
 
@@ -324,14 +389,34 @@ fn transcript_derived_sessions(
                     recorded_as: namespace.clone(),
                 };
 
-                // A transcript-derived Claude session has no derivable workspace path,
-                // because the namespace mapping is not invertible. Report the reason.
-                let workspace = Err(WorkspaceUnknown::NotInvertible);
+                // A transcript-derived Claude session's workspace comes from resolving the
+                // namespace. The namespace mapping is not invertible (three characters
+                // collapse to `-`), so this is done as a verified search over directories
+                // that actually exist.
+                let workspace = match world.resolve_namespace(namespace) {
+                    NamespaceResolution::Resolved(path) => Ok(Workspace {
+                        path,
+                        namespace: Ok(namespace.clone()),
+                    }),
+                    NamespaceResolution::Ambiguous(candidates) => {
+                        Err(WorkspaceUnknown::Ambiguous {
+                            candidates: candidates.len(),
+                        })
+                    }
+                    NamespaceResolution::NoLongerExists => Err(WorkspaceUnknown::WorkspaceGone),
+                    NamespaceResolution::SearchExhausted => Err(WorkspaceUnknown::SearchIncomplete),
+                };
 
-                // For checking if work is running, we check if any non-agent process has
-                // a cwd that maps to this namespace.
-                let work_running =
-                    work_running_in_namespace(namespace, &observation.records, detectors);
+                // For checking if work is running: when the workspace resolved to a path, use
+                // that directly; when it did not, fall back to checking if any process's cwd
+                // maps forward to the namespace.
+                let work_running = workspace
+                    .as_ref()
+                    .ok()
+                    .map(|w| work_running_in(&w.path, &identity, &observation.records))
+                    .unwrap_or_else(|| {
+                        work_running_in_namespace(namespace, &observation.records, detectors)
+                    });
 
                 let liveness = classify(
                     &Observation {
@@ -509,5 +594,189 @@ pub fn collect(
         (Identity::Transcript { .. }, Identity::Process { .. }) => std::cmp::Ordering::Greater,
     });
 
-    Ok(Snapshot { sessions })
+    // --- Workspace discovery and classification ---
+    //
+    // Deliberately NOT bounded by the liveness discovery window that bounds session
+    // discovery. A workspace that has been stranded for a week is *more* at risk, not less.
+    // This is what makes the panel a durable safety net even though a stalled session drops
+    // out of the session table after the window.
+
+    // Source 1: Each session's own workspace path.
+    // Source 2: Every observed process working directory.
+    // Both land in the same set because a process's cwd might not be any session's workspace.
+    let mut candidate_paths: Vec<String> = sessions
+        .iter()
+        .filter_map(|s| s.workspace.as_ref().ok().map(|w| w.path.clone()))
+        .chain(
+            observation
+                .records
+                .iter()
+                .filter_map(|r| r.cwd.as_ref().ok().cloned()),
+        )
+        .collect();
+
+    // Source 3: Each recorded Claude namespace, resolved via `resolve_namespace`.
+    // Namespaces that do NOT resolve are remembered separately as unlocated.
+    let mut unlocated = Vec::new();
+    if let Ok(namespaces) = &sources.claude_namespaces {
+        for namespace in namespaces {
+            match world.resolve_namespace(namespace) {
+                NamespaceResolution::Resolved(path) => {
+                    candidate_paths.push(path);
+                }
+                resolution => {
+                    // A namespace that did not resolve goes into `unlocated`. Never silently
+                    // drop it: a workspace whose path could not be established has an unknown
+                    // version-control state, and unknown is not clean.
+                    unlocated.push((namespace.clone(), resolution));
+                }
+            }
+        }
+    }
+
+    // Source 4: Each Codex-recorded session workspace.
+    if let Ok(codex_sessions_list) = &sources.codex_sessions {
+        for codex_session in codex_sessions_list {
+            candidate_paths.push(codex_session.workspace.clone());
+        }
+    }
+
+    // Observational discovery alone — the first four sources — was measured to find 8 dirty
+    // workspaces on the target machine. The sweep below finds 14, adding 6 more, including
+    // `presto_testing` with 28 uncommitted entries — the largest pile of at-risk work on the
+    // machine and the same shape as the 27-file loss that motivated this project. The sweep
+    // is not an optimisation; it is what makes the safety net honest.
+
+    // Source 5: A sweep of the neighbourhoods the known repositories live in.
+    //
+    // The roots are the parent directories of those candidates that turned out to **be
+    // repositories** — not of every candidate. That distinction is load-bearing and was
+    // found by running it: many candidates are ordinary directories such as the home folder
+    // and `/private/tmp`, and sweeping *their* parents walks most of the disk. Measured with
+    // every candidate's parent, the sweep exhausted its budget and had to report partial
+    // coverage; derived from repositories only, it visits 122 directories, finds 70
+    // workspaces in 9 ms, and completes. No configuration is required either way.
+    //
+    // `repository_root` is asked again here rather than threaded down from above: it is a
+    // handful of `stat` calls, and duplicating its answer in a second structure is how the
+    // two would come to disagree.
+    let mut sweep_roots: Vec<String> = candidate_paths
+        .iter()
+        .filter_map(|path| world.repository_root(path).map(|(root, _)| root))
+        .filter_map(|repository| {
+            let parent = std::path::Path::new(&repository).parent()?;
+            let parent_str = parent.to_str()?;
+            // Never sweep `/` itself.
+            if parent_str.is_empty() || parent_str == "/" {
+                None
+            } else {
+                Some(parent_str.to_string())
+            }
+        })
+        .collect();
+    sweep_roots.sort();
+    sweep_roots.dedup();
+
+    let sweep = world.sweep_for_repositories(&sweep_roots);
+    candidate_paths.extend(sweep.repositories.iter().map(|(path, _)| path.clone()));
+
+    // Deduplicate candidates by path, **case-insensitively**, because APFS is
+    // case-insensitive but case-preserving and the same workspace arrives spelled
+    // differently from different sources. Keep the first spelling seen.
+    let mut seen_lowercase: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut unique_candidates = Vec::new();
+    for candidate in candidate_paths {
+        let lowercase = candidate.to_lowercase();
+        if seen_lowercase.insert(lowercase) {
+            unique_candidates.push(candidate);
+        }
+    }
+
+    // Map each candidate path through `repository_root`. When it names a root, the **root**
+    // is the workspace: several processes in different subdirectories of one repository are
+    // ONE workspace, and listing them separately would inflate the panel with duplicates of
+    // one risk.
+    //
+    // When `repository_root` finds nothing, **still keep the path as a candidate.** Being a
+    // worktree is treated as an attribute of a workspace, not a precondition for discovering
+    // one. It will classify as `Unknown(NotVersionControlled)`, which is not at risk.
+    let workspace_candidates: Vec<(String, bool)> = unique_candidates
+        .iter()
+        .map(|candidate| {
+            world
+                .repository_root(candidate)
+                .unwrap_or_else(|| (candidate.clone(), false))
+        })
+        .collect();
+
+    // Deduplicate again by root, case-insensitively, keeping the first spelling.
+    seen_lowercase.clear();
+    let mut unique_workspace_candidates = Vec::new();
+    for (root, linked) in workspace_candidates {
+        let lowercase = root.to_lowercase();
+        if seen_lowercase.insert(lowercase) {
+            unique_workspace_candidates.push((root, linked));
+        }
+    }
+
+    // Sort for stable output.
+    unique_workspace_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Call `vcs_facts_batch` **once** with all candidate paths — not `vcs_facts` in a loop.
+    // It is concurrent, and the sequential cost was measured at 5.0 s for 70 workspaces.
+    let workspace_paths: Vec<String> = unique_workspace_candidates
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect();
+    let vcs_facts_results = world.vcs_facts_batch(&workspace_paths);
+
+    // For each candidate, compute `session_driving`: whether any session whose identity is
+    // `Identity::Process { .. }` has a workspace path lying **within** this workspace.
+    //
+    // This rests on a live process rather than on the liveness verdict, because process
+    // residence is directly observed, whereas a WAITING verdict is inferred from silence,
+    // so a DIRTY-DRIVEN classification never depends on a guess.
+    let workspaces: Vec<WorkspaceReport> = unique_workspace_candidates
+        .iter()
+        .zip(vcs_facts_results.iter())
+        .map(|((path, linked_from_root), facts)| {
+            let session_driving = sessions.iter().any(|session| {
+                matches!(&session.identity, Identity::Process { .. })
+                    && session
+                        .workspace
+                        .as_ref()
+                        .ok()
+                        .map(|w| is_inside(&w.path, path))
+                        .unwrap_or(false)
+            });
+
+            let state = crate::vcs::classify(facts, session_driving);
+
+            // `linked_worktree` from the facts when they are `Ok`, otherwise from whatever
+            // `repository_root` reported for that candidate, otherwise `false`.
+            let linked_worktree = facts
+                .as_ref()
+                .map(|f| f.linked_worktree)
+                .unwrap_or(*linked_from_root);
+
+            // `uncommitted_entries` as `Some(n)` only when the facts are `Ok` — it must be
+            // `None` whenever `state` is `Unknown`, and never `Some(0)` standing in for
+            // "could not tell".
+            let uncommitted_entries = facts.as_ref().ok().map(|f| f.uncommitted_entries);
+
+            WorkspaceReport {
+                path: path.clone(),
+                state,
+                linked_worktree,
+                uncommitted_entries,
+            }
+        })
+        .collect();
+
+    Ok(Snapshot {
+        sessions,
+        workspaces,
+        unlocated,
+        sweep_complete: sweep.complete,
+    })
 }

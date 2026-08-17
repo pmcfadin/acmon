@@ -717,3 +717,491 @@ fn every_transcript_derived_session_has_process_resident_false() {
         }
     }
 }
+
+#[test]
+fn repository_root_of_this_crates_directory_is_this_crate() {
+    // This crate is a git repository, so asking for the root of its own directory must
+    // return the root, and it must not be a linked worktree (it is the primary).
+    let world = RealWorld::new();
+    let cwd = std::env::current_dir().expect("this test process has a working directory");
+    let cwd_str = cwd.to_str().expect("a UTF-8 path");
+
+    let result = world.repository_root(cwd_str);
+
+    assert!(
+        result.is_some(),
+        "this crate's directory must be inside a repository"
+    );
+    let (root, linked_worktree) = result.unwrap();
+
+    // The root must be an ancestor of (or equal to) the current directory.
+    assert!(
+        cwd_str.starts_with(&root),
+        "repository root {root} must be an ancestor of this directory {cwd_str}"
+    );
+
+    // This is the primary repository, not a linked worktree.
+    assert!(
+        !linked_worktree,
+        "this crate's repository is not a linked worktree"
+    );
+}
+
+#[test]
+fn repository_root_of_an_ancestorless_path_is_none() {
+    // A path with no parent, such as `/`, cannot be inside a repository (unless someone
+    // has created a repository at the filesystem root, which is not a real-world case).
+    // This tests the termination condition of the ancestor walk.
+    let world = RealWorld::new();
+
+    let result = world.repository_root("/");
+
+    assert_eq!(
+        result, None,
+        "the filesystem root is not inside a repository"
+    );
+}
+
+#[test]
+fn vcs_facts_of_a_nonexistent_path_is_path_gone() {
+    use acmon::vcs::Unreadable;
+
+    let world = RealWorld::new();
+
+    // A path that cannot exist: contains a component that is unlikely to be real.
+    let nonexistent = "/tmp/acmon-test-does-not-exist-e5a8f3b2-9c4d-4e1a-8b7f-3d2c1a0b9e8d";
+
+    let result = world.vcs_facts(nonexistent);
+
+    assert_eq!(
+        result,
+        Err(Unreadable::PathGone),
+        "a nonexistent path must return PathGone, not NotVersionControlled or a reading"
+    );
+}
+
+#[test]
+fn vcs_facts_of_a_non_repository_directory_is_not_version_controlled() {
+    use acmon::vcs::Unreadable;
+
+    let world = RealWorld::new();
+
+    // Create a temporary directory that is known not to be a repository.
+    let temp_dir = std::env::temp_dir().join("acmon-test-not-a-repo");
+    let _ = std::fs::create_dir(&temp_dir); // Ignore errors if it already exists.
+
+    let result = world.vcs_facts(temp_dir.to_str().expect("UTF-8 path"));
+
+    // Clean up.
+    let _ = std::fs::remove_dir(&temp_dir);
+
+    assert_eq!(
+        result,
+        Err(Unreadable::NotVersionControlled),
+        "a real directory that is not a repository must return NotVersionControlled, not a \
+         clean reading (which would be a fail-to-zero)"
+    );
+}
+
+#[test]
+fn vcs_facts_of_this_crate_agrees_with_repository_root() {
+    // Invariant: the root reported by vcs_facts must match what repository_root said.
+    // The count of uncommitted entries is deliberately NOT asserted — it varies between
+    // runs as work progresses.
+    let world = RealWorld::new();
+    let cwd = std::env::current_dir().expect("this test process has a working directory");
+    let cwd_str = cwd.to_str().expect("a UTF-8 path");
+
+    let expected_root = world
+        .repository_root(cwd_str)
+        .expect("this crate is in a repository")
+        .0;
+
+    let facts = world
+        .vcs_facts(cwd_str)
+        .expect("this crate's directory must be readable by vcs_facts");
+
+    assert_eq!(
+        facts.root, expected_root,
+        "vcs_facts must report the same root as repository_root"
+    );
+}
+
+/// A throwaway git repository, plus the means to invalidate its index stat cache.
+///
+/// Built rather than borrowed. Proving that the query cannot write means provoking git
+/// into writing, and provoking the repository this crate lives in is exactly the
+/// interference `vcs_facts` exists to avoid.
+struct ProbeRepository {
+    directory: std::path::PathBuf,
+    file: std::path::PathBuf,
+}
+
+impl ProbeRepository {
+    fn create() -> ProbeRepository {
+        let unique = format!(
+            "acmon-vcs-write-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock after 1970")
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&directory).expect("a temporary directory");
+        let file = directory.join("tracked.txt");
+        std::fs::write(&file, "unchanging content\n").expect("writing the tracked file");
+
+        let repository = ProbeRepository { directory, file };
+        repository.git(&["init", "-q"]);
+        // Set identity and disable signing locally. A machine whose global config requires
+        // a signature would otherwise fail the commit, and the test would report a
+        // read-only violation that never happened.
+        repository.git(&["config", "user.email", "probe@acmon.invalid"]);
+        repository.git(&["config", "user.name", "acmon probe"]);
+        repository.git(&["config", "commit.gpgsign", "false"]);
+        repository.git(&["add", "tracked.txt"]);
+        repository.git(&["commit", "-q", "-m", "the only commit"]);
+        repository
+    }
+
+    /// Run git in the probe repository and require it to have succeeded.
+    ///
+    /// AGENTS.md: assert success before believing a measurement. A silently failed `git
+    /// commit` leaves no index, and the read-only assertion below would then pass by
+    /// comparing nothing to nothing.
+    fn git(&self, arguments: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("--no-optional-locks")
+            .args(arguments)
+            .current_dir(&self.directory)
+            .output()
+            .expect("git is installed");
+        assert!(
+            status.status.success(),
+            "setting up the probe repository failed at `git {}`: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+
+    fn index_bytes(&self) -> Vec<u8> {
+        std::fs::read(self.directory.join(".git").join("index"))
+            .expect("the index exists once something has been committed")
+    }
+
+    /// Make the index's stat cache wrong without changing a byte of content.
+    ///
+    /// Two things about this are load-bearing, both learned by getting them wrong.
+    ///
+    /// A fixed, absurd modification time rather than "now": within the same second git
+    /// treats a file as racily clean and may skip the refresh entirely, which was measured
+    /// to make this provocation succeed only 1 time in 3.
+    ///
+    /// And the timestamp is a **parameter**, because each arm of the test must use a
+    /// different one. The control arm's `git status` rewrites the index with whatever
+    /// timestamp it found; re-applying that same timestamp afterwards leaves the stat cache
+    /// already correct, so the second arm is never provoked and passes whether or not the
+    /// query is read-only. Measured: with a shared timestamp the guarantee appears to hold
+    /// even with `--no-optional-locks` removed. With distinct timestamps, removing the flag
+    /// fails the test 3 times out of 3.
+    fn make_index_stale(&self, timestamp: &str) {
+        let touched = std::process::Command::new("touch")
+            .args(["-m", "-t", timestamp])
+            .arg(&self.file)
+            .status()
+            .expect("touch is installed");
+        assert!(touched.success(), "could not backdate the tracked file");
+    }
+}
+
+impl Drop for ProbeRepository {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// Observing a repository must not write to it — proven, with a control arm.
+///
+/// The control arm is the whole value of this test. An earlier version simply ran
+/// `vcs_facts` against this crate's own repository and asserted `.git/index` was
+/// unmodified. That version passed with `--no-optional-locks` deliberately removed,
+/// because git had nothing to refresh: it was a test that could not fail, which is the
+/// same defect class as every bug documented in
+/// `docs/observability-mechanics.md` §7.
+///
+/// So the index is first made stale, and a plain `git status` is required to rewrite it.
+/// That establishes the provocation works before anything is concluded from the second
+/// arm. The plain invocation is the one place in this project where
+/// `--no-optional-locks` is deliberately omitted, and it is omitted to demonstrate that
+/// the flag is what carries the guarantee.
+#[test]
+fn observing_a_repository_cannot_write_to_it() {
+    let repository = ProbeRepository::create();
+    let path = repository
+        .directory
+        .to_str()
+        .expect("a UTF-8 temporary path")
+        .to_string();
+
+    // Control arm: without the precautions, git MUST rewrite the index.
+    repository.make_index_stale("203001010101.01");
+    let before_control = repository.index_bytes();
+    let control = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&repository.directory)
+        .output()
+        .expect("git is installed");
+    assert!(control.status.success(), "the control git status failed");
+    let after_control = repository.index_bytes();
+    assert_ne!(
+        before_control, after_control,
+        "the provocation failed: an unguarded `git status` did not rewrite the index, so \
+         this test cannot detect a write and proves nothing about the guarded query"
+    );
+
+    // Subject arm: with the precautions, the index must be byte-identical afterwards.
+    // A DIFFERENT timestamp from the control arm — see `make_index_stale`.
+    repository.make_index_stale("202001010101.01");
+    let before = repository.index_bytes();
+    let facts = RealWorld::new()
+        .vcs_facts(&path)
+        .expect("the probe repository is readable");
+    let after = repository.index_bytes();
+
+    assert_eq!(
+        before, after,
+        "vcs_facts rewrote .git/index, so observing a workspace contends with the agent \
+         working in it"
+    );
+    // The reading also has to be right, or an early error return would satisfy the
+    // assertion above while measuring nothing. Backdating a file changes no content, so
+    // the repository is clean.
+    assert_eq!(
+        facts.uncommitted_entries, 0,
+        "backdating a tracked file changes no content, so the probe repository is clean"
+    );
+}
+
+#[test]
+fn resolve_namespace_round_trips_this_crates_namespace() {
+    // The round trip that matters: map this crate's directory to a namespace, then resolve
+    // that namespace back to a directory. The result must be this directory.
+    use acmon::workspace::{namespace_for, NamespaceResolution};
+
+    let world = RealWorld::new();
+    let cwd = std::env::current_dir().expect("this test process has a working directory");
+    let cwd_str = cwd.to_str().expect("a UTF-8 path");
+
+    let namespace = namespace_for(cwd_str);
+    let resolution = world.resolve_namespace(&namespace);
+
+    match resolution {
+        NamespaceResolution::Resolved(path) => {
+            assert_eq!(
+                path, cwd_str,
+                "resolving the namespace of this crate's directory must return that directory"
+            );
+        }
+        other => {
+            panic!("expected Resolved({cwd_str}), got {other:?} — the round trip failed");
+        }
+    }
+}
+
+#[test]
+fn resolve_namespace_of_a_nonexistent_namespace_is_no_longer_exists() {
+    // An invented namespace that names nothing must return NoLongerExists, not
+    // SearchExhausted — the distinction matters because one is an answer and the other is
+    // a failure.
+    use acmon::workspace::NamespaceResolution;
+
+    let world = RealWorld::new();
+
+    // A name that cannot exist: long and contains characters unlikely to match
+    let nonexistent = "does-not-exist-9f3e8a7b-2c1d-4e5f-6a7b-8c9d0e1f2a3b";
+
+    let resolution = world.resolve_namespace(nonexistent);
+
+    assert_eq!(
+        resolution,
+        NamespaceResolution::NoLongerExists,
+        "a nonexistent namespace must return NoLongerExists, not SearchExhausted or Resolved"
+    );
+}
+
+#[test]
+fn sweep_finds_this_crate_and_reports_complete() {
+    // Sweeping this crate's parent directory must find this crate, and must report
+    // complete == true.
+    let world = RealWorld::new();
+    let cwd = std::env::current_dir().expect("this test process has a working directory");
+    let parent = cwd
+        .parent()
+        .expect("this crate is not at the filesystem root")
+        .to_str()
+        .expect("a UTF-8 path");
+
+    let sweep = world.sweep_for_repositories(&[parent.to_string()]);
+
+    assert!(
+        sweep.complete,
+        "sweeping this crate's parent should complete within the budget"
+    );
+
+    let found_this_crate = sweep.repositories.iter().any(|(path, _)| {
+        let cwd_str = cwd.to_str().expect("a UTF-8 path");
+        path == cwd_str
+    });
+
+    assert!(
+        found_this_crate,
+        "sweep of {} must find this crate at {}, got repositories: {:?}",
+        parent,
+        cwd.display(),
+        sweep.repositories
+    );
+}
+
+#[test]
+fn sweep_of_empty_roots_returns_complete_with_no_repositories() {
+    // Sweeping an empty list of roots must return no repositories and complete == true.
+    // An empty answer must still be a complete one.
+    let world = RealWorld::new();
+
+    let sweep = world.sweep_for_repositories(&[]);
+
+    assert_eq!(
+        sweep.repositories.len(),
+        0,
+        "sweeping no roots must return no repositories"
+    );
+    assert!(
+        sweep.complete,
+        "sweeping no roots must report complete == true"
+    );
+}
+
+#[test]
+fn sweep_never_descends_into_a_repository() {
+    // The sweep must not descend into a repository: assert directories_visited for a sweep
+    // of this crate's parent is far smaller than the number of directories inside this
+    // crate. Count them independently with std::fs to get a figure that does not recompute
+    // the way the sweep does.
+    let world = RealWorld::new();
+    let cwd = std::env::current_dir().expect("this test process has a working directory");
+    let cwd_str = cwd.to_str().expect("a UTF-8 path");
+    let parent = cwd
+        .parent()
+        .expect("this crate is not at the filesystem root")
+        .to_str()
+        .expect("a UTF-8 path");
+
+    let sweep = world.sweep_for_repositories(&[parent.to_string()]);
+
+    // Count directories inside this crate using a naive recursive walk
+    fn count_dirs(path: &str) -> usize {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        let mut count = 0;
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                count += 1;
+                count += count_dirs(&entry.path().to_string_lossy());
+            }
+        }
+        count
+    }
+
+    let dirs_inside_crate = count_dirs(cwd_str);
+
+    assert!(
+        dirs_inside_crate > 10,
+        "this crate should contain many directories (found {dirs_inside_crate}), or this \
+         comparison proves nothing"
+    );
+
+    assert!(
+        sweep.directories_visited < dirs_inside_crate,
+        "sweep visited {} directories but this crate alone contains {dirs_inside_crate} — \
+         the sweep descended into a repository",
+        sweep.directories_visited
+    );
+}
+
+#[test]
+fn every_path_in_a_sweep_is_absolute_and_unique() {
+    // Every path in a sweep result must be absolute, and no path may be returned twice.
+    let world = RealWorld::new();
+    let cwd = std::env::current_dir().expect("this test process has a working directory");
+    let parent = cwd
+        .parent()
+        .expect("this crate is not at the filesystem root")
+        .to_str()
+        .expect("a UTF-8 path");
+
+    let sweep = world.sweep_for_repositories(&[parent.to_string()]);
+
+    let mut seen = std::collections::HashSet::new();
+    for (path, _) in &sweep.repositories {
+        assert!(
+            path.starts_with('/'),
+            "path {path} is not absolute — all sweep results must be absolute paths"
+        );
+
+        assert!(
+            seen.insert(path.clone()),
+            "path {path} appears more than once in the sweep — results must be deduplicated"
+        );
+    }
+}
+
+#[test]
+fn vcs_facts_batch_returns_results_in_order() {
+    // vcs_facts_batch must return exactly as many results as it was given paths, in order.
+    // Feed it a list containing this crate's root twice plus a path that does not exist,
+    // and assert positions 0 and 1 are equal Ok results and position 2 is Err(PathGone).
+    use acmon::vcs::Unreadable;
+
+    let world = RealWorld::new();
+    let cwd = std::env::current_dir().expect("this test process has a working directory");
+    let cwd_str = cwd.to_str().expect("a UTF-8 path");
+    let nonexistent = "/tmp/acmon-test-vcs-batch-does-not-exist-a1b2c3d4";
+
+    let paths = vec![
+        cwd_str.to_string(),
+        cwd_str.to_string(),
+        nonexistent.to_string(),
+    ];
+
+    let results = world.vcs_facts_batch(&paths);
+
+    assert_eq!(
+        results.len(),
+        3,
+        "vcs_facts_batch must return exactly as many results as paths"
+    );
+
+    assert!(
+        results[0].is_ok(),
+        "position 0 (this crate's root) must be Ok, got {:?}",
+        results[0]
+    );
+    assert!(
+        results[1].is_ok(),
+        "position 1 (this crate's root again) must be Ok, got {:?}",
+        results[1]
+    );
+    assert_eq!(
+        results[0], results[1],
+        "positions 0 and 1 are the same path and must return equal Ok results"
+    );
+
+    assert_eq!(
+        results[2],
+        Err(Unreadable::PathGone),
+        "position 2 (nonexistent path) must be Err(PathGone)"
+    );
+}

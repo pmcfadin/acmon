@@ -25,6 +25,17 @@ struct FakeWorld {
     codex_sessions: Result<Vec<CodexSession>, WorldError>,
     /// Per-namespace activity times. A namespace with no entry gets a default time.
     namespace_activities: HashMap<String, Result<SystemTime, ActivityUnavailable>>,
+    /// Per-path repository roots. A path with no entry gets `None`.
+    repository_roots: HashMap<String, Option<(String, bool)>>,
+    /// Per-path VCS facts. A path with no entry gets `NotVersionControlled`.
+    vcs_facts_map: HashMap<String, Result<acmon::vcs::VcsFacts, acmon::vcs::Unreadable>>,
+    /// Per-namespace resolutions. A namespace with no entry gets `NoLongerExists`.
+    namespace_resolutions: HashMap<String, acmon::workspace::NamespaceResolution>,
+    /// The sweep result. Defaults to empty.
+    sweep: acmon::world::Sweep,
+    /// Record which paths were passed to `vcs_facts_batch`, so tests can assert no
+    /// candidate was skipped.
+    vcs_facts_batch_calls: std::cell::RefCell<Vec<Vec<String>>>,
 }
 
 /// Namespaces that genuinely exist in `~/.claude/projects` on the machine these
@@ -62,6 +73,15 @@ impl FakeWorld {
             namespaces: Ok(recorded_namespaces()),
             codex_sessions: Ok(recorded_codex_sessions()),
             namespace_activities: HashMap::new(),
+            repository_roots: HashMap::new(),
+            vcs_facts_map: HashMap::new(),
+            namespace_resolutions: HashMap::new(),
+            sweep: acmon::world::Sweep {
+                repositories: Vec::new(),
+                complete: true,
+                directories_visited: 0,
+            },
+            vcs_facts_batch_calls: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -72,6 +92,15 @@ impl FakeWorld {
             namespaces: Ok(recorded_namespaces()),
             codex_sessions: Ok(recorded_codex_sessions()),
             namespace_activities: HashMap::new(),
+            repository_roots: HashMap::new(),
+            vcs_facts_map: HashMap::new(),
+            namespace_resolutions: HashMap::new(),
+            sweep: acmon::world::Sweep {
+                repositories: Vec::new(),
+                complete: true,
+                directories_visited: 0,
+            },
+            vcs_facts_batch_calls: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -96,6 +125,39 @@ impl FakeWorld {
         activity: Result<SystemTime, ActivityUnavailable>,
     ) -> Self {
         self.namespace_activities.insert(namespace, activity);
+        self
+    }
+
+    fn repository_root(mut self, path: String, root: Option<(String, bool)>) -> Self {
+        self.repository_roots.insert(path, root);
+        self
+    }
+
+    fn vcs_facts(
+        mut self,
+        path: String,
+        facts: Result<acmon::vcs::VcsFacts, acmon::vcs::Unreadable>,
+    ) -> Self {
+        self.vcs_facts_map.insert(path, facts);
+        self
+    }
+
+    fn namespace_resolution(
+        mut self,
+        namespace: String,
+        resolution: acmon::workspace::NamespaceResolution,
+    ) -> Self {
+        self.namespace_resolutions.insert(namespace, resolution);
+        self
+    }
+
+    fn sweep(mut self, sweep: acmon::world::Sweep) -> Self {
+        self.sweep = sweep;
+        self
+    }
+
+    fn with_namespaces(mut self, namespaces: Vec<String>) -> Self {
+        self.namespaces = Ok(namespaces);
         self
     }
 }
@@ -170,6 +232,38 @@ impl World for FakeWorld {
 
     fn codex_sessions(&self) -> Result<Vec<CodexSession>, WorldError> {
         self.codex_sessions.clone()
+    }
+
+    fn repository_root(&self, path: &str) -> Option<(String, bool)> {
+        self.repository_roots.get(path).cloned().unwrap_or(None)
+    }
+
+    fn vcs_facts(&self, path: &str) -> Result<acmon::vcs::VcsFacts, acmon::vcs::Unreadable> {
+        self.vcs_facts_map
+            .get(path)
+            .cloned()
+            .unwrap_or(Err(acmon::vcs::Unreadable::NotVersionControlled))
+    }
+
+    fn resolve_namespace(&self, namespace: &str) -> acmon::workspace::NamespaceResolution {
+        self.namespace_resolutions
+            .get(namespace)
+            .cloned()
+            .unwrap_or(acmon::workspace::NamespaceResolution::NoLongerExists)
+    }
+
+    fn sweep_for_repositories(&self, _roots: &[String]) -> acmon::world::Sweep {
+        self.sweep.clone()
+    }
+
+    fn vcs_facts_batch(
+        &self,
+        paths: &[String],
+    ) -> Vec<Result<acmon::vcs::VcsFacts, acmon::vcs::Unreadable>> {
+        // Record the call for test assertions.
+        self.vcs_facts_batch_calls.borrow_mut().push(paths.to_vec());
+        // Delegate to vcs_facts for each path.
+        paths.iter().map(|p| self.vcs_facts(p)).collect()
     }
 }
 
@@ -1204,11 +1298,10 @@ fn a_transcript_past_stall_with_work_in_workspace_is_not_stalled() {
 }
 
 #[test]
-fn a_transcript_derived_claude_session_reports_workspace_as_not_invertible() {
-    // A transcript-derived Claude session cannot report its workspace path, because the
-    // namespace mapping is not invertible: `-a-b-c` could have come from `_`, `.`, `-`,
-    // or `/`. The session must report this as a specific reason, not as a generic
-    // "unknown" or a guessed path.
+fn a_transcript_derived_claude_session_with_unresolved_namespace_reports_workspace_gone() {
+    // A transcript-derived Claude session whose namespace doesn't resolve reports
+    // WorkspaceGone. The namespace mapping is not invertible, so resolution is done as a
+    // verified search — when that search finds nothing, the workspace is gone.
     let world = FakeWorld::with(
         vec![rec(
             88429,
@@ -1229,8 +1322,8 @@ fn a_transcript_derived_claude_session_reports_workspace_as_not_invertible() {
 
     assert_eq!(
         transcript_session.workspace,
-        Err(WorkspaceUnknown::NotInvertible),
-        "a transcript-derived Claude session must report NotInvertible, not a guessed path"
+        Err(WorkspaceUnknown::WorkspaceGone),
+        "a transcript-derived Claude session with unresolved namespace reports WorkspaceGone"
     );
 }
 
@@ -1299,5 +1392,571 @@ fn a_transcript_silent_for_less_than_stall_with_no_process_is_unknown() {
         transcript_session.liveness.state,
         State::Unknown,
         "a transcript silent for less than the stall threshold is UNKNOWN, not STALLED"
+    );
+}
+
+// --- Workspace discovery and classification tests (ticket #7 final piece) ---
+
+#[test]
+fn a_dirty_workspace_with_no_live_session_is_dirty_stranded_and_at_risk() {
+    let workspace = "/Users/pmcfadin/projects/test_repo";
+    let world = FakeWorld::with(
+        vec![rec(
+            88429,
+            "/Users/pmcfadin/projects/acmon/target/debug/acmon",
+        )],
+        88429,
+    )
+    .repository_root(workspace.to_string(), Some((workspace.to_string(), false)))
+    .vcs_facts(
+        workspace.to_string(),
+        Ok(acmon::vcs::VcsFacts {
+            root: workspace.to_string(),
+            uncommitted_entries: 5,
+            linked_worktree: false,
+        }),
+    )
+    .sweep(acmon::world::Sweep {
+        repositories: vec![(workspace.to_string(), false)],
+        complete: true,
+        directories_visited: 1,
+    });
+
+    let snapshot =
+        collect(&world, fixture_now(), &Thresholds::default()).expect("collection should succeed");
+
+    let ws = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.path == workspace)
+        .expect("workspace should be discovered");
+
+    assert_eq!(
+        ws.state,
+        acmon::vcs::WorkspaceState::DirtyStranded,
+        "uncommitted work with no live session is DIRTY-STRANDED"
+    );
+    assert!(
+        ws.state.at_risk(),
+        "DIRTY-STRANDED must be reported as at-risk"
+    );
+    assert_eq!(ws.uncommitted_entries, Some(5));
+}
+
+#[test]
+fn the_same_workspace_with_a_live_session_is_dirty_driven_and_not_at_risk() {
+    // The same workspace as above, but with a live session process inside it. The only
+    // difference is the session — this is what criterion 3 asks to be distinguishable.
+    let workspace = "/Users/pmcfadin/projects/test_repo";
+    let world = FakeWorld::with(
+        vec![
+            rec_in(69046, CLAUDE_EXE, workspace),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .repository_root(workspace.to_string(), Some((workspace.to_string(), false)))
+    .vcs_facts(
+        workspace.to_string(),
+        Ok(acmon::vcs::VcsFacts {
+            root: workspace.to_string(),
+            uncommitted_entries: 5,
+            linked_worktree: false,
+        }),
+    );
+
+    let snapshot =
+        collect(&world, fixture_now(), &Thresholds::default()).expect("collection should succeed");
+
+    let ws = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.path == workspace)
+        .expect("workspace should be discovered");
+
+    assert_eq!(
+        ws.state,
+        acmon::vcs::WorkspaceState::DirtyDriven,
+        "uncommitted work with a live session is DIRTY-DRIVEN"
+    );
+    assert!(
+        !ws.state.at_risk(),
+        "DIRTY-DRIVEN must NOT be reported as at-risk"
+    );
+    assert_eq!(ws.uncommitted_entries, Some(5));
+}
+
+#[test]
+fn a_session_in_a_subdirectory_of_the_repository_root_still_drives_the_workspace() {
+    let workspace = "/Users/pmcfadin/projects/test_repo";
+    let subdir = "/Users/pmcfadin/projects/test_repo/src/module";
+    let world = FakeWorld::with(
+        vec![
+            rec_in(69046, CLAUDE_EXE, subdir),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .repository_root(workspace.to_string(), Some((workspace.to_string(), false)))
+    .repository_root(subdir.to_string(), Some((workspace.to_string(), false)))
+    .vcs_facts(
+        workspace.to_string(),
+        Ok(acmon::vcs::VcsFacts {
+            root: workspace.to_string(),
+            uncommitted_entries: 3,
+            linked_worktree: false,
+        }),
+    );
+
+    let snapshot =
+        collect(&world, fixture_now(), &Thresholds::default()).expect("collection should succeed");
+
+    let ws = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.path == workspace)
+        .expect("workspace should be discovered");
+
+    assert_eq!(
+        ws.state,
+        acmon::vcs::WorkspaceState::DirtyDriven,
+        "a session in a subdirectory still drives the workspace"
+    );
+}
+
+#[test]
+fn a_workspace_whose_facts_are_query_failed_is_unknown_and_at_risk() {
+    let workspace = "/Users/pmcfadin/projects/test_repo";
+    let world = FakeWorld::with(
+        vec![rec(
+            88429,
+            "/Users/pmcfadin/projects/acmon/target/debug/acmon",
+        )],
+        88429,
+    )
+    .repository_root(workspace.to_string(), Some((workspace.to_string(), false)))
+    .vcs_facts(
+        workspace.to_string(),
+        Err(acmon::vcs::Unreadable::QueryFailed(
+            "git status failed".to_string(),
+        )),
+    )
+    .sweep(acmon::world::Sweep {
+        repositories: vec![(workspace.to_string(), false)],
+        complete: true,
+        directories_visited: 1,
+    });
+
+    let snapshot =
+        collect(&world, fixture_now(), &Thresholds::default()).expect("collection should succeed");
+
+    let ws = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.path == workspace)
+        .expect("workspace should be discovered");
+
+    assert!(
+        matches!(
+            ws.state,
+            acmon::vcs::WorkspaceState::Unknown(acmon::vcs::Unreadable::QueryFailed(_))
+        ),
+        "QueryFailed results in Unknown state"
+    );
+    assert!(
+        ws.state.at_risk(),
+        "Unknown(QueryFailed) must be reported as at-risk"
+    );
+    assert_eq!(
+        ws.uncommitted_entries, None,
+        "uncommitted_entries must be None when state is Unknown"
+    );
+}
+
+#[test]
+fn a_namespace_that_resolves_to_no_longer_exists_appears_in_unlocated() {
+    let namespace = "-Users-pmcfadin-projects-deleted";
+    let world = FakeWorld::with(
+        vec![rec(
+            88429,
+            "/Users/pmcfadin/projects/acmon/target/debug/acmon",
+        )],
+        88429,
+    )
+    .with_namespaces(vec![namespace.to_string()])
+    .namespace_resolution(
+        namespace.to_string(),
+        acmon::workspace::NamespaceResolution::NoLongerExists,
+    )
+    .namespace_activity(namespace.to_string(), Ok(silent_for(5 * 3600)));
+
+    let snapshot =
+        collect(&world, fixture_now(), &Thresholds::default()).expect("collection should succeed");
+
+    assert!(
+        snapshot.unlocated.iter().any(|(ns, res)| ns == namespace
+            && matches!(res, acmon::workspace::NamespaceResolution::NoLongerExists)),
+        "a namespace that no longer exists must appear in unlocated"
+    );
+
+    assert!(
+        !snapshot
+            .workspaces
+            .iter()
+            .any(|w| w.path.contains("deleted")),
+        "a namespace that no longer exists must NOT appear in workspaces"
+    );
+}
+
+#[test]
+fn ambiguous_and_search_exhausted_also_reach_unlocated() {
+    let ambiguous_ns = "-Users-pmcfadin-projects-ambiguous";
+    let incomplete_ns = "-Users-pmcfadin-projects-incomplete";
+    let world = FakeWorld::with(
+        vec![rec(
+            88429,
+            "/Users/pmcfadin/projects/acmon/target/debug/acmon",
+        )],
+        88429,
+    )
+    .with_namespaces(vec![ambiguous_ns.to_string(), incomplete_ns.to_string()])
+    .namespace_resolution(
+        ambiguous_ns.to_string(),
+        acmon::workspace::NamespaceResolution::Ambiguous(vec![
+            "/Users/pmcfadin/projects/ambiguous1".to_string(),
+            "/Users/pmcfadin/projects/ambiguous2".to_string(),
+        ]),
+    )
+    .namespace_resolution(
+        incomplete_ns.to_string(),
+        acmon::workspace::NamespaceResolution::SearchExhausted,
+    )
+    .namespace_activity(ambiguous_ns.to_string(), Ok(silent_for(5 * 3600)))
+    .namespace_activity(incomplete_ns.to_string(), Ok(silent_for(5 * 3600)));
+
+    let snapshot =
+        collect(&world, fixture_now(), &Thresholds::default()).expect("collection should succeed");
+
+    assert!(
+        snapshot.unlocated.iter().any(|(ns, res)| ns == ambiguous_ns
+            && matches!(res, acmon::workspace::NamespaceResolution::Ambiguous(_))),
+        "an ambiguous namespace must appear in unlocated"
+    );
+
+    assert!(
+        snapshot
+            .unlocated
+            .iter()
+            .any(|(ns, res)| ns == incomplete_ns
+                && matches!(res, acmon::workspace::NamespaceResolution::SearchExhausted)),
+        "a search-exhausted namespace must appear in unlocated"
+    );
+}
+
+#[test]
+fn a_transcript_derived_session_for_ambiguous_namespace_reports_workspace_unknown() {
+    let ambiguous_ns = "-Users-pmcfadin-projects-ambiguous";
+    let world = FakeWorld::with(
+        vec![rec(
+            88429,
+            "/Users/pmcfadin/projects/acmon/target/debug/acmon",
+        )],
+        88429,
+    )
+    .with_namespaces(vec![ambiguous_ns.to_string()])
+    .namespace_resolution(
+        ambiguous_ns.to_string(),
+        acmon::workspace::NamespaceResolution::Ambiguous(vec![
+            "/Users/pmcfadin/projects/ambiguous1".to_string(),
+            "/Users/pmcfadin/projects/ambiguous2".to_string(),
+        ]),
+    )
+    .namespace_activity(ambiguous_ns.to_string(), Ok(silent_for(5 * 3600)));
+
+    let snapshot =
+        collect(&world, fixture_now(), &Thresholds::default()).expect("collection should succeed");
+
+    let transcript_session = snapshot
+        .sessions
+        .iter()
+        .find(|s| matches!(s.identity, acmon::Identity::Transcript { .. }))
+        .expect("a transcript-derived session should exist");
+
+    assert!(
+        matches!(
+            transcript_session.workspace,
+            Err(WorkspaceUnknown::Ambiguous { candidates: 2 })
+        ),
+        "transcript-derived session for ambiguous namespace reports Ambiguous, got {:?}",
+        transcript_session.workspace
+    );
+}
+
+#[test]
+fn a_namespace_that_resolves_gives_its_transcript_derived_session_a_real_workspace_path() {
+    let namespace = "-Users-pmcfadin-projects-resolved";
+    let resolved_path = "/Users/pmcfadin/projects/resolved";
+    let world = FakeWorld::with(
+        vec![rec(
+            88429,
+            "/Users/pmcfadin/projects/acmon/target/debug/acmon",
+        )],
+        88429,
+    )
+    .with_namespaces(vec![namespace.to_string()])
+    .namespace_resolution(
+        namespace.to_string(),
+        acmon::workspace::NamespaceResolution::Resolved(resolved_path.to_string()),
+    )
+    .namespace_activity(namespace.to_string(), Ok(silent_for(5 * 3600)));
+
+    let snapshot =
+        collect(&world, fixture_now(), &Thresholds::default()).expect("collection should succeed");
+
+    let transcript_session = snapshot
+        .sessions
+        .iter()
+        .find(|s| matches!(s.identity, acmon::Identity::Transcript { .. }))
+        .expect("a transcript-derived session should exist");
+
+    let workspace = transcript_session
+        .workspace
+        .as_ref()
+        .expect("workspace should be resolved");
+    assert_eq!(
+        workspace.path, resolved_path,
+        "transcript-derived session should have resolved workspace path"
+    );
+    assert_eq!(
+        workspace.namespace,
+        Ok(namespace.to_string()),
+        "namespace should be preserved"
+    );
+}
+
+#[test]
+fn sweep_complete_is_false_when_the_fake_sweep_says_incomplete() {
+    let world = FakeWorld::with(
+        vec![rec(
+            88429,
+            "/Users/pmcfadin/projects/acmon/target/debug/acmon",
+        )],
+        88429,
+    )
+    .sweep(acmon::world::Sweep {
+        repositories: vec![],
+        complete: false,
+        directories_visited: 100,
+    });
+
+    let snapshot =
+        collect(&world, fixture_now(), &Thresholds::default()).expect("collection should succeed");
+
+    assert!(
+        !snapshot.sweep_complete,
+        "sweep_complete must be false when the sweep says incomplete"
+    );
+}
+
+#[test]
+fn the_same_repository_root_from_two_sources_appears_once_in_workspaces() {
+    let workspace = "/Users/pmcfadin/projects/test_repo";
+    let subdir1 = "/Users/pmcfadin/projects/test_repo/src";
+    let subdir2 = "/Users/pmcfadin/projects/test_repo/tests";
+
+    let world = FakeWorld::with(
+        vec![
+            rec_in(69046, CLAUDE_EXE, subdir1),
+            rec_in(70000, CLAUDE_EXE, subdir2),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .repository_root(subdir1.to_string(), Some((workspace.to_string(), false)))
+    .repository_root(subdir2.to_string(), Some((workspace.to_string(), false)))
+    .vcs_facts(
+        workspace.to_string(),
+        Ok(acmon::vcs::VcsFacts {
+            root: workspace.to_string(),
+            uncommitted_entries: 0,
+            linked_worktree: false,
+        }),
+    );
+
+    let snapshot =
+        collect(&world, fixture_now(), &Thresholds::default()).expect("collection should succeed");
+
+    let matching_workspaces: Vec<_> = snapshot
+        .workspaces
+        .iter()
+        .filter(|w| w.path == workspace)
+        .collect();
+
+    assert_eq!(
+        matching_workspaces.len(),
+        1,
+        "the same repository root from two sources must appear exactly once"
+    );
+}
+
+#[test]
+fn same_repository_root_with_different_case_appears_once() {
+    let workspace = "/Users/pmcfadin/projects/TestRepo";
+    let workspace_lowercase = "/users/pmcfadin/projects/testrepo";
+
+    let world = FakeWorld::with(
+        vec![
+            rec_in(69046, CLAUDE_EXE, workspace),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .repository_root(workspace.to_string(), Some((workspace.to_string(), false)))
+    .repository_root(
+        workspace_lowercase.to_string(),
+        Some((workspace.to_string(), false)),
+    )
+    .vcs_facts(
+        workspace.to_string(),
+        Ok(acmon::vcs::VcsFacts {
+            root: workspace.to_string(),
+            uncommitted_entries: 0,
+            linked_worktree: false,
+        }),
+    )
+    .sweep(acmon::world::Sweep {
+        repositories: vec![(workspace_lowercase.to_string(), false)],
+        complete: true,
+        directories_visited: 10,
+    });
+
+    let snapshot =
+        collect(&world, fixture_now(), &Thresholds::default()).expect("collection should succeed");
+
+    let matching_workspaces: Vec<_> = snapshot
+        .workspaces
+        .iter()
+        .filter(|w| w.path.eq_ignore_ascii_case(workspace))
+        .collect();
+
+    assert_eq!(
+        matching_workspaces.len(),
+        1,
+        "the same repository with different case spellings must appear exactly once, got: {:?}",
+        snapshot
+            .workspaces
+            .iter()
+            .map(|w| &w.path)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_candidate_path_with_no_repository_root_still_appears_in_workspaces() {
+    let non_repo = "/Users/pmcfadin/Documents/random_folder";
+    let world = FakeWorld::with(
+        vec![
+            rec_in(69046, CLAUDE_EXE, non_repo),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .repository_root(non_repo.to_string(), None);
+
+    let snapshot =
+        collect(&world, fixture_now(), &Thresholds::default()).expect("collection should succeed");
+
+    let ws = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.path == non_repo)
+        .expect("non-repository path should still appear in workspaces");
+
+    assert!(
+        matches!(
+            ws.state,
+            acmon::vcs::WorkspaceState::Unknown(acmon::vcs::Unreadable::NotVersionControlled)
+        ),
+        "a path with no repository root classifies as Unknown(NotVersionControlled)"
+    );
+    assert!(
+        !ws.state.at_risk(),
+        "NotVersionControlled is not at risk (nothing to lose)"
+    );
+    assert_eq!(
+        ws.uncommitted_entries, None,
+        "uncommitted_entries must be None for Unknown state"
+    );
+}
+
+#[test]
+fn vcs_facts_batch_is_called_with_every_candidate() {
+    let workspace1 = "/Users/pmcfadin/projects/repo1";
+    let workspace2 = "/Users/pmcfadin/projects/repo2";
+
+    let world = FakeWorld::with(
+        vec![
+            rec_in(69046, CLAUDE_EXE, workspace1),
+            rec_in(70000, CLAUDE_EXE, workspace2),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .repository_root(
+        workspace1.to_string(),
+        Some((workspace1.to_string(), false)),
+    )
+    .repository_root(
+        workspace2.to_string(),
+        Some((workspace2.to_string(), false)),
+    )
+    .vcs_facts(
+        workspace1.to_string(),
+        Ok(acmon::vcs::VcsFacts {
+            root: workspace1.to_string(),
+            uncommitted_entries: 2,
+            linked_worktree: false,
+        }),
+    )
+    .vcs_facts(
+        workspace2.to_string(),
+        Ok(acmon::vcs::VcsFacts {
+            root: workspace2.to_string(),
+            uncommitted_entries: 3,
+            linked_worktree: false,
+        }),
+    );
+
+    let snapshot =
+        collect(&world, fixture_now(), &Thresholds::default()).expect("collection should succeed");
+
+    // Check that vcs_facts_batch was called
+    let calls = world.vcs_facts_batch_calls.borrow();
+    assert!(
+        !calls.is_empty(),
+        "vcs_facts_batch should have been called at least once"
+    );
+
+    // Check that all workspaces were included in the batch call
+    let all_paths: Vec<String> = calls.iter().flat_map(|c| c.iter().cloned()).collect();
+    assert!(
+        all_paths.contains(&workspace1.to_string()),
+        "workspace1 should be in vcs_facts_batch call, got: {:?}",
+        all_paths
+    );
+    assert!(
+        all_paths.contains(&workspace2.to_string()),
+        "workspace2 should be in vcs_facts_batch call, got: {:?}",
+        all_paths
+    );
+
+    // Verify both workspaces appear in the results
+    assert!(
+        snapshot.workspaces.iter().any(|w| w.path == workspace1),
+        "workspace1 should appear in results"
+    );
+    assert!(
+        snapshot.workspaces.iter().any(|w| w.path == workspace2),
+        "workspace2 should appear in results"
     );
 }

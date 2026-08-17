@@ -578,19 +578,414 @@ impl World for RealWorld {
     }
 
     fn output_width(&self) -> u16 {
-        const FALLBACK: u16 = 80;
+        // The width used when stdout is not a terminal.
+        //
+        // Deliberately NOT 80. A pipe, a file, or a test harness imposes no width at all, so
+        // an unmeasurable width is not evidence of a narrow one. This previously fell back to
+        // 80, and because the table needs 88, `acmon | less` and `acmon > file` printed a
+        // refusal to widen a terminal that was not there — an unmeasured value standing in
+        // for a measured constraint, which is the failure mode AGENTS.md forbids.
+        const NOT_A_TERMINAL: u16 = 120;
 
         let mut size: libc::winsize = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) };
-        // Not a terminal (piped, redirected, or under a harness): fall back rather
-        // than render a zero-width table.
         if rc == 0 && size.ws_col > 0 {
-            size.ws_col
-        } else {
-            FALLBACK
+            // A real terminal answered. Its width is a genuine constraint, and if it is too
+            // narrow the caller gets a refusal rather than a truncated number.
+            return size.ws_col;
+        }
+
+        // No terminal. Honour `COLUMNS` if the caller set it, since that is an explicit
+        // statement of intent, and otherwise use a width the output actually fits in.
+        std::env::var("COLUMNS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u16>().ok())
+            .filter(|width| *width > 0)
+            .unwrap_or(NOT_A_TERMINAL)
+    }
+
+    fn repository_root(&self, path: &str) -> Option<(String, bool)> {
+        use std::path::Path;
+
+        // Walk up the directory tree looking for a `.git` entry. Each step is a stat,
+        // not a process launch — which matters because this repo pays a measured
+        // re-authorisation tax on every exec, and this will be called once per observed
+        // process working directory (hundreds).
+        let mut current = Path::new(path);
+        loop {
+            let git_path = current.join(".git");
+
+            // Check if .git exists and whether it is a file or directory. A file means
+            // this is a linked worktree; a directory means it is a primary repository.
+            // The distinction is observable with the same stat that checks existence, so
+            // it costs nothing extra.
+            if let Ok(metadata) = std::fs::metadata(&git_path) {
+                let linked_worktree = metadata.is_file();
+                return Some((current.to_string_lossy().into_owned(), linked_worktree));
+            }
+
+            // Move to the parent. If there is no parent, we have walked to the root
+            // without finding a repository.
+            current = current.parent()?;
         }
     }
+
+    fn vcs_facts(&self, path: &str) -> Result<crate::vcs::VcsFacts, crate::vcs::Unreadable> {
+        use crate::vcs::{Unreadable, VcsFacts};
+
+        // Check if the path exists before attempting anything else.
+        if !std::path::Path::new(path).exists() {
+            return Err(Unreadable::PathGone);
+        }
+
+        // Find the repository root. If there is none, this is not a versioned directory.
+        let (root, linked_worktree) = self
+            .repository_root(path)
+            .ok_or(Unreadable::NotVersionControlled)?;
+
+        // Query git for the status. Every flag is load-bearing — see the inline comments.
+        // The query is run against the ROOT, not the path itself, because a process
+        // working in a subdirectory is still working in the same repository.
+        let mut child = Command::new("git")
+            // --no-optional-locks: Stops git refreshing and rewriting the index. Without
+            // this flag, a status query can take a lock the agent working in this
+            // repository needs, making the observer a participant. This is the mechanical
+            // enforcement of the "MUST NOT mutate" contract in the trait doc.
+            .arg("--no-optional-locks")
+            // -c core.fsmonitor=false: Stops git STARTING a filesystem-monitor daemon.
+            // Launching a daemon into the observed repository would make this tool act
+            // rather than observe, which violates the "the tool observes; it never acts"
+            // rule from AGENTS.md.
+            .arg("-c")
+            .arg("core.fsmonitor=false")
+            // -c gc.auto=0: Belt and braces against any housekeeping write. Auto-gc can
+            // trigger on certain operations; disabling it ensures the query is
+            // read-only.
+            .arg("-c")
+            .arg("gc.auto=0")
+            .arg("-C")
+            .arg(&root)
+            .arg("status")
+            .arg("--porcelain")
+            // --untracked-files=normal: Untracked files ARE uncommitted work. The
+            // workspace whose loss motivated this project held files git had never seen,
+            // so "uncommitted" explicitly includes them.
+            .arg("--untracked-files=normal")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| Unreadable::QueryFailed(format!("could not spawn git: {e}")))?;
+
+        // Enforce a timeout: poll try_wait() with short sleeps, and kill the child if
+        // it exceeds the budget. Killing our own git child is not a breach of "the tool
+        // observes; it never acts" — that rule protects agent sessions, and an unbounded
+        // query would hang the live display that ticket #10 builds.
+        const VCS_QUERY_BUDGET: Duration = Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let poll_interval = Duration::from_millis(50);
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // Process exited. Check the exit status BEFORE believing the output —
+                    // AGENTS.md rule: "Assert success before believing a measurement."
+                    // A failed git still produces parseable-looking empty output, and
+                    // reading that as "clean" is exactly the fail-to-zero this project
+                    // exists to eliminate.
+                    if !status.success() {
+                        let mut stderr = Vec::new();
+                        if let Some(mut pipe) = child.stderr.take() {
+                            let _ = std::io::Read::read_to_end(&mut pipe, &mut stderr);
+                        }
+                        let error = String::from_utf8_lossy(&stderr).trim().to_string();
+                        return Err(Unreadable::QueryFailed(error));
+                    }
+
+                    // Status succeeded. Count the non-blank lines in stdout — each one is
+                    // an uncommitted entry.
+                    let mut stdout = Vec::new();
+                    if let Some(mut pipe) = child.stdout.take() {
+                        let _ = std::io::Read::read_to_end(&mut pipe, &mut stdout);
+                    }
+                    let output = String::from_utf8_lossy(&stdout);
+                    let uncommitted_entries = output
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .count();
+
+                    return Ok(VcsFacts {
+                        root,
+                        uncommitted_entries,
+                        linked_worktree,
+                    });
+                }
+                Ok(None) => {
+                    // Still running. Check if we have exceeded the budget.
+                    if started.elapsed() > VCS_QUERY_BUDGET {
+                        // Timeout. Kill the child and wait for it to exit, so we do not
+                        // leave it running.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(Unreadable::TimedOut);
+                    }
+                    // Still within budget. Sleep briefly and poll again.
+                    std::thread::sleep(poll_interval);
+                }
+                Err(e) => {
+                    // try_wait failed, which is unusual. Kill and report.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Unreadable::QueryFailed(format!("try_wait failed: {e}")));
+                }
+            }
+        }
+    }
+
+    fn resolve_namespace(&self, namespace: &str) -> crate::workspace::NamespaceResolution {
+        use crate::workspace;
+
+        // Supply a real directory lister to the pure resolution function. The lister
+        // returns only sub-directory names and skips symlinks.
+        //
+        // Why skip symlinks: `/tmp` is a symlink to `/private/tmp` on macOS. Following
+        // links can produce cycles, and the kernel reports resolved paths anyway, so a
+        // symlinked route is never the path a transcript recorded. Calling `is_dir()` on
+        // `DirEntry::file_type()` does not follow links on Unix, so testing `is_dir()`
+        // naturally excludes them.
+        let lister = |path: &str| -> Option<Vec<String>> {
+            let entries = std::fs::read_dir(path).ok()?;
+            let mut directories = Vec::new();
+            for entry in entries {
+                let Ok(entry) = entry else { continue };
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    directories.push(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+            Some(directories)
+        };
+
+        workspace::resolve_namespace(namespace, &lister)
+    }
+
+    fn sweep_for_repositories(&self, roots: &[String]) -> crate::world::Sweep {
+        use crate::world::Sweep;
+        use std::collections::HashSet;
+
+        const SWEEP_MAX_DEPTH: usize = 4;
+        const SWEEP_BUDGET: usize = 4096;
+
+        let mut repositories: Vec<(String, bool)> = Vec::new();
+        let mut directories_visited = 0;
+        let mut complete = true;
+
+        // Phase 1 — bounded descent.
+        //
+        // Walk down from each root to SWEEP_MAX_DEPTH. A directory containing a `.git`
+        // entry is a workspace: record it and do not descend into it. Skip symlinks for
+        // the same reason `resolve_namespace` does — following them can produce cycles.
+        // Count every directory visited; on exceeding SWEEP_BUDGET, stop.
+        //
+        // Measured on the target machine, sweeping `~/projects`: 68 workspaces from 122
+        // directories visited, in under 10 ms. The pruning is what makes it cheap — the
+        // same sweep without pruning visits 18,146 directories and takes 809 ms to find
+        // only 4 more.
+        fn descend(
+            path: &str,
+            depth: usize,
+            max_depth: usize,
+            repositories: &mut Vec<(String, bool)>,
+            directories_visited: &mut usize,
+            budget: usize,
+        ) -> bool {
+            if *directories_visited >= budget {
+                return false; // Budget exhausted
+            }
+            if depth > max_depth {
+                return true; // Max depth reached, but budget not exhausted
+            }
+
+            *directories_visited += 1;
+
+            // Check for `.git` entry
+            let git_path = std::path::Path::new(path).join(".git");
+            if let Ok(metadata) = std::fs::metadata(&git_path) {
+                let linked_worktree = metadata.is_file();
+                repositories.push((path.to_string(), linked_worktree));
+                return true; // Do not descend into a repository
+            }
+
+            // List children and descend
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return true; // Unreadable directory kills only this branch
+            };
+
+            for entry in entries {
+                let Ok(entry) = entry else { continue };
+                // Skip symlinks — `file_type()` does not follow links on Unix
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let child_path = entry.path().to_string_lossy().into_owned();
+                if !descend(
+                    &child_path,
+                    depth + 1,
+                    max_depth,
+                    repositories,
+                    directories_visited,
+                    budget,
+                ) {
+                    return false; // Budget exhausted
+                }
+            }
+
+            true
+        }
+
+        for root in roots {
+            if !descend(
+                root,
+                0,
+                SWEEP_MAX_DEPTH,
+                &mut repositories,
+                &mut directories_visited,
+                SWEEP_BUDGET,
+            ) {
+                complete = false;
+                break;
+            }
+        }
+
+        // Phase 2 — read git's own worktree registry.
+        //
+        // Pruning at `.git` has one hole: a linked worktree can live inside another
+        // repository's tree, and this project's agent workflows put them at
+        // `<repo>/.claude/worktrees/<name>`, where phase 1 will never look. Closing that
+        // hole needs no deep sweep and no subprocess, because git already keeps a registry:
+        // for a primary repository, `<repo>/.git/worktrees/<name>/gitdir` is a file whose
+        // contents are the path of that worktree's own `.git` file, so the worktree
+        // directory is that path's parent.
+        //
+        // Measured: this recovers 2 worktrees phase 1 missed, and the whole two-phase
+        // discovery still costs 9 ms. One of the two recovered paths does not exist — a
+        // stale registration git never cleaned up — so a registered worktree must be
+        // reported like any other candidate and left to `vcs_facts` to call `PathGone`. Do
+        // not filter it out silently and do not error.
+        let mut linked_worktrees = Vec::new();
+        for (repo_root, is_linked) in &repositories {
+            // Only check primary repositories (not linked worktrees)
+            if *is_linked {
+                continue;
+            }
+
+            let worktrees_dir = std::path::Path::new(repo_root)
+                .join(".git")
+                .join("worktrees");
+            let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
+                continue; // No worktrees directory, or unreadable
+            };
+
+            for entry in entries {
+                let Ok(entry) = entry else { continue };
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+
+                let gitdir_file = entry.path().join("gitdir");
+                let Ok(gitdir_contents) = std::fs::read_to_string(&gitdir_file) else {
+                    continue;
+                };
+
+                // The gitdir file contains the path to the worktree's `.git` file; the
+                // worktree directory is its parent
+                let gitdir_path = gitdir_contents.trim();
+                if let Some(parent) = std::path::Path::new(gitdir_path).parent() {
+                    let worktree_path = parent.to_string_lossy().into_owned();
+                    linked_worktrees.push((worktree_path, true));
+                }
+            }
+        }
+        repositories.extend(linked_worktrees);
+
+        // Deduplicate the combined result
+        let mut seen = HashSet::new();
+        repositories.retain(|(path, _)| seen.insert(path.clone()));
+
+        Sweep {
+            repositories,
+            complete,
+            directories_visited,
+        }
+    }
+
+    fn vcs_facts_batch(
+        &self,
+        paths: &[String],
+    ) -> Vec<Result<crate::vcs::VcsFacts, crate::vcs::Unreadable>> {
+        use std::sync::Arc;
+
+        // For 0 or 1 paths, just use the single-threaded implementation
+        if paths.len() <= 1 {
+            return paths.iter().map(|p| self.vcs_facts(p)).collect();
+        }
+
+        // Split paths into chunks, one thread per chunk, at most min(8, paths.len()) threads.
+        //
+        // Why concurrent: `git status` costs min 21 ms · median 83 ms · max 149 ms per
+        // repository, and 70 workspaces sequentially is 5.0 seconds, which alone blows the
+        // project's one-second fast-tier budget.
+        let num_threads = std::cmp::min(8, paths.len());
+        let chunk_size = paths.len().div_ceil(num_threads);
+
+        // Use Arc to share self across threads (RealWorld must be Sync)
+        let self_arc = Arc::new(self);
+        let paths_arc = Arc::new(paths.to_vec());
+
+        let mut results = vec![Err(crate::vcs::Unreadable::NotVersionControlled); paths.len()];
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+
+            for chunk_idx in 0..num_threads {
+                let start = chunk_idx * chunk_size;
+                if start >= paths.len() {
+                    break;
+                }
+                let end = std::cmp::min(start + chunk_size, paths.len());
+
+                let self_clone = Arc::clone(&self_arc);
+                let paths_clone = Arc::clone(&paths_arc);
+
+                let handle = scope.spawn(move || {
+                    let mut chunk_results = Vec::new();
+                    for idx in start..end {
+                        chunk_results.push(self_clone.vcs_facts(&paths_clone[idx]));
+                    }
+                    (start, chunk_results)
+                });
+
+                handles.push(handle);
+            }
+
+            // Collect results from threads in order
+            for handle in handles {
+                let (start, chunk_results) = handle.join().expect("thread should not panic");
+                for (i, result) in chunk_results.into_iter().enumerate() {
+                    results[start + i] = result;
+                }
+            }
+        });
+
+        results
+    }
 }
+
+// Compile-time assertion that RealWorld is Sync, so the concurrent vcs_facts_batch works.
+// If RealWorld ever gains a field with interior mutability that is not Sync, this will fail
+// the build rather than silently serializing the batch.
+const _: fn() = || {
+    fn assert_sync<T: Sync>() {}
+    assert_sync::<RealWorld>();
+};
 
 /// Unit tests for the fallback reader's parsing, kept private.
 ///

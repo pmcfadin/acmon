@@ -230,6 +230,19 @@ impl std::fmt::Display for WorldError {
 
 impl std::error::Error for WorldError {}
 
+/// What a sweep for repositories found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sweep {
+    /// Each workspace found, with whether it is a linked worktree.
+    pub repositories: Vec<(String, bool)>,
+    /// False when the sweep hit its bound before finishing. A partial sweep presented as
+    /// complete is a silent cap, and a silent cap in a safety net reads as "nothing to
+    /// report".
+    pub complete: bool,
+    /// How many directories were visited, so both the cost and the bound are checkable.
+    pub directories_visited: usize,
+}
+
 /// Everything the collector needs from outside itself.
 pub trait World {
     /// Enumerate all processes with their executable paths.
@@ -297,4 +310,51 @@ pub trait World {
     /// Lives here because `world` is the only module permitted to touch the operating
     /// system, and because a fake can then pin it for deterministic render tests.
     fn output_width(&self) -> u16;
+
+    /// The repository root containing a path, and whether that root is a linked worktree —
+    /// established WITHOUT running a subprocess.
+    ///
+    /// Returns `(root, linked_worktree)` where `linked_worktree` is true iff the
+    /// repository's `.git` is a file rather than a directory. Walking ancestors for a
+    /// `.git` entry is a handful of `stat` calls, where `git rev-parse` is a process
+    /// launch. This repo pays a measured re-authorisation tax on every exec, and the
+    /// candidate set is one entry per observed process working directory — hundreds.
+    ///
+    /// `.git` being a FILE rather than a DIRECTORY is exactly what distinguishes a linked
+    /// worktree, so the attribute falls out of the same stat that finds the root. No
+    /// extra syscall is needed.
+    ///
+    /// Returns `None` when no ancestor has a `.git` entry. That is an answer ("not in a
+    /// repository"), never an error.
+    fn repository_root(&self, path: &str) -> Option<(String, bool)>;
+
+    /// What version control says about a workspace, read without writing to it.
+    ///
+    /// This MUST NOT be able to mutate the repository being observed, because the
+    /// repository may have a live agent working in it, and contending for its index
+    /// would make the observer a participant. The implementation therefore uses
+    /// `git --no-optional-locks` and disables filesystem monitors and automatic
+    /// housekeeping — see the implementation for the full set of precautions.
+    ///
+    /// Returns `Err` when the state genuinely could not be determined — the path does not
+    /// exist, there is no repository, or git refused to answer. `Ok` with
+    /// `uncommitted_entries == 0` is clean; anything else is dirty.
+    fn vcs_facts(&self, path: &str) -> Result<crate::vcs::VcsFacts, crate::vcs::Unreadable>;
+
+    /// Which existing directory a recorded transcript namespace names.
+    fn resolve_namespace(&self, namespace: &str) -> crate::workspace::NamespaceResolution;
+
+    /// Find every git workspace at or below the given roots.
+    fn sweep_for_repositories(&self, roots: &[String]) -> Sweep;
+
+    /// Read version-control facts for many workspaces.
+    ///
+    /// Order matches `paths`. A **default implementation** loops over `vcs_facts`, so a fake
+    /// World needs nothing; `RealWorld` overrides it to run the queries concurrently.
+    fn vcs_facts_batch(
+        &self,
+        paths: &[String],
+    ) -> Vec<Result<crate::vcs::VcsFacts, crate::vcs::Unreadable>> {
+        paths.iter().map(|p| self.vcs_facts(p)).collect()
+    }
 }

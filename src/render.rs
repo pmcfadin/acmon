@@ -16,8 +16,9 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
 
-use crate::collect::{Identity, Session, Snapshot};
-use crate::workspace::WorkspaceUnknown;
+use crate::collect::{Identity, Session, Snapshot, WorkspaceReport};
+use crate::vcs::{Unreadable, WorkspaceState};
+use crate::workspace::NamespaceResolution;
 use crate::world::Resources;
 
 /// The caveat that travels with every child-CPU figure.
@@ -101,8 +102,18 @@ pub fn required_height(snapshot: &Snapshot, width: u16) -> u16 {
     if width < minimum_width() {
         return wrap_words(&too_narrow_message(width), width).len() as u16;
     }
-    // top border + header row + one row per session + bottom border + the caveats.
-    (snapshot.sessions.len() + 3) as u16 + footer_lines(snapshot, width).len() as u16
+    // Session table: top border + header row + one row per session + bottom border
+    let session_table_height = (snapshot.sessions.len() + 3) as u16;
+
+    // At-risk panel: always present. Top border + title row + content rows + summary lines + bottom border.
+    // The title row is a header inside the bordered block.
+    let (_, panel_rows, panel_summary) = at_risk_panel_content(snapshot, width);
+    let panel_height = 3 + panel_rows.len() as u16 + panel_summary.len() as u16;
+
+    // Footer caveats
+    let footer_height = footer_lines(snapshot, width).len() as u16;
+
+    session_table_height + panel_height + footer_height
 }
 
 /// The caveats printed under the table.
@@ -125,6 +136,223 @@ fn footer_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
     lines
 }
 
+/// Build the at-risk workspace panel's content: rows and summary.
+///
+/// The SINGLE source of truth for both the height calculation and the drawing. If these
+/// ever diverged, the panel would be silently clipped, and a clipped at-risk list is the
+/// calm plausible wrong answer this project exists to remove.
+///
+/// The panel lists workspaces holding uncommitted work that no live session is driving,
+/// and workspaces whose version-control state could not be read. This is the reason the
+/// project exists: three sessions' work was lost in one day, and a workspace holding 27
+/// uncommitted files was deleted minutes after sitting unflagged.
+///
+/// Returns (title, rows, summary_lines). The panel is ALWAYS present, even when the list
+/// is empty — an absent panel reads as "did not check", while an empty panel with an
+/// explicit summary reads as "checked and clear".
+///
+/// The panel's own column widths are below, and they are deliberately not the session
+/// table's. The panel prints no CPU or memory figures, so it can give far more of each line
+/// to the path — which is the only part of a row a human can act on. Borrowing the table's
+/// `workspace_width` cut panel paths to 16 characters on an 88-column terminal while 46
+/// columns sat unused.
+fn at_risk_panel_content(snapshot: &Snapshot, width: u16) -> (String, Vec<String>, Vec<String>) {
+    let path_column_width = panel_path_width(width);
+
+    // Partition workspaces by state
+    let mut dirty_stranded: Vec<&WorkspaceReport> = Vec::new();
+    let mut unknown_at_risk: Vec<&WorkspaceReport> = Vec::new();
+    let mut dirty_driven: Vec<&WorkspaceReport> = Vec::new();
+    let mut clean_count = 0;
+    let mut not_version_controlled_count = 0;
+    let mut path_gone_count = 0;
+
+    for workspace in &snapshot.workspaces {
+        match &workspace.state {
+            WorkspaceState::DirtyStranded => dirty_stranded.push(workspace),
+            WorkspaceState::Unknown(Unreadable::QueryFailed(_))
+            | WorkspaceState::Unknown(Unreadable::TimedOut) => unknown_at_risk.push(workspace),
+            WorkspaceState::DirtyDriven => dirty_driven.push(workspace),
+            WorkspaceState::Clean => clean_count += 1,
+            WorkspaceState::Unknown(Unreadable::NotVersionControlled) => {
+                not_version_controlled_count += 1
+            }
+            WorkspaceState::Unknown(Unreadable::PathGone) => path_gone_count += 1,
+        }
+    }
+
+    // Sort stranded by uncommitted_entries descending (largest pile first)
+    dirty_stranded.sort_by(|a, b| {
+        b.uncommitted_entries
+            .unwrap_or(0)
+            .cmp(&a.uncommitted_entries.unwrap_or(0))
+    });
+
+    // Count at-risk
+    let at_risk_count = dirty_stranded.len() + unknown_at_risk.len();
+    let total_workspaces = snapshot.workspaces.len();
+
+    let title = format!(
+        " at risk — {} of {} workspaces ",
+        at_risk_count, total_workspaces
+    );
+
+    // Build rows: stranded first, then unknown at-risk, then driven
+    let mut rows = Vec::new();
+
+    for workspace in dirty_stranded.iter().chain(unknown_at_risk.iter()) {
+        rows.push(workspace_row(workspace, path_column_width));
+    }
+
+    for workspace in &dirty_driven {
+        rows.push(workspace_row(workspace, path_column_width));
+    }
+
+    // Build summary
+    let mut summary = Vec::new();
+
+    // When nothing is at risk, say so explicitly
+    if at_risk_count == 0 {
+        if total_workspaces == 0 {
+            // NOT reassurance. Nothing was checked — and on the machine behind
+            // `docs/observability-mechanics.md` §4.6 there are 70 workspaces to check, so an
+            // empty candidate set means discovery failed rather than that the machine is
+            // clean. Ticket #7 requires an empty panel to read as "checked and clear"; this
+            // case is the opposite of that and has to read the opposite way.
+            summary.push(
+                "No workspaces were located, so NOTHING WAS CHECKED — this is not a clear \
+                 result."
+                    .to_string(),
+            );
+        } else if !dirty_driven.is_empty() {
+            summary.push(
+                "No workspaces at risk — all dirty workspaces have active sessions.".to_string(),
+            );
+        } else {
+            summary.push("No workspaces at risk — all checked workspaces are clean.".to_string());
+        }
+    }
+
+    // Account for what was not listed
+    let mut accounted = Vec::new();
+    if clean_count > 0 {
+        accounted.push(format!("{} clean", clean_count));
+    }
+    if !dirty_driven.is_empty() && at_risk_count > 0 {
+        accounted.push(format!("{} dirty-driven", dirty_driven.len()));
+    }
+    if not_version_controlled_count > 0 {
+        accounted.push(format!(
+            "{} not version-controlled",
+            not_version_controlled_count
+        ));
+    }
+    if path_gone_count > 0 {
+        accounted.push(format!("{} path gone", path_gone_count));
+    }
+
+    if !accounted.is_empty() {
+        summary.push(format!("Also found: {}.", accounted.join(", ")));
+    }
+
+    // Unlocated namespaces
+    let mut no_longer_exists_count = 0;
+    let mut ambiguous_count = 0;
+    let mut search_exhausted_count = 0;
+    let mut misfiled_count = 0;
+
+    for (_, resolution) in &snapshot.unlocated {
+        match resolution {
+            NamespaceResolution::NoLongerExists => no_longer_exists_count += 1,
+            NamespaceResolution::Ambiguous(_) => ambiguous_count += 1,
+            NamespaceResolution::SearchExhausted => search_exhausted_count += 1,
+            // A resolved namespace has a path, so it belongs in `workspaces`, not here.
+            // Counted rather than ignored: silently swallowing it would shrink the total the
+            // panel claims to have checked, and a wrong denominator is how "0 at risk" stops
+            // meaning anything.
+            NamespaceResolution::Resolved(_) => misfiled_count += 1,
+        }
+    }
+
+    let mut unlocated_parts = Vec::new();
+    if no_longer_exists_count > 0 {
+        unlocated_parts.push(format!("{} no longer exist", no_longer_exists_count));
+    }
+    if ambiguous_count > 0 {
+        unlocated_parts.push(format!("{} ambiguous", ambiguous_count));
+    }
+    if search_exhausted_count > 0 {
+        unlocated_parts.push(format!("{} search incomplete", search_exhausted_count));
+    }
+
+    if !unlocated_parts.is_empty() {
+        summary.push(format!(
+            "Recorded namespaces not located: {}.",
+            unlocated_parts.join(", ")
+        ));
+    }
+    if misfiled_count > 0 {
+        summary.push(format!(
+            "BUG: {misfiled_count} namespace(s) reported as unlocated already have a path."
+        ));
+    }
+
+    // Partial coverage warning
+    if !snapshot.sweep_complete {
+        summary.push(
+            "WARNING: Directory sweep incomplete — this list is partial, not exhaustive."
+                .to_string(),
+        );
+    }
+
+    (title, rows, summary)
+}
+
+const PANEL_STATE_WIDTH: u16 = 14; // "DIRTY-STRANDED", the longest state
+const PANEL_COUNT_WIDTH: u16 = 15; // a count, or the reason printed in its place
+const PANEL_KIND_WIDTH: u16 = 8; // "worktree" / "primary"
+
+/// How much room the panel's path column gets at a given total width.
+///
+/// Derived rather than declared, and used both to shorten the path and to lay the row out,
+/// so the two cannot disagree and cut the path a second time without marking it.
+fn panel_path_width(total: u16) -> u16 {
+    let prefix = PANEL_STATE_WIDTH + PANEL_COUNT_WIDTH + PANEL_KIND_WIDTH + 3;
+    let borders = 2;
+    total.saturating_sub(prefix + borders).max(WORKSPACE_MIN)
+}
+
+/// Format one workspace as a row for the at-risk panel.
+///
+/// Columns: state, count (or reason for Unknown), worktree/primary marker, path (shortened).
+fn workspace_row(workspace: &WorkspaceReport, path_column_width: u16) -> String {
+    let state = workspace.state.to_string();
+
+    // For Unknown, show the reason in place of the count. Never "0", which would read as clean.
+    let count_or_reason = match &workspace.state {
+        WorkspaceState::Unknown(reason) => reason.to_string(),
+        _ => workspace
+            .uncommitted_entries
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "—".to_string()),
+    };
+
+    let worktree_marker = if workspace.linked_worktree {
+        "worktree"
+    } else {
+        "primary"
+    };
+
+    let path = shorten_from_the_left(&workspace.path, path_column_width);
+
+    format!(
+        "{state:<state_width$} {count_or_reason:<count_width$} {worktree_marker:<kind_width$} {path}",
+        state_width = PANEL_STATE_WIDTH as usize,
+        count_width = PANEL_COUNT_WIDTH as usize,
+        kind_width = PANEL_KIND_WIDTH as usize,
+    )
+}
+
 fn too_narrow_message(width: u16) -> String {
     format!(
         "acmon needs {} columns to print these numbers without truncating them; \
@@ -145,11 +373,19 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot) {
         return;
     }
 
-    let caveats = footer_lines(snapshot, area.width);
-    let [table_area, caveat_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(caveats.len() as u16)])
-            .areas(area);
+    // Build the at-risk panel content
+    let (panel_title, panel_rows, panel_summary) = at_risk_panel_content(snapshot, area.width);
+    let panel_height = 3 + panel_rows.len() as u16 + panel_summary.len() as u16;
 
+    let caveats = footer_lines(snapshot, area.width);
+    let [table_area, panel_area, caveat_area] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(panel_height),
+        Constraint::Length(caveats.len() as u16),
+    ])
+    .areas(area);
+
+    // Render session table
     let title = format!(" acmon — {} agent session(s) ", snapshot.sessions.len());
     let workspace_width = workspace_width(area.width);
     let rows: Vec<Row> = snapshot
@@ -173,6 +409,22 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot) {
         .block(Block::default().borders(Borders::ALL).title(title));
 
     frame.render_widget(table, table_area);
+
+    // Render at-risk panel
+    let mut panel_content = panel_rows;
+    if !panel_summary.is_empty() {
+        if !panel_content.is_empty() {
+            panel_content.push(String::new()); // Blank line before summary
+        }
+        panel_content.extend(panel_summary);
+    }
+
+    let panel = Paragraph::new(panel_content.join("\n"))
+        .block(Block::default().borders(Borders::ALL).title(panel_title));
+
+    frame.render_widget(panel, panel_area);
+
+    // Render footer caveats
     frame.render_widget(Paragraph::new(caveats.join("\n")), caveat_area);
 }
 
@@ -211,23 +463,21 @@ fn row_for(session: &Session, workspace_width: u16) -> Row<'static> {
         ],
     };
 
-    // For a transcript-derived session, show the namespace in the workspace column if
-    // the workspace is unknown due to the namespace being not invertible. Otherwise
-    // show the workspace path or the reason it is unknown.
+    // The workspace path when it is known, and otherwise the reason — carrying the recorded
+    // namespace alongside it whenever there is one.
+    //
+    // The namespace matters because for a transcript-derived session it is the only thing
+    // that identifies which workspace the row is about. A bare `gone` names nothing, and a
+    // row that names nothing cannot be acted on. The program still must not claim to know
+    // the path, so the reason comes first and the namespace after it.
     let workspace = match &session.workspace {
         Ok(workspace) => shorten_from_the_left(&workspace.path, workspace_width),
-        Err(WorkspaceUnknown::NotInvertible) => {
-            // For a transcript-derived Claude session, show the namespace itself
-            // rather than the unknown-reason text. A human reading the namespace can
-            // see which directory it is; the program must not claim to know, but
-            // withholding it entirely would make the row useless.
-            if let Identity::Transcript { recorded_as } = &session.identity {
-                shorten_from_the_left(recorded_as, workspace_width)
-            } else {
-                WorkspaceUnknown::NotInvertible.to_string()
+        Err(unknown) => match &session.identity {
+            Identity::Transcript { recorded_as } => {
+                shorten_from_the_left(&format!("{unknown}: {recorded_as}"), workspace_width)
             }
-        }
-        Err(unknown) => unknown.to_string(),
+            Identity::Process { .. } => unknown.to_string(),
+        },
     };
 
     let pid_cell = match &session.identity {

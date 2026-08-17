@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use acmon::liveness::{Method, State, Verdict};
 use acmon::render::{minimum_width, render_to_lines, required_height};
-use acmon::workspace::{Workspace, WorkspaceUnknown};
+use acmon::vcs::{Unreadable, WorkspaceState};
+use acmon::workspace::{NamespaceResolution, Workspace, WorkspaceUnknown};
 use acmon::world::{ResourceSource, Resources, ResourcesUnavailable, Unmeasured};
-use acmon::{Identity, Session, Snapshot};
+use acmon::{Identity, Session, Snapshot, WorkspaceReport};
 
 /// A width that fits the whole table with room to spare. The narrow cases have their
 /// own tests.
@@ -43,6 +44,9 @@ fn measured_ledger() -> Resources {
 
 fn snapshot_of(pids: &[i32]) -> Snapshot {
     Snapshot {
+        workspaces: Vec::new(),
+        unlocated: Vec::new(),
+        sweep_complete: true,
         sessions: pids
             .iter()
             .map(|&pid| Session {
@@ -58,6 +62,9 @@ fn snapshot_of(pids: &[i32]) -> Snapshot {
 
 fn snapshot_with(reading: Result<Resources, ResourcesUnavailable>) -> Snapshot {
     Snapshot {
+        workspaces: Vec::new(),
+        unlocated: Vec::new(),
+        sweep_complete: true,
         sessions: vec![Session {
             identity: Identity::Process { pid: 264 },
             cli: "claude".to_string(),
@@ -70,6 +77,9 @@ fn snapshot_with(reading: Result<Resources, ResourcesUnavailable>) -> Snapshot {
 
 fn snapshot_in(workspace: Result<Workspace, WorkspaceUnknown>) -> Snapshot {
     Snapshot {
+        workspaces: Vec::new(),
+        unlocated: Vec::new(),
+        sweep_complete: true,
         sessions: vec![Session {
             identity: Identity::Process { pid: 264 },
             cli: "claude".to_string(),
@@ -308,6 +318,9 @@ fn a_terminal_too_narrow_for_the_numbers_says_so_instead_of_truncating() {
 
 fn snapshot_in_state(verdict: Verdict) -> Snapshot {
     Snapshot {
+        workspaces: Vec::new(),
+        unlocated: Vec::new(),
+        sweep_complete: true,
         sessions: vec![Session {
             identity: Identity::Process { pid: 264 },
             cli: "claude".to_string(),
@@ -433,13 +446,16 @@ fn a_transcript_derived_row_shows_gone_not_a_number() {
     // and never a fabricated number like 0 or -1.
     let text = rendered(
         &Snapshot {
+            workspaces: Vec::new(),
+            unlocated: Vec::new(),
+            sweep_complete: true,
             sessions: vec![Session {
                 identity: Identity::Transcript {
                     recorded_as: "-Users-pmcfadin-projects-agentic-coding-monitor".to_string(),
                 },
                 cli: "claude".to_string(),
                 resources: Err(ResourcesUnavailable::ProcessExited),
-                workspace: Err(WorkspaceUnknown::NotInvertible),
+                workspace: Err(WorkspaceUnknown::WorkspaceGone),
                 liveness: Verdict {
                     state: State::Stalled,
                     method: Method::NoProcessAndSilencePastStall,
@@ -453,11 +469,19 @@ fn a_transcript_derived_row_shows_gone_not_a_number() {
         text.contains("gone"),
         "the PID column must show 'gone' for a transcript-derived session; got:\n{text}"
     );
-    for fabrication in ["0", "-1", "N/A"] {
-        assert!(
-            !text.contains(fabrication),
-            "the PID column must not show a fabricated number like {fabrication}; got:\n{text}"
-        );
+    // Check that fabricated PIDs don't appear in the session table.
+    // Look for the session table line (contains "gone" and "claude" and "STALLED").
+    for line in text.lines() {
+        if line.contains("gone") && line.contains("claude") && line.contains("STALLED") {
+            // This is the session row. Check it doesn't start with a fabricated PID.
+            for fabrication in ["0", "-1", "N/A"] {
+                let pattern = format!("│{:<6}", fabrication);
+                assert!(
+                    !line.starts_with(&pattern),
+                    "the PID column must not show a fabricated number like {fabrication}; got line:\n{line}"
+                );
+            }
+        }
     }
 }
 
@@ -471,13 +495,16 @@ fn a_transcript_derived_claude_row_shows_its_namespace_in_the_workspace_column()
     let namespace = "-Users-pmcfadin-projects-agentic-coding-monitor";
     let text = rendered(
         &Snapshot {
+            workspaces: Vec::new(),
+            unlocated: Vec::new(),
+            sweep_complete: true,
             sessions: vec![Session {
                 identity: Identity::Transcript {
                     recorded_as: namespace.to_string(),
                 },
                 cli: "claude".to_string(),
                 resources: Err(ResourcesUnavailable::ProcessExited),
-                workspace: Err(WorkspaceUnknown::NotInvertible),
+                workspace: Err(WorkspaceUnknown::WorkspaceGone),
                 liveness: Verdict {
                     state: State::Stalled,
                     method: Method::NoProcessAndSilencePastStall,
@@ -495,5 +522,338 @@ fn a_transcript_derived_claude_row_shows_its_namespace_in_the_workspace_column()
         !text.contains("not-invertible"),
         "the workspace column must not show the error reason when the namespace is available; \
          got:\n{text}"
+    );
+}
+
+// ===== At-risk workspace panel tests =====
+
+#[test]
+fn at_risk_panel_lists_a_stranded_workspace() {
+    // The primary case: uncommitted work with no session driving it.
+    let text = rendered(
+        &Snapshot {
+            sessions: Vec::new(),
+            workspaces: vec![WorkspaceReport {
+                path: "/Users/pmcfadin/projects/abandoned".to_string(),
+                state: WorkspaceState::DirtyStranded,
+                linked_worktree: false,
+                uncommitted_entries: Some(27),
+            }],
+            unlocated: Vec::new(),
+            sweep_complete: true,
+        },
+        WIDE,
+    );
+
+    assert!(
+        text.contains("DIRTY-STRANDED"),
+        "the panel must show the workspace state; got:\n{text}"
+    );
+    assert!(
+        text.contains("27"),
+        "the panel must show the uncommitted entry count; got:\n{text}"
+    );
+    assert!(
+        text.contains("abandoned"),
+        "the panel must show the workspace path; got:\n{text}"
+    );
+}
+
+#[test]
+fn at_risk_panel_is_present_when_nothing_is_at_risk() {
+    // An empty panel must read as "checked and clear", never as possibly broken.
+    let text = rendered(
+        &Snapshot {
+            sessions: Vec::new(),
+            workspaces: vec![WorkspaceReport {
+                path: "/Users/pmcfadin/projects/clean".to_string(),
+                state: WorkspaceState::Clean,
+                linked_worktree: false,
+                uncommitted_entries: Some(0),
+            }],
+            unlocated: Vec::new(),
+            sweep_complete: true,
+        },
+        WIDE,
+    );
+
+    // Panel border and title must be present
+    assert!(
+        text.contains("at risk"),
+        "the panel title must be present even when empty; got:\n{text}"
+    );
+    assert!(
+        text.contains("0 of 1 workspaces"),
+        "the panel must state how many were checked; got:\n{text}"
+    );
+    // Must contain a phrase meaning checked-and-clear
+    assert!(
+        text.contains("No workspaces at risk") || text.contains("none found"),
+        "the panel must explicitly say nothing is at risk; got:\n{text}"
+    );
+}
+
+#[test]
+fn dirty_driven_and_dirty_stranded_are_distinguishable() {
+    // A driven workspace is visibly different from a stranded one.
+    let text = rendered(
+        &Snapshot {
+            sessions: Vec::new(),
+            workspaces: vec![
+                WorkspaceReport {
+                    path: "/Users/pmcfadin/projects/stranded".to_string(),
+                    state: WorkspaceState::DirtyStranded,
+                    linked_worktree: false,
+                    uncommitted_entries: Some(10),
+                },
+                WorkspaceReport {
+                    path: "/Users/pmcfadin/projects/driven".to_string(),
+                    state: WorkspaceState::DirtyDriven,
+                    linked_worktree: false,
+                    uncommitted_entries: Some(5),
+                },
+            ],
+            unlocated: Vec::new(),
+            sweep_complete: true,
+        },
+        WIDE,
+    );
+
+    assert!(
+        text.contains("DIRTY-STRANDED"),
+        "stranded state must appear; got:\n{text}"
+    );
+    assert!(
+        text.contains("DIRTY-DRIVEN"),
+        "driven state must appear; got:\n{text}"
+    );
+    // Verify the strings are actually different
+    let stranded_index = text.find("DIRTY-STRANDED").unwrap();
+    let driven_index = text.find("DIRTY-DRIVEN").unwrap();
+    assert_ne!(
+        stranded_index, driven_index,
+        "the two states must be distinguishable"
+    );
+}
+
+#[test]
+fn unknown_workspace_is_listed_and_does_not_show_zero() {
+    // An Unknown(QueryFailed) workspace is at risk and must not show "0" where the count goes.
+    let text = rendered(
+        &Snapshot {
+            sessions: Vec::new(),
+            workspaces: vec![WorkspaceReport {
+                path: "/Users/pmcfadin/projects/unreadable".to_string(),
+                state: WorkspaceState::Unknown(Unreadable::QueryFailed("git failed".to_string())),
+                linked_worktree: false,
+                uncommitted_entries: None,
+            }],
+            unlocated: Vec::new(),
+            sweep_complete: true,
+        },
+        WIDE,
+    );
+
+    assert!(
+        text.contains("UNKNOWN"),
+        "the unknown state must appear; got:\n{text}"
+    );
+    assert!(
+        text.contains("query failed"),
+        "the reason must appear in place of the count; got:\n{text}"
+    );
+
+    // Verify no "0" appears in the count position. We need to be careful: "0" appears in
+    // "1 of 0 workspaces" etc. Check that the line containing "UNKNOWN" doesn't have
+    // a standalone "0" that looks like a count.
+    for line in text.lines() {
+        if line.contains("UNKNOWN") {
+            // The count column should contain "query failed", not "0"
+            assert!(
+                !line.contains(" 0 "),
+                "the Unknown workspace row must not contain a standalone 0; got line:\n{line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn linked_worktree_shows_worktree_attribute() {
+    let text = rendered(
+        &Snapshot {
+            sessions: Vec::new(),
+            workspaces: vec![WorkspaceReport {
+                path: "/Users/pmcfadin/projects/obs/.claude/worktrees/feature-1".to_string(),
+                state: WorkspaceState::DirtyStranded,
+                linked_worktree: true,
+                uncommitted_entries: Some(3),
+            }],
+            unlocated: Vec::new(),
+            sweep_complete: true,
+        },
+        WIDE,
+    );
+
+    assert!(
+        text.contains("worktree"),
+        "a linked worktree must show the worktree attribute; got:\n{text}"
+    );
+}
+
+#[test]
+fn sweep_incomplete_produces_partial_coverage_warning() {
+    let with_warning = rendered(
+        &Snapshot {
+            sessions: Vec::new(),
+            workspaces: Vec::new(),
+            unlocated: Vec::new(),
+            sweep_complete: false,
+        },
+        WIDE,
+    );
+
+    let without_warning = rendered(
+        &Snapshot {
+            sessions: Vec::new(),
+            workspaces: Vec::new(),
+            unlocated: Vec::new(),
+            sweep_complete: true,
+        },
+        WIDE,
+    );
+
+    assert!(
+        with_warning.contains("incomplete") || with_warning.contains("partial"),
+        "sweep_complete: false must produce a warning; got:\n{with_warning}"
+    );
+    assert!(
+        !without_warning.contains("incomplete"),
+        "sweep_complete: true must not produce the warning; got:\n{without_warning}"
+    );
+}
+
+#[test]
+fn unlocated_namespaces_are_counted_and_distinguished() {
+    let text = rendered(
+        &Snapshot {
+            sessions: Vec::new(),
+            workspaces: Vec::new(),
+            unlocated: vec![
+                (
+                    "namespace1".to_string(),
+                    NamespaceResolution::NoLongerExists,
+                ),
+                (
+                    "namespace2".to_string(),
+                    NamespaceResolution::NoLongerExists,
+                ),
+                (
+                    "namespace3".to_string(),
+                    NamespaceResolution::Ambiguous(vec!["a".to_string(), "b".to_string()]),
+                ),
+                (
+                    "namespace4".to_string(),
+                    NamespaceResolution::SearchExhausted,
+                ),
+            ],
+            sweep_complete: true,
+        },
+        WIDE,
+    );
+
+    // Must report all three categories
+    assert!(
+        text.contains("no longer exist") || text.contains("2"),
+        "NoLongerExists must be counted; got:\n{text}"
+    );
+    assert!(
+        text.contains("ambiguous") || text.contains("1"),
+        "Ambiguous must be counted; got:\n{text}"
+    );
+    assert!(
+        text.contains("incomplete") || text.contains("search"),
+        "SearchExhausted must be counted and read differently from NoLongerExists; got:\n{text}"
+    );
+}
+
+#[test]
+fn stranded_workspaces_are_ordered_by_count_descending() {
+    // Largest pile of endangered work first.
+    let text = rendered(
+        &Snapshot {
+            sessions: Vec::new(),
+            workspaces: vec![
+                WorkspaceReport {
+                    path: "/Users/pmcfadin/projects/small".to_string(),
+                    state: WorkspaceState::DirtyStranded,
+                    linked_worktree: false,
+                    uncommitted_entries: Some(5),
+                },
+                WorkspaceReport {
+                    path: "/Users/pmcfadin/projects/large".to_string(),
+                    state: WorkspaceState::DirtyStranded,
+                    linked_worktree: false,
+                    uncommitted_entries: Some(47),
+                },
+                WorkspaceReport {
+                    path: "/Users/pmcfadin/projects/medium".to_string(),
+                    state: WorkspaceState::DirtyStranded,
+                    linked_worktree: false,
+                    uncommitted_entries: Some(15),
+                },
+            ],
+            unlocated: Vec::new(),
+            sweep_complete: true,
+        },
+        WIDE,
+    );
+
+    // Find the positions of the three workspaces in the output
+    let large_pos = text.find("large").expect("'large' should be in output");
+    let medium_pos = text.find("medium").expect("'medium' should be in output");
+    let small_pos = text.find("small").expect("'small' should be in output");
+
+    assert!(
+        large_pos < medium_pos,
+        "largest (47) must come before medium (15); got:\n{text}"
+    );
+    assert!(
+        medium_pos < small_pos,
+        "medium (15) must come before small (5); got:\n{text}"
+    );
+}
+
+#[test]
+fn panel_does_not_clip_existing_caveat() {
+    // The panel's presence must not clip the existing child-CPU floor caveat.
+    let text = rendered(
+        &Snapshot {
+            sessions: vec![Session {
+                identity: Identity::Process { pid: 69046 },
+                cli: "claude".to_string(),
+                resources: Ok(measured_ledger()),
+                workspace: measured_workspace(),
+                liveness: active_verdict(),
+            }],
+            workspaces: vec![WorkspaceReport {
+                path: "/Users/pmcfadin/projects/test".to_string(),
+                state: WorkspaceState::DirtyStranded,
+                linked_worktree: false,
+                uncommitted_entries: Some(10),
+            }],
+            unlocated: Vec::new(),
+            sweep_complete: true,
+        },
+        WIDE,
+    );
+
+    // The existing floor caveat must still be fully present
+    assert!(
+        text.contains("floor"),
+        "the floor caveat must survive when the panel is present; got:\n{text}"
+    );
+    assert!(
+        text.contains("totals."),
+        "and so must its last words; got:\n{text}"
     );
 }

@@ -516,6 +516,11 @@ The slug is the absolute cwd with characters replaced by `-`. **The replaced set
 
 Corroboration: **0 of 135 namespaces on this machine contain an underscore.**
 
+The total drifts downward between measurements in this document — 135, then 113, then 109
+— because the store is pruned, not because one of the counts is a typo. The underscore
+result held at every one of them, which is the part that matters: a mapping that preserves
+underscores matches **nothing at all**, for every workspace, silently.
+
 Two further hazards:
 
 - **Case.** A namespace exists as `-Users-pmcfadin-projects-WorkforceOS` while the
@@ -525,6 +530,44 @@ Two further hazards:
   case-insensitively. On a case-sensitive volume, path access would fail too.
 - **Lossiness.** Because `/`, `.` and `_` all map to `-`, the slug is **not
   invertible**. Always map path → slug forward; never attempt slug → path.
+
+#### The slug has no inverse, but it can be searched for — measured
+
+"Not invertible" is a fact about the *function*, and it is easy to over-read into "the
+path is unknowable". A different operation is available and is not a guess: descend the
+real filesystem one level at a time, and at each level keep only children whose
+**forward** mapping matches the next span of the slug. Every step is confirmed against a
+directory entry that exists, so a single surviving candidate is proven rather than
+inferred, and two surviving candidates are reported as ambiguous rather than resolved by
+picking one.
+
+Two details decide whether this works:
+
+- **Do not split the slug on `-`.** Directory names contain hyphens of their own.
+  `agentic_coding_monitor` maps to `agentic-coding-monitor`, which is one directory
+  wearing three apparent segments. The descent has to test each real child's mapped name
+  as a *prefix* of what remains.
+- **Compare case-insensitively and keep the filesystem's spelling.** Same reason as
+  above: `WorkforceOS` is recorded, `workforceos` is reported by the kernel, and only one
+  of the two names a directory whose case survives being handed back to a human.
+
+Measured over the whole store on this machine:
+
+| | |
+| --- | --- |
+| Slugs recorded | 109 |
+| Resolved to exactly one existing directory | **32** |
+| Ambiguous (more than one candidate) | **0** |
+| No longer exists — directory deleted, moved, or renamed | **77** |
+| Total cost of the whole sweep | **42 ms** |
+
+Zero ambiguity is an observation about this machine, not a property of the mapping: two
+siblings named `a.b` and `a_b` would both map to `a-b`, and the search must report that
+rather than choose. The 77 that resolve to nothing are the more interesting number — most
+are deleted worktrees and expired temporary directories, which is to say that **the
+majority of recorded workspaces on this machine no longer exist.** A search that returned
+"gone" when it had merely given up early would be indistinguishable from this result, so
+the two outcomes have to stay separate.
 
 ### 4.4 Codex session storage
 
@@ -568,6 +611,136 @@ No OpenTelemetry. Telemetry is Sentry-based and not externally queryable.
 **Net asymmetry:** Claude Code gives per-tool-call latency and per-subagent token
 accounting for free. Codex gives neither without either installing hooks or parsing
 tool events out of transcripts.
+
+### 4.6 Workspace version-control state
+
+This is the measurement the project exists for: whether a directory holds work that
+exists nowhere else.
+
+#### Querying git cannot be allowed to write
+
+The repository being observed may have an agent working in it. A plain `git status`
+refreshes and rewrites `.git/index`, and can start a filesystem-monitor daemon — so the
+naive query makes the observer a participant, contending for a lock the agent needs.
+Four flags prevent it, and each earns its place:
+
+| Flag | What it prevents |
+| --- | --- |
+| `--no-optional-locks` | git refreshing and rewriting the index, i.e. taking the lock |
+| `-c core.fsmonitor=false` | git **starting a daemon** inside the observed repository |
+| `-c gc.auto=0` | any housekeeping write triggered incidentally |
+| `--untracked-files=normal` | *omitting* untracked files, which are uncommitted work |
+
+The last one is not a safety flag but a correctness one. The workspace whose loss
+motivated this project held files git had never seen; a query that reported only tracked
+modifications would have called it clean.
+
+This is mechanically checkable rather than merely asserted: capture `.git/index`'s
+modification time either side of the query and require it unchanged. Dropping
+`--no-optional-locks` makes that check fail, which is what makes it a test rather than a
+comment.
+
+#### Being a worktree costs no subprocess to establish
+
+`.git` is a **directory** in a repository's primary working tree and a **file** in a
+linked worktree. So walking a path's ancestors for a `.git` entry yields both the
+repository root and the worktree attribute in a handful of `stat` calls, where
+`git rev-parse` would be a process launch — and on this machine every launch pays the
+authorization tax measured in §6. The attribute is recorded; it is never a filter on
+which workspaces get discovered.
+
+#### Which workspaces are reachable at all — measured
+
+The candidate set is the question that decides whether the at-risk panel finds anything.
+Both obvious sources were measured and **both are inadequate**, which is the most
+important result in this section:
+
+| Discovery source | Workspaces reached | Holding uncommitted work |
+| --- | --- | --- |
+| Working directories of all observed processes (90 distinct) | 5 git roots | 1 |
+| Recorded transcript slugs resolved per §4.3 (32 of 109) | 22 git roots | 7 |
+| Union of both | 24 git roots | 8 |
+| **Directory sweep of `~/projects`, depth ≤ 3** | **69 git roots** | **14** |
+
+Process working directories are nearly free and nearly useless on their own: 90 distinct
+cwds collapse to 5 repositories, because most processes sit in `/` or in a home directory.
+The transcript store is better — it names workspaces an agent has worked in even when
+nothing is running there now, which is precisely the at-risk case.
+
+But the sweep finds **14 dirty workspaces where the union of the observational sources
+finds 8**, and the largest of the six it adds is `presto_testing` with **28 uncommitted
+entries** — the single biggest pile of at-risk work on the machine, and the same shape as
+the 27-file loss that motivated the project. A panel built only from processes and
+transcripts would have missed it while reporting confidently on the rest. That is a
+plausible, calm, wrong answer, so observational discovery alone is not sufficient for the
+at-risk panel and a sweep is required.
+
+Sweep rules that matter: stop descending at any directory containing `.git`, so a
+repository's vendored dependencies are never walked; skip symlinks, so `/tmp → /private/tmp`
+cannot create a cycle; bound total directories visited and report exhaustion rather than
+reporting the partial result as complete.
+
+Pruning at `.git` is what makes the sweep cheap, and the cost of not pruning is severe:
+
+| Sweep of `~/projects` | Workspaces found | Directories visited | Time |
+| --- | --- | --- | --- |
+| depth ≤ 4, prune at `.git` | 68 | **122** | < 10 ms |
+| depth ≤ 4, no pruning | 72 | 18,146 | 809 ms |
+| depth ≤ 5, no pruning | 72 | 53,228 | 4664 ms |
+
+#### The hole in pruning, and git's own registry as the fix
+
+Pruning has one hole. A linked worktree can live *inside* another repository's tree, and
+this project's own agent workflows put them at `<repo>/.claude/worktrees/<name>`, where a
+pruned sweep will never look. That is where the four extra workspaces in the table above
+come from, and paying 809 ms and 18,000 directory reads for them is a bad trade.
+
+There is no need to trade at all, because **git already keeps a registry**. For a primary
+repository, `<repo>/.git/worktrees/<name>/gitdir` is a file whose contents are the path of
+that worktree's own `.git` file — so the worktree directory is that path's parent. Reading
+it is a directory listing and a small file read per repository. No subprocess, and the
+answer is authoritative rather than discovered.
+
+| Two-phase discovery | |
+| --- | --- |
+| Phase 1 — pruned sweep, depth ≤ 4 | 68 workspaces, 122 directories |
+| Phase 2 — read `.git/worktrees/*/gitdir` | **2 more**, including one a pruned sweep cannot reach |
+| Total | **70 workspaces in 9 ms** |
+
+One caveat found immediately: of the two worktrees recovered from the registry, **one does
+not exist** — a stale registration git never cleaned up. A registered worktree therefore
+has to be treated as a candidate like any other and left to the version-control query to
+report as `path gone`. Filtering it out silently would hide a real class of stale state,
+and erroring on it would make one abandoned registration break the whole sweep.
+
+#### Worktrees dominate, and that is why git-ness must be an attribute
+
+Under `~/projects`:
+
+| | |
+| --- | --- |
+| Primary working trees (`.git` is a directory) | 24 |
+| **Linked worktrees (`.git` is a file)** | **46** |
+| Dirty workspaces that are linked worktrees | 4 of 14 |
+
+Two thirds of the git workspaces on this machine are linked worktrees, created per issue
+by agent workflows. Any design that treated a worktree as a special case, or discovered
+workspaces by looking for primary repositories, would ignore the majority of them. Walking
+up to the first `.git` entry gets this right for free: for a linked worktree the first
+entry found is the worktree's own, so the worktree is the workspace — which is correct,
+because that is where the uncommitted work is.
+
+#### Cost
+
+| Roots swept | Sequential `git status` total |
+| --- | --- |
+| 22 (transcript store only) | 1607 ms |
+| 69 (full `~/projects` sweep) | **5.0 s** |
+
+Per repository: min 21 ms · median 83 ms · max 149 ms. Zero query failures across both
+sweeps. Five seconds is far past the one-second fast-tier budget, so the honest reading is
+that the full sweep is a slow-tier measurement, and that a concurrent implementation has
+5.0 s sequential as the figure to beat.
 
 ---
 
