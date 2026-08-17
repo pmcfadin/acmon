@@ -1,0 +1,23 @@
+# Local machine profiles — may contain repo paths and machine identifiers.
+# Use `export --redact` before sharing any profile.
+profiles/
+*.profile.json
+
+# Collector runtime state
+state.json
+registry.json
+events.jsonl
+spool/
+
+# Local editor / agent settings
+.claude/settings.local.json
+
+# Rust
+target/
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Keep large trees out of Spotlight's index (see docs)
+.metadata_never_index
