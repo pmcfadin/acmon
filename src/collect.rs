@@ -28,6 +28,30 @@ pub enum CollectError {
     },
 }
 
+impl std::fmt::Display for CollectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CollectError::World(err) => write!(f, "{}", err),
+            CollectError::UntrustworthySnapshot { observer_pid } => {
+                write!(
+                    f,
+                    "process snapshot incomplete (observer {} not in its own result)",
+                    observer_pid
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CollectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CollectError::World(err) => Some(err),
+            CollectError::UntrustworthySnapshot { .. } => None,
+        }
+    }
+}
+
 /// Collect a snapshot of the agent sessions on this machine.
 pub fn collect(world: &dyn World) -> Result<Snapshot, CollectError> {
     let observation = world.process_snapshot().map_err(CollectError::World)?;
@@ -46,7 +70,7 @@ pub fn collect(world: &dyn World) -> Result<Snapshot, CollectError> {
         .records
         .iter()
         .filter_map(|record| {
-            let exe = record.exe_path.as_deref()?;
+            let exe = record.exe_path.as_ref().ok()?;
             let detector = detectors.iter().find(|d| d.matches(exe))?;
             Some(Session {
                 pid: record.pid,

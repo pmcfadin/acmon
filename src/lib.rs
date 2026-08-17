@@ -9,4 +9,4 @@ pub mod world;
 pub use collect::{collect, CollectError, Session, Snapshot};
 pub use detect::Detector;
 pub use real_world::RealWorld;
-pub use world::{ProcessRecord, ProcessSnapshot, World, WorldError};
+pub use world::{ExePathUnavailable, ProcessRecord, ProcessSnapshot, World, WorldError};

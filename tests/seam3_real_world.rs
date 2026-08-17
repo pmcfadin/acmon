@@ -54,7 +54,7 @@ fn an_unreadable_executable_path_is_absent_rather_than_empty() {
         observation
             .records
             .iter()
-            .all(|r| r.exe_path.as_deref() != Some("")),
+            .all(|r| r.exe_path.as_ref().ok().map(|s| s.as_str()) != Some("")),
         "an unreadable path must be absent, never an empty string"
     );
 }
