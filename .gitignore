@@ -21,8 +21,3 @@ target/
 
 # Keep large trees out of Spotlight's index (see docs)
 .metadata_never_index
-
-
-# Added by cargo
-
-/target

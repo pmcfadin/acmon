@@ -4,7 +4,7 @@ Measuring what AI coding agents actually cost on a managed macOS developer machi
 and how much of that cost is the machine's fault rather than the work's. See
 [`README.md`](README.md).
 
-**Status:** research and specification complete; **no implementation yet.**
+**Status:** v1 implementation in progress; ticket #2 (live session table) complete and verified.
 
 ## Orientation
 
@@ -14,7 +14,7 @@ Read these before proposing anything:
 | --- | --- |
 | [`docs/observability-mechanics.md`](docs/observability-mechanics.md) | The evidence base. What is observable on macOS, how, at what cost, and what is provably *not* observable. |
 | [`docs/PRD.md`](docs/PRD.md) | Requirements, scope phasing (v1/v2/v3), and the decision record. |
-| [Issue #1](https://github.com/pmcfadin/acmon/issues/1) | The v1 spec, triaged `ready-for-agent`. |
+| [Issues #2–#12](https://github.com/pmcfadin/acmon/issues) | Active v1 work: #2 done; #3/#4 next startable. |
 
 ## Working rules specific to this project
 
