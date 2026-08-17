@@ -1,0 +1,16 @@
+[package]
+name = "acmon"
+version = "0.1.0"
+edition = "2021"
+description = "Measure what AI coding agents cost on a managed macOS machine"
+license = "Apache-2.0"
+repository = "https://github.com/pmcfadin/acmon"
+
+[dependencies]
+libproc = "0.14"
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[profile.release]
+strip = true
