@@ -18,6 +18,14 @@ impl RealWorld {
     }
 }
 
+/// Whether a pid still refers to a live process.
+///
+/// Signal 0 performs the permission and existence checks without delivering
+/// anything, so this observes without disturbing.
+fn process_exists(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 || *libc::__error() == libc::EPERM }
+}
+
 impl World for RealWorld {
     fn process_snapshot(&self) -> Result<ProcessSnapshot, WorldError> {
         let pids = pids_by_type(ProcFilter::All).map_err(|e| {
@@ -28,16 +36,16 @@ impl World for RealWorld {
             .into_iter()
             .map(|pid| {
                 let pid = pid as i32;
-                // LIMITATION, stated rather than hidden. There is no single call that
-                // returns every path, so this is a list followed by a read. A pid that
-                // exits in between cannot be distinguished from one whose path we are
-                // not permitted to read at the libproc API level, so both report
-                // PermissionDenied. Neither becomes a session. That errs toward never
-                // inventing a session, which is the safe direction. In practice every
-                // same-user process is readable, and sessions are always same-user.
+                // There is no single call returning every path, so this is a list
+                // followed by a read, and a pid can exit in between. Rather than
+                // assume a cause, ask: if the process is gone the reason is exit, and
+                // if it is still there the reason is that we may not read it. One
+                // extra syscall, only on the failure path, in exchange for a reason
+                // that is true rather than merely plausible.
                 let exe_path = match proc_pid::pidpath(pid) {
                     Ok(path) if !path.is_empty() => Ok(path),
-                    _ => Err(ExePathUnavailable::PermissionDenied),
+                    _ if process_exists(pid) => Err(ExePathUnavailable::PermissionDenied),
+                    _ => Err(ExePathUnavailable::ProcessExited),
                 };
                 ProcessRecord { pid, exe_path }
             })
@@ -47,5 +55,18 @@ impl World for RealWorld {
             records,
             observer_pid: self.observer_pid,
         })
+    }
+
+    fn output_width(&self) -> u16 {
+        const FALLBACK: u16 = 80;
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) };
+        // Not a terminal (piped, redirected, or under a harness): fall back rather
+        // than render a zero-width table.
+        if rc == 0 && size.ws_col > 0 {
+            size.ws_col
+        } else {
+            FALLBACK
+        }
     }
 }

@@ -5,6 +5,7 @@
 //! class of machine vary by roughly 2x. A test asserting a specific count is a test
 //! that fails for reasons unrelated to correctness.
 
+use acmon::world::ExePathUnavailable;
 use acmon::{collect, RealWorld, World};
 
 #[test]
@@ -57,4 +58,33 @@ fn an_unreadable_executable_path_is_absent_rather_than_empty() {
             .all(|r| r.exe_path.as_ref().ok().map(|s| s.as_str()) != Some("")),
         "an unreadable path must be absent, never an empty string"
     );
+}
+
+#[test]
+fn an_unavailable_path_states_a_reason_that_is_actually_true() {
+    // A reason must be established, not assumed. If a record claims the process
+    // exited, the process really must be gone. The converse is deliberately NOT
+    // asserted: a process alive at snapshot time may legitimately have exited by now,
+    // so only the direction that cannot race is checked.
+    let world = RealWorld::new();
+    let observation = world.process_snapshot().expect("enumeration");
+
+    for record in &observation.records {
+        if record.exe_path == Err(ExePathUnavailable::ProcessExited) {
+            let alive = unsafe { libc::kill(record.pid, 0) == 0 };
+            assert!(
+                !alive,
+                "pid {} is reported as exited but is alive — the reason is false",
+                record.pid
+            );
+        }
+    }
+}
+
+#[test]
+fn output_width_is_always_usable() {
+    // Under a test harness stdout is not a terminal, so this exercises the fallback.
+    // Zero would render a table with no columns at all.
+    let world = RealWorld::new();
+    assert!(world.output_width() > 0, "a width of zero renders nothing");
 }

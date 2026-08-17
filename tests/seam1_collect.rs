@@ -28,6 +28,11 @@ impl FakeWorld {
 }
 
 impl World for FakeWorld {
+    fn output_width(&self) -> u16 {
+        // Pinned, so render tests are deterministic regardless of the real terminal.
+        80
+    }
+
     fn process_snapshot(&self) -> Result<ProcessSnapshot, WorldError> {
         self.snapshot.clone()
     }

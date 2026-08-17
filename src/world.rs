@@ -4,11 +4,14 @@
 //! pure and testable from captured fixtures.
 
 /// Why an executable path could not be read.
+///
+/// Each variant must be TRUE when reported. A reason that is merely plausible is
+/// worse than no reason at all: it reads as a finding rather than as ignorance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExePathUnavailable {
-    /// The process exited between enumeration and detail read.
+    /// The process no longer exists. Confirmed after the failed read, not guessed.
     ProcessExited,
-    /// The path could not be read, likely due to permissions.
+    /// The process still exists but its path could not be read.
     PermissionDenied,
 }
 
@@ -71,8 +74,16 @@ pub trait World {
     /// the contract is that the result represents one logical observation, not that
     /// it's gathered in a single syscall.
     ///
-    /// Processes that exit during enumeration will have
-    /// `exe_path = Err(ExePathUnavailable::PermissionDenied)` and are not
-    /// distinguishable from processes whose paths cannot be read due to permissions.
+    /// A process that exits mid-enumeration reports
+    /// [`ExePathUnavailable::ProcessExited`] and one that is merely unreadable reports
+    /// [`ExePathUnavailable::PermissionDenied`]. Implementations MUST establish which
+    /// is true rather than assuming, because a confidently wrong reason is worse than
+    /// an admitted unknown.
     fn process_snapshot(&self) -> Result<ProcessSnapshot, WorldError>;
+
+    /// The width available for output, in columns.
+    ///
+    /// Lives here because `world` is the only module permitted to touch the operating
+    /// system, and because a fake can then pin it for deterministic render tests.
+    fn output_width(&self) -> u16;
 }

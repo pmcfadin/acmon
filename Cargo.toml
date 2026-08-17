@@ -7,10 +7,14 @@ license = "Apache-2.0"
 repository = "https://github.com/pmcfadin/acmon"
 
 [dependencies]
+libc = "0.2"
 libproc = "0.14"
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+
+[dev-dependencies]
+libc = "0.2"
 
 [profile.release]
 strip = true

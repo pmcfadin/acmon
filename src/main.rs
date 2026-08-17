@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use acmon::{collect, render, RealWorld};
+use acmon::{collect, render, RealWorld, World};
 
 fn main() -> ExitCode {
     let world = RealWorld::new();
@@ -8,9 +8,7 @@ fn main() -> ExitCode {
     match collect(&world) {
         Ok(snapshot) => {
             let height = render::required_height(&snapshot);
-            // Standard terminal width; no crossterm dependency needed for one-shot output
-            let width = 80;
-            for line in render::render_to_lines(&snapshot, width, height) {
+            for line in render::render_to_lines(&snapshot, world.output_width(), height) {
                 println!("{line}");
             }
             ExitCode::SUCCESS
