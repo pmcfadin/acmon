@@ -53,8 +53,12 @@ fn rec_unreadable(pid: i32) -> ProcessRecord {
     }
 }
 
-/// Captured from a real machine: nine live Claude sessions, the real Codex CLI, and
-/// five processes that a careless detector would misclassify.
+/// Captured from a real machine: live Claude sessions of both builds, the real Codex
+/// CLI, and processes a careless detector would misclassify.
+///
+/// Every path here was observed via `proc_pidpath`. The pids were observed too, but
+/// they are inherently ephemeral — nothing in these tests depends on a pid being
+/// currently live, only on paths being real and distinguishable.
 fn captured_process_table() -> Vec<ProcessRecord> {
     vec![
         // --- nine genuine Claude Code sessions. Note the basename is a VERSION STRING.
