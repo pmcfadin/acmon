@@ -6,7 +6,7 @@
 //! that fails for reasons unrelated to correctness.
 
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use acmon::workspace::NamespaceUnmatched;
 use acmon::world::{PathUnavailable, ResourceSource, ResourcesUnavailable, Unmeasured};
@@ -35,7 +35,8 @@ fn the_real_process_table_contains_the_observing_process() {
 fn collection_over_the_real_machine_yields_only_recognised_clis() {
     let world = RealWorld::new();
 
-    let snapshot = collect(&world).expect("collection over the real machine should succeed");
+    let snapshot = collect(&world, SystemTime::now())
+        .expect("collection over the real machine should succeed");
 
     for session in &snapshot.sessions {
         assert!(
@@ -370,7 +371,8 @@ fn every_workspace_attribution_on_this_machine_is_true_in_both_directions() {
     // presented: a calm "no session here" for a workspace that had one.
     let world = RealWorld::new();
     let recorded = world.recorded_namespaces().expect("listable");
-    let snapshot = collect(&world).expect("collection over the real machine should succeed");
+    let snapshot = collect(&world, SystemTime::now())
+        .expect("collection over the real machine should succeed");
 
     for session in &snapshot.sessions {
         let Ok(workspace) = &session.workspace else {
@@ -432,4 +434,203 @@ fn codex_sessions_from_the_real_machine_are_either_empty_or_well_formed() {
     // Either result is legitimate: emptiness means no recent Codex sessions on this
     // machine, which is a valid state. The test proves only that whatever came back has
     // the right shape, not that any particular count is correct.
+}
+
+#[test]
+fn every_recorded_namespace_has_an_activity_time_or_a_stated_reason() {
+    // For every namespace on this machine, namespace_activity returns either a time or a
+    // stated reason — never a panic, never a suspiciously-epoch time. A zero or epoch
+    // value would be the fail-to-zero defect this project exists to remove.
+    use acmon::world::ActivityUnavailable;
+
+    let world = RealWorld::new();
+    let recorded = world
+        .recorded_namespaces()
+        .expect("the transcript store should be listable");
+
+    assert!(
+        !recorded.is_empty(),
+        "no namespaces were listed at all, so nothing below proves anything"
+    );
+
+    // A time after 2020 and not in the future by more than a small margin guards against
+    // epoch or zero values.
+    let year_2020 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+    let future_margin = std::time::Duration::from_secs(3_600); // 1 hour
+
+    for namespace in &recorded {
+        let result = world.namespace_activity(namespace);
+        match result {
+            Ok(time) => {
+                assert!(
+                    time > year_2020,
+                    "namespace {namespace} activity time {time:?} is suspiciously old — \
+                     looks like an epoch or zero"
+                );
+                let now = std::time::SystemTime::now();
+                assert!(
+                    time < now + future_margin,
+                    "namespace {namespace} activity time {time:?} is in the future — \
+                     current time is {now:?}"
+                );
+            }
+            Err(ActivityUnavailable::NotRecorded) => {
+                panic!(
+                    "namespace {namespace} is in the listing but reports as not recorded — \
+                     should be Unreadable or NoTranscripts"
+                );
+            }
+            Err(ActivityUnavailable::Unreadable(_)) | Err(ActivityUnavailable::NoTranscripts) => {
+                // These are legitimate answers with stated reasons.
+            }
+        }
+    }
+}
+
+#[test]
+fn a_namespace_that_does_not_exist_returns_not_recorded() {
+    use acmon::world::ActivityUnavailable;
+
+    let world = RealWorld::new();
+
+    // A name that cannot exist: contains characters that would be replaced by the slug
+    // mapping, and is long enough to be unlikely to collide.
+    let nonexistent = "does-not-exist-aef8b1c2-3d4e-5f6a-7b8c-9d0e1f2a3b4c";
+
+    let result = world.namespace_activity(nonexistent);
+
+    assert_eq!(
+        result,
+        Err(ActivityUnavailable::NotRecorded),
+        "a namespace that does not exist must return NotRecorded, not Unreadable or a time"
+    );
+}
+
+#[test]
+fn namespace_activity_agrees_with_an_independent_source() {
+    // The activity time must agree with an independent reader: pick a namespace, find the
+    // newest .jsonl in it with an independent command, and compare. Only a bound, not
+    // exact equality — filesystem time resolution varies.
+    let world = RealWorld::new();
+    let recorded = world
+        .recorded_namespaces()
+        .expect("the transcript store should be listable");
+
+    if recorded.is_empty() {
+        // Vacuously true but still a legitimate state — say so loudly rather than
+        // silently passing.
+        println!(
+            "WARNING: no namespaces on this machine, so namespace_activity agreement is \
+             not tested"
+        );
+        return;
+    }
+
+    // Pick the first namespace as the test subject.
+    let namespace = &recorded[0];
+    let home = std::env::var("HOME").expect("HOME is readable");
+    let namespace_path = format!("{}/.claude/projects/{}", home, namespace);
+
+    // Find the newest .jsonl file's mtime using an independent source: `find` and `stat`.
+    let find_output = Command::new("/usr/bin/find")
+        .args([&namespace_path, "-name", "*.jsonl", "-type", "f"])
+        .output()
+        .expect("find should run");
+    assert!(
+        find_output.status.success(),
+        "find failed: {:?}",
+        find_output.status
+    );
+
+    let files = String::from_utf8_lossy(&find_output.stdout);
+    let file_list: Vec<&str> = files.lines().collect();
+    if file_list.is_empty() {
+        // No transcripts in this namespace — the implementation should report
+        // NoTranscripts.
+        use acmon::world::ActivityUnavailable;
+        assert_eq!(
+            world.namespace_activity(namespace),
+            Err(ActivityUnavailable::NoTranscripts),
+            "namespace {namespace} has no .jsonl files, so namespace_activity should return \
+             NoTranscripts"
+        );
+        return;
+    }
+
+    // Use stat to get the mtime of each file, then find the max.
+    let mut newest_mtime = std::time::SystemTime::UNIX_EPOCH;
+    for file in &file_list {
+        let stat_output = Command::new("/usr/bin/stat")
+            .args(["-f", "%m", file])
+            .output()
+            .expect("stat should run");
+        assert!(
+            stat_output.status.success(),
+            "stat failed for {file}: {:?}",
+            stat_output.status
+        );
+        let mtime_str = String::from_utf8_lossy(&stat_output.stdout);
+        let mtime_secs: u64 = mtime_str
+            .trim()
+            .parse()
+            .expect("stat output should be a number");
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs);
+        newest_mtime = newest_mtime.max(mtime);
+    }
+
+    let reported = world
+        .namespace_activity(namespace)
+        .expect("namespace exists and has transcripts");
+
+    // Allow a small tolerance for filesystem time resolution (typically 1 second, but be
+    // generous).
+    let tolerance = std::time::Duration::from_secs(2);
+    let diff = if reported > newest_mtime {
+        reported
+            .duration_since(newest_mtime)
+            .expect("diff calculation")
+    } else {
+        newest_mtime
+            .duration_since(reported)
+            .expect("diff calculation")
+    };
+
+    assert!(
+        diff <= tolerance,
+        "namespace {namespace} activity {reported:?} differs from independent source \
+         {newest_mtime:?} by {diff:?} — beyond tolerance {tolerance:?}"
+    );
+}
+
+#[test]
+fn codex_sessions_carry_last_activity_within_the_recency_window() {
+    // Every CodexSession returned must carry a last_activity, and that time must be
+    // within the recency window the implementation uses, since that is the filter that
+    // selected it. An empty list is legitimate — say so in a comment.
+    let world = RealWorld::new();
+
+    let sessions = world
+        .codex_sessions()
+        .expect("reading the Codex session index should succeed");
+
+    // An empty result is legitimate and not a failure: this machine may have no recent
+    // Codex sessions. The test proves only that whatever came back has a last_activity
+    // and it is recent.
+
+    let now = std::time::SystemTime::now();
+    let recency_window = std::time::Duration::from_secs(6 * 3_600); // 6 hours
+
+    for session in &sessions {
+        let age = now
+            .duration_since(session.last_activity)
+            .expect("last_activity should not be in the future");
+
+        assert!(
+            age <= recency_window,
+            "session {} last_activity {:?} is older than the recency window — it should not \
+             have been included",
+            session.id,
+            session.last_activity
+        );
+    }
 }

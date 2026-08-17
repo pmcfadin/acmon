@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use acmon::liveness::{Method, State, Verdict};
 use acmon::render::{minimum_width, render_to_lines, required_height};
 use acmon::workspace::{Workspace, WorkspaceUnknown};
 use acmon::world::{ResourceSource, Resources, ResourcesUnavailable, Unmeasured};
@@ -17,6 +18,15 @@ fn measured_workspace() -> Result<Workspace, WorkspaceUnknown> {
         path: "/Users/pmcfadin/projects/agentic_coding_monitor".to_string(),
         namespace: Ok("-Users-pmcfadin-projects-agentic-coding-monitor".to_string()),
     })
+}
+
+/// A verdict reached by direct observation, so rows carry no inference marker unless a
+/// test is specifically about one.
+fn active_verdict() -> Verdict {
+    Verdict {
+        state: State::Active,
+        method: Method::TranscriptChangedRecently,
+    }
 }
 
 /// The ledger of session 69046, measured in `docs/observability-mechanics.md` §2.6.
@@ -40,6 +50,7 @@ fn snapshot_of(pids: &[i32]) -> Snapshot {
                 cli: "claude".to_string(),
                 resources: Ok(measured_ledger()),
                 workspace: measured_workspace(),
+                liveness: active_verdict(),
             })
             .collect(),
     }
@@ -52,6 +63,7 @@ fn snapshot_with(reading: Result<Resources, ResourcesUnavailable>) -> Snapshot {
             cli: "claude".to_string(),
             resources: reading,
             workspace: measured_workspace(),
+            liveness: active_verdict(),
         }],
     }
 }
@@ -63,6 +75,7 @@ fn snapshot_in(workspace: Result<Workspace, WorkspaceUnknown>) -> Snapshot {
             cli: "claude".to_string(),
             resources: Ok(measured_ledger()),
             workspace,
+            liveness: active_verdict(),
         }],
     }
 }
@@ -290,5 +303,125 @@ fn a_terminal_too_narrow_for_the_numbers_says_so_instead_of_truncating() {
     assert!(
         !text.contains("claude"),
         "no partial table may be drawn when it cannot be drawn correctly; got:\n{text}"
+    );
+}
+
+fn snapshot_in_state(verdict: Verdict) -> Snapshot {
+    Snapshot {
+        sessions: vec![Session {
+            pid: 264,
+            cli: "claude".to_string(),
+            resources: Ok(measured_ledger()),
+            workspace: measured_workspace(),
+            liveness: verdict,
+        }],
+    }
+}
+
+#[test]
+fn a_row_names_the_sessions_state() {
+    for (verdict, expected) in [
+        (
+            Verdict {
+                state: State::Active,
+                method: Method::TranscriptChangedRecently,
+            },
+            "ACTIVE",
+        ),
+        (
+            Verdict {
+                state: State::Stalled,
+                method: Method::NoProcessAndSilencePastStall,
+            },
+            "STALLED",
+        ),
+        (
+            Verdict {
+                state: State::Unknown,
+                method: Method::TranscriptActivityUnknown,
+            },
+            "UNKNOWN",
+        ),
+    ] {
+        let text = rendered(&snapshot_in_state(verdict), WIDE);
+        assert!(
+            text.contains(expected),
+            "expected state {expected} in the row; got:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn an_inferred_state_is_marked_and_an_observed_one_is_not() {
+    // The distinction acceptance criterion 4 asks for. Both rows below say WAITING, so
+    // this can only pass if the marker comes from the method rather than the state.
+    let inferred = rendered(
+        &snapshot_in_state(Verdict {
+            state: State::Waiting,
+            method: Method::ProcessResidentButSilent,
+        }),
+        WIDE,
+    );
+    let observed = rendered(
+        &snapshot_in_state(Verdict {
+            state: State::Active,
+            method: Method::TranscriptChangedRecently,
+        }),
+        WIDE,
+    );
+
+    assert!(
+        inferred.contains("WAITING?"),
+        "an inferred verdict must be marked; got:\n{inferred}"
+    );
+    assert!(
+        !observed.contains("ACTIVE?"),
+        "an observed verdict must not be marked; got:\n{observed}"
+    );
+}
+
+#[test]
+fn the_marker_is_explained_only_when_something_was_actually_inferred() {
+    // Printed always, the note becomes furniture a reader stops seeing.
+    let with_inference = rendered(
+        &snapshot_in_state(Verdict {
+            state: State::Waiting,
+            method: Method::ProcessResidentButSilent,
+        }),
+        WIDE,
+    );
+    let without = rendered(
+        &snapshot_in_state(Verdict {
+            state: State::Active,
+            method: Method::TranscriptChangedRecently,
+        }),
+        WIDE,
+    );
+
+    assert!(
+        with_inference.contains("inferred from silence"),
+        "the marker must be explained when it appears; got:\n{with_inference}"
+    );
+    assert!(
+        !without.contains("inferred from silence"),
+        "and not explained when nothing was inferred; got:\n{without}"
+    );
+}
+
+#[test]
+fn a_state_is_never_abbreviated_to_fit() {
+    // A truncated STALLED is a different word, and STALL would read as an instruction.
+    // The column is sized for the longest state plus its marker; this pins that.
+    let text = rendered(
+        &snapshot_in_state(Verdict {
+            state: State::Stalled,
+            method: Method::NoProcessAndSilencePastStall,
+        }),
+        minimum_width(),
+    );
+
+    assert!(
+        text.contains("STALLED"),
+        "the full state must survive at the narrowest renderable width; got:\n{text}"
     );
 }

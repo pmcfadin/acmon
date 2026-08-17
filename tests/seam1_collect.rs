@@ -5,10 +5,13 @@
 //! basenames, and the near-miss processes all occurred.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use acmon::liveness::State;
 use acmon::workspace::{NamespaceUnmatched, WorkspaceUnknown};
-use acmon::world::{CodexSession, ResourceSource, Resources, ResourcesUnavailable, Unmeasured};
+use acmon::world::{
+    ActivityUnavailable, CodexSession, ResourceSource, Resources, ResourcesUnavailable, Unmeasured,
+};
 use acmon::{collect, CollectError, ProcessRecord, ProcessSnapshot, World, WorldError};
 
 struct FakeWorld {
@@ -20,6 +23,8 @@ struct FakeWorld {
     namespaces: Result<Vec<String>, WorldError>,
     /// The Codex sessions this machine is pretending to have recorded.
     codex_sessions: Result<Vec<CodexSession>, WorldError>,
+    /// Per-namespace activity times. A namespace with no entry gets a default time.
+    namespace_activities: HashMap<String, Result<SystemTime, ActivityUnavailable>>,
 }
 
 /// Namespaces that genuinely exist in `~/.claude/projects` on the machine these
@@ -40,6 +45,7 @@ fn recorded_codex_sessions() -> Vec<CodexSession> {
     vec![CodexSession {
         id: "01a010c6-9c79-76d1-82da-3fad4bbf3bc4".to_string(),
         workspace: "/Users/pmcfadin/Documents/Codex/2026-08-17/he".to_string(),
+        last_activity: SystemTime::UNIX_EPOCH + Duration::from_secs(1_723_900_800),
     }]
 }
 
@@ -53,6 +59,7 @@ impl FakeWorld {
             ledgers: HashMap::new(),
             namespaces: Ok(recorded_namespaces()),
             codex_sessions: Ok(recorded_codex_sessions()),
+            namespace_activities: HashMap::new(),
         }
     }
 
@@ -62,6 +69,7 @@ impl FakeWorld {
             ledgers: HashMap::new(),
             namespaces: Ok(recorded_namespaces()),
             codex_sessions: Ok(recorded_codex_sessions()),
+            namespace_activities: HashMap::new(),
         }
     }
 
@@ -79,6 +87,23 @@ impl FakeWorld {
         self.codex_sessions = sessions;
         self
     }
+
+    #[allow(dead_code)] // Will be used once liveness integration is wired up
+    fn namespace_activity(
+        mut self,
+        namespace: String,
+        activity: Result<SystemTime, ActivityUnavailable>,
+    ) -> Self {
+        self.namespace_activities.insert(namespace, activity);
+        self
+    }
+}
+
+/// A fixed instant for liveness verdicts, so a test's answer does not depend on when it
+/// ran. Sixty seconds after the activity time `FakeWorld` reports by default, which makes
+/// an unremarkable session ACTIVE unless a test says otherwise.
+fn fixture_now() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_060)
 }
 
 /// The ledger of session 69046, measured and recorded in
@@ -127,6 +152,13 @@ impl World for FakeWorld {
 
     fn recorded_namespaces(&self) -> Result<Vec<String>, WorldError> {
         self.namespaces.clone()
+    }
+
+    fn namespace_activity(&self, namespace: &str) -> Result<SystemTime, ActivityUnavailable> {
+        self.namespace_activities
+            .get(namespace)
+            .cloned()
+            .unwrap_or_else(|| Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)))
     }
 
     fn codex_sessions(&self) -> Result<Vec<CodexSession>, WorldError> {
@@ -196,7 +228,7 @@ fn captured_process_table() -> Vec<ProcessRecord> {
 fn lists_every_live_session_of_both_clis_and_nothing_else() {
     let world = FakeWorld::with(captured_process_table(), 88429);
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
 
     let found: Vec<(i32, &str)> = snapshot
         .sessions
@@ -229,7 +261,7 @@ fn a_snapshot_missing_its_own_observer_is_a_failure_not_an_idle_machine() {
         .collect();
     let world = FakeWorld::with(truncated, 88429);
 
-    let result = collect(&world);
+    let result = collect(&world, fixture_now());
 
     assert!(
         matches!(result, Err(CollectError::UntrustworthySnapshot { .. })),
@@ -251,7 +283,8 @@ fn a_machine_with_no_agent_sessions_reports_zero_rather_than_failing() {
         88429,
     );
 
-    let snapshot = collect(&world).expect("a trustworthy but empty snapshot is not an error");
+    let snapshot =
+        collect(&world, fixture_now()).expect("a trustworthy but empty snapshot is not an error");
 
     assert_eq!(snapshot.sessions.len(), 0);
 }
@@ -271,7 +304,7 @@ fn processes_with_unreadable_paths_are_excluded_but_reason_is_recorded() {
         88429,
     );
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
 
     // The unreadable process is not a session
     assert_eq!(snapshot.sessions.len(), 0);
@@ -307,7 +340,7 @@ fn each_session_carries_the_readings_of_its_own_pid() {
         Ok(measured_ledger_of_a_session_that_delegates_little()),
     );
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
 
     let heavy_delegator = snapshot
         .sessions
@@ -347,7 +380,7 @@ fn a_session_whose_ledger_cannot_be_read_is_still_listed_with_a_reason() {
     )
     .ledger(69046, Err(ResourcesUnavailable::ProcessExited));
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
 
     assert_eq!(
         snapshot.sessions.len(),
@@ -386,7 +419,7 @@ fn a_coarser_reading_keeps_what_it_has_and_says_why_the_rest_is_missing() {
     )
     .ledger(69046, Ok(coarse));
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
     let reading = snapshot.sessions[0].resources.as_ref().unwrap();
 
     assert_eq!(reading.own_cpu, Ok(Duration::from_secs(42)));
@@ -405,7 +438,7 @@ fn world_errors_propagate_as_collect_errors() {
         "process table unreadable".to_string(),
     ));
 
-    let result = collect(&world);
+    let result = collect(&world, fixture_now());
 
     assert!(
         matches!(result, Err(CollectError::World(_))),
@@ -443,7 +476,7 @@ fn each_session_shows_the_directory_it_is_working_in() {
         88429,
     );
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
     let find = |pid: i32| {
         snapshot
             .sessions
@@ -481,7 +514,7 @@ fn a_workspace_is_attributed_to_the_namespace_recorded_for_it() {
         88429,
     );
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
     let namespace_of = |pid: i32| {
         snapshot
             .sessions
@@ -517,7 +550,7 @@ fn a_workspace_with_no_recorded_namespace_says_so_and_shows_what_it_looked_for()
         88429,
     );
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
     let workspace = snapshot.sessions[0].workspace.as_ref().unwrap();
 
     assert_eq!(
@@ -544,7 +577,7 @@ fn a_session_whose_working_directory_is_unreadable_shows_an_explicit_unknown() {
         88429,
     );
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
 
     assert_eq!(snapshot.sessions.len(), 1, "the session is still listed");
     assert_eq!(
@@ -570,7 +603,8 @@ fn a_failure_to_list_recorded_namespaces_is_not_a_workspace_without_a_transcript
     )
     .without_namespace_listing("~/.claude/projects is not readable");
 
-    let snapshot = collect(&world).expect("an unlistable transcript store is not fatal");
+    let snapshot =
+        collect(&world, fixture_now()).expect("an unlistable transcript store is not fatal");
     let workspace = snapshot.sessions[0].workspace.as_ref().unwrap();
 
     assert!(
@@ -633,7 +667,7 @@ fn the_real_codex_cli_is_a_session() {
         88429,
     );
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
 
     assert_eq!(
         snapshot
@@ -655,7 +689,7 @@ fn no_desktop_application_or_helper_is_ever_a_session() {
     ));
     let world = FakeWorld::with(records, 88429);
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
 
     assert!(
         snapshot.sessions.is_empty(),
@@ -681,7 +715,7 @@ fn the_codex_cli_is_told_apart_from_a_helper_in_the_same_directory() {
         88429,
     );
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
 
     assert_eq!(snapshot.sessions.len(), 1, "only the CLI is a session");
     assert_eq!(snapshot.sessions[0].pid, 59293);
@@ -701,7 +735,7 @@ fn a_descriptive_process_name_rather_than_a_path_does_not_break_detection() {
         88429,
     );
 
-    let snapshot = collect(&world).expect("a descriptive name is not a crash");
+    let snapshot = collect(&world, fixture_now()).expect("a descriptive name is not a crash");
 
     assert!(snapshot.sessions.is_empty());
 }
@@ -721,7 +755,7 @@ fn the_codex_cli_is_recognised_wherever_it_is_installed() {
         88429,
     );
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
 
     assert_eq!(
         snapshot.sessions.len(),
@@ -748,7 +782,7 @@ fn a_codex_binary_inside_an_application_bundle_is_not_a_cli_session() {
         88429,
     );
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
 
     assert!(
         snapshot.sessions.is_empty(),
@@ -785,7 +819,7 @@ fn a_codex_sessions_workspace_comes_from_its_transcript_not_from_its_cwd() {
         88429,
     );
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
     let session = &snapshot.sessions[0];
 
     assert_eq!(session.cli, "codex");
@@ -814,7 +848,7 @@ fn a_codex_session_with_no_recent_transcript_still_appears_with_its_directory() 
         88429,
     );
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
     let session = &snapshot.sessions[0];
 
     assert_eq!(session.cli, "codex");
@@ -845,7 +879,7 @@ fn a_codex_index_read_failure_renders_as_could_not_look_not_as_no_transcript() {
         "~/.codex/session_index.jsonl is not readable".to_string(),
     )));
 
-    let snapshot = collect(&world).expect("an unreadable Codex index is not fatal");
+    let snapshot = collect(&world, fixture_now()).expect("an unreadable Codex index is not fatal");
     let session = &snapshot.sessions[0];
 
     let workspace = session.workspace.as_ref().expect("workspace is readable");
@@ -876,7 +910,7 @@ fn a_claude_session_and_a_codex_session_each_get_their_workspace_from_the_right_
         88429,
     );
 
-    let snapshot = collect(&world).expect("collection should succeed");
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
 
     let claude_session = snapshot
         .sessions
@@ -906,5 +940,123 @@ fn a_claude_session_and_a_codex_session_each_get_their_workspace_from_the_right_
         codex_ws.namespace,
         Ok(CODEX_SESSION_ID.to_string()),
         "Codex session uses session id from Codex sessions"
+    );
+}
+
+/// An activity time relative to the fixed `fixture_now`, so silence is exact.
+fn silent_for(seconds: u64) -> SystemTime {
+    fixture_now() - Duration::from_secs(seconds)
+}
+
+const CLAUDE_NAMESPACE: &str = "-Users-pmcfadin-projects-agentic-coding-monitor";
+
+#[test]
+fn a_session_whose_transcript_changed_recently_is_active() {
+    let world = FakeWorld::with(
+        vec![
+            rec(69046, CLAUDE_EXE),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .namespace_activity(CLAUDE_NAMESPACE.to_string(), Ok(silent_for(30)));
+
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
+
+    assert_eq!(snapshot.sessions[0].liveness.state, State::Active);
+    assert!(
+        !snapshot.sessions[0].liveness.method.is_inferred(),
+        "a transcript that changed is an observation, not an inference"
+    );
+}
+
+#[test]
+fn a_session_silent_past_the_quiet_threshold_with_a_live_process_is_waiting() {
+    // Measured post-assistant silence is p99 3.9 minutes, so twenty minutes of silence
+    // from a session whose process is still there is the shape of a human who has been
+    // asked something and not yet answered.
+    let world = FakeWorld::with(
+        vec![
+            rec(69046, CLAUDE_EXE),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .namespace_activity(CLAUDE_NAMESPACE.to_string(), Ok(silent_for(20 * 60)));
+
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
+
+    assert_eq!(snapshot.sessions[0].liveness.state, State::Waiting);
+    assert!(
+        snapshot.sessions[0].liveness.method.is_inferred(),
+        "no signal for 'blocked on a human' exists to be read, so WAITING is inferred \
+         and must say so"
+    );
+}
+
+#[test]
+fn a_session_whose_transcript_activity_cannot_be_read_is_unknown_not_active() {
+    // The failure that matters: an unreadable activity time must not become "silent for
+    // zero seconds", which would read as a busy session.
+    let world = FakeWorld::with(
+        vec![
+            rec(69046, CLAUDE_EXE),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .namespace_activity(
+        CLAUDE_NAMESPACE.to_string(),
+        Err(ActivityUnavailable::Unreadable(
+            "permission denied".to_string(),
+        )),
+    );
+
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
+
+    assert_eq!(snapshot.sessions[0].liveness.state, State::Unknown);
+}
+
+#[test]
+fn a_session_with_no_recorded_transcript_is_unknown_rather_than_stalled() {
+    // Its workspace has no namespace, so nothing can be said about silence. That must not
+    // collapse into a verdict — least of all a verdict that the session is dead.
+    let world = FakeWorld::with(
+        vec![
+            rec_in(69046, CLAUDE_EXE, "/Users/pmcfadin/projects/never_opened"),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    );
+
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
+
+    assert_eq!(snapshot.sessions[0].liveness.state, State::Unknown);
+}
+
+#[test]
+fn a_codex_sessions_silence_comes_from_the_index_rather_than_a_transcript_read() {
+    // Codex records when each session was last updated in its index, so liveness costs no
+    // further read at all.
+    let world = FakeWorld::with(
+        vec![
+            rec_in(59293, CODEX_EXE, CODEX_WORKSPACE),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .with_codex_sessions(Ok(vec![CodexSession {
+        id: CODEX_SESSION_ID.to_string(),
+        workspace: CODEX_WORKSPACE.to_string(),
+        last_activity: silent_for(45 * 60),
+    }]));
+
+    let snapshot = collect(&world, fixture_now()).expect("collection should succeed");
+
+    assert_eq!(snapshot.sessions[0].cli, "codex");
+    assert_eq!(
+        snapshot.sessions[0].liveness.state,
+        State::Waiting,
+        "forty-five minutes of silence with the process still there is waiting"
     );
 }

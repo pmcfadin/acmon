@@ -1,6 +1,9 @@
 //! Seam 1 — turning an observation of the world into a snapshot.
 
+use std::time::{Duration, SystemTime};
+
 use crate::detect::embedded_detectors;
+use crate::liveness::{classify, Observation, Thresholds, Verdict};
 use crate::workspace::{
     namespace_for, recorded_namespace, NamespaceUnmatched, Workspace, WorkspaceUnknown,
 };
@@ -21,6 +24,9 @@ pub struct Session {
     pub resources: Result<Resources, ResourcesUnavailable>,
     /// Which directory this session is working in, or why that is unknown.
     pub workspace: Result<Workspace, WorkspaceUnknown>,
+    /// Whether this session is working, waiting, stalled, or beyond telling — and which
+    /// observation produced that answer, so an inference never reads as an assertion.
+    pub liveness: Verdict,
 }
 
 /// Everything observed in one collection.
@@ -151,8 +157,74 @@ fn workspace_of(
     })
 }
 
+/// How long a session's transcript has been silent, or `None` if that cannot be told.
+///
+/// `None` is not "no silence" — it is the absence of an answer, and the state machine
+/// turns it into UNKNOWN rather than into a verdict.
+fn silence_of(
+    session_workspace: &Result<Workspace, WorkspaceUnknown>,
+    cli: &str,
+    sources: &AttributionSources,
+    world: &dyn World,
+    now: SystemTime,
+) -> Option<Duration> {
+    let workspace = session_workspace.as_ref().ok()?;
+    let namespace = workspace.namespace.as_ref().ok()?;
+
+    let last_activity = match cli {
+        // Claude Code's namespace is a directory of transcripts; its activity is the
+        // newest modification time among them.
+        "claude" => world.namespace_activity(namespace).ok()?,
+        // Codex's index already reports when each session was last updated, so no
+        // further read is needed.
+        "codex" => {
+            sources
+                .codex_sessions
+                .as_ref()
+                .ok()?
+                .iter()
+                .find(|candidate| candidate.id == *namespace)?
+                .last_activity
+        }
+        _ => return None,
+    };
+
+    // A modification time later than now means the clock and the filesystem disagree,
+    // which happens with skew. The transcript changed at or after this instant either
+    // way, so the honest reading is "just now" rather than a refusal.
+    Some(now.duration_since(last_activity).unwrap_or(Duration::ZERO))
+}
+
+/// Whether any process other than the session itself is working in its workspace.
+///
+/// This is what stops a build or a test run from being mistaken for a dead session:
+/// legitimate silence of several minutes was measured, and it is caused by exactly these.
+/// A subdirectory counts, because build and test runners commonly chdir into one.
+///
+/// Costs nothing extra — every process's working directory was already read in the same
+/// pass that found the sessions.
+fn work_running_in(
+    workspace_path: &str,
+    session_pid: i32,
+    records: &[crate::ProcessRecord],
+) -> bool {
+    let inside = |candidate: &str| {
+        candidate.eq_ignore_ascii_case(workspace_path)
+            || candidate.len() > workspace_path.len()
+                && candidate[..workspace_path.len()].eq_ignore_ascii_case(workspace_path)
+                && candidate.as_bytes()[workspace_path.len()] == b'/'
+    };
+
+    records.iter().any(|record| {
+        record.pid != session_pid && record.cwd.as_deref().map(inside).unwrap_or(false)
+    })
+}
+
 /// Collect a snapshot of the agent sessions on this machine.
-pub fn collect(world: &dyn World) -> Result<Snapshot, CollectError> {
+///
+/// `now` is injected rather than read from a clock here, so that a liveness verdict is
+/// deterministic under test rather than depending on when the test happened to run.
+pub fn collect(world: &dyn World, now: SystemTime) -> Result<Snapshot, CollectError> {
     let observation = world.process_snapshot().map_err(CollectError::World)?;
 
     // Check the observation against itself before drawing any conclusion from it.
@@ -173,17 +245,40 @@ pub fn collect(world: &dyn World) -> Result<Snapshot, CollectError> {
         codex_sessions: world.codex_sessions(),
     };
 
+    let thresholds = Thresholds::default();
+
     let mut sessions: Vec<Session> = observation
         .records
         .iter()
         .filter_map(|record| {
             let exe = record.exe_path.as_ref().ok()?;
             let detector = detectors.iter().find(|d| d.matches(exe))?;
+            let workspace = workspace_of(&detector.id, &record.cwd, &sources);
+
+            let liveness = classify(
+                &Observation {
+                    silence: silence_of(&workspace, &detector.id, &sources, world, now),
+                    // This session was found *in* the enumeration, so its process was
+                    // observed to be there. See the note on STALLED below.
+                    process_resident: true,
+                    work_running_in_workspace: workspace
+                        .as_ref()
+                        .ok()
+                        .map(|w| work_running_in(&w.path, record.pid, &observation.records))
+                        .unwrap_or(false),
+                    // The enumeration was checked against itself above, and a collection
+                    // over an untrustworthy one never gets this far.
+                    snapshot_trustworthy: true,
+                },
+                &thresholds,
+            );
+
             Some(Session {
                 pid: record.pid,
                 cli: detector.id.clone(),
                 resources: world.resources(record.pid),
-                workspace: workspace_of(&detector.id, &record.cwd, &sources),
+                workspace,
+                liveness,
             })
         })
         .collect();

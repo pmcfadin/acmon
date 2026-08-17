@@ -235,11 +235,15 @@ fn parse_ps_cpu_time(field: &str) -> Result<Duration, String> {
 /// while excluding a live one would lose its workspace.
 const CODEX_RECENCY_WINDOW_SECONDS: i64 = 6 * 3_600;
 
-/// The ids the Codex index reports as active within the recency window.
+/// The ids the Codex index reports as active within the recency window, with their
+/// last-activity timestamps.
 ///
 /// Only `id` and `updated_at` are deserialised. The index also carries a thread name,
 /// which is user-supplied text and is deliberately never read into this program.
-fn recently_active_codex_ids(index: &std::path::Path, now: i64) -> Result<Vec<String>, WorldError> {
+fn recently_active_codex_ids(
+    index: &std::path::Path,
+    now: i64,
+) -> Result<Vec<(String, SystemTime)>, WorldError> {
     #[derive(serde::Deserialize)]
     struct IndexRow {
         id: String,
@@ -249,7 +253,7 @@ fn recently_active_codex_ids(index: &std::path::Path, now: i64) -> Result<Vec<St
     let text = std::fs::read_to_string(index)
         .map_err(|e| WorldError::CodexIndex(format!("{}: {e}", index.display())))?;
 
-    let mut ids = Vec::new();
+    let mut sessions = Vec::new();
     for (number, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -263,13 +267,22 @@ fn recently_active_codex_ids(index: &std::path::Path, now: i64) -> Result<Vec<St
             WorldError::CodexIndex(format!("{} line {}: {e}", index.display(), number + 1))
         })?;
         if now - updated <= CODEX_RECENCY_WINDOW_SECONDS {
-            ids.push(row.id);
+            let last_activity = std::time::UNIX_EPOCH
+                + Duration::from_secs(updated.try_into().map_err(|_| {
+                    WorldError::CodexIndex(format!(
+                        "{} line {}: timestamp {} is negative",
+                        index.display(),
+                        number + 1,
+                        updated
+                    ))
+                })?);
+            sessions.push((row.id, last_activity));
         }
     }
-    Ok(ids)
+    Ok(sessions)
 }
 
-/// Find the transcript file for each wanted id, reading directory entries only.
+/// Find the transcript file for each wanted session, reading directory entries only.
 ///
 /// No transcript is opened here, so the store's contents are never scanned — but be
 /// precise about what bounds the walk, because it is not the recency window. The walk
@@ -283,9 +296,9 @@ fn recently_active_codex_ids(index: &std::path::Path, now: i64) -> Result<Vec<St
 /// because the index outlives the transcripts it points at.
 fn locate_codex_transcripts(
     sessions: &std::path::Path,
-    wanted: &[String],
-) -> Result<Vec<(String, std::path::PathBuf)>, WorldError> {
-    let mut found: Vec<(String, std::path::PathBuf)> = Vec::new();
+    wanted: &[(String, SystemTime)],
+) -> Result<Vec<(String, std::path::PathBuf, SystemTime)>, WorldError> {
+    let mut found: Vec<(String, std::path::PathBuf, SystemTime)> = Vec::new();
     let mut pending = vec![sessions.to_path_buf()];
 
     while let Some(directory) = pending.pop() {
@@ -304,9 +317,11 @@ fn locate_codex_transcripts(
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(id) = wanted.iter().find(|id| name.contains(id.as_str())) {
-                if !found.iter().any(|(already, _)| already == id) {
-                    found.push((id.clone(), entry.path()));
+            if let Some((id, last_activity)) =
+                wanted.iter().find(|(id, _)| name.contains(id.as_str()))
+            {
+                if !found.iter().any(|(already, _, _)| already == id) {
+                    found.push((id.clone(), entry.path(), *last_activity));
                 }
             }
         }
@@ -466,9 +481,13 @@ impl World for RealWorld {
 
         located
             .into_iter()
-            .map(|(id, path)| {
+            .map(|(id, path, last_activity)| {
                 read_codex_workspace(&path)
-                    .map(|workspace| CodexSession { id, workspace })
+                    .map(|workspace| CodexSession {
+                        id,
+                        workspace,
+                        last_activity,
+                    })
                     .map_err(WorldError::CodexIndex)
             })
             .collect()
@@ -497,6 +516,65 @@ impl World for RealWorld {
             }
         }
         Ok(names)
+    }
+
+    fn namespace_activity(
+        &self,
+        namespace: &str,
+    ) -> Result<SystemTime, crate::world::ActivityUnavailable> {
+        use crate::world::ActivityUnavailable;
+
+        let home = std::env::var("HOME")
+            .map_err(|e| ActivityUnavailable::Unreadable(format!("HOME is not readable: {e}")))?;
+        let namespace_dir = std::path::Path::new(&home)
+            .join(".claude")
+            .join("projects")
+            .join(namespace);
+
+        // Check if the directory exists at all. Distinct from unreadable: this is an
+        // answer.
+        if !namespace_dir.exists() {
+            return Err(ActivityUnavailable::NotRecorded);
+        }
+
+        let entries = std::fs::read_dir(&namespace_dir).map_err(|e| {
+            ActivityUnavailable::Unreadable(format!("{}: {e}", namespace_dir.display()))
+        })?;
+
+        // Find the most recent modification time among all .jsonl files. The directory's
+        // own mtime is not used: appending to a file inside a directory does not update
+        // the directory's mtime — only creating, renaming or deleting an entry does. A
+        // session that has been appending to one transcript for hours would look
+        // untouched if we used the directory mtime.
+        let mut most_recent: Option<SystemTime> = None;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                ActivityUnavailable::Unreadable(format!("{}: {e}", namespace_dir.display()))
+            })?;
+            let name = entry.file_name();
+            if name.to_string_lossy().ends_with(".jsonl") {
+                let metadata = entry.metadata().map_err(|e| {
+                    ActivityUnavailable::Unreadable(format!(
+                        "{}/{}: {e}",
+                        namespace_dir.display(),
+                        name.to_string_lossy()
+                    ))
+                })?;
+                let modified = metadata.modified().map_err(|e| {
+                    ActivityUnavailable::Unreadable(format!(
+                        "{}/{}: modification time unavailable: {e}",
+                        namespace_dir.display(),
+                        name.to_string_lossy()
+                    ))
+                })?;
+                most_recent = Some(match most_recent {
+                    None => modified,
+                    Some(prev) => prev.max(modified),
+                });
+            }
+        }
+
+        most_recent.ok_or(ActivityUnavailable::NoTranscripts)
     }
 
     fn output_width(&self) -> u16 {

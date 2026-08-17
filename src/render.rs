@@ -28,11 +28,24 @@ use crate::world::Resources;
 const FLOOR_CAVEAT: &str =
     "Child CPU omits detached and orphaned work, so these are floors, not totals.";
 
+/// What the marker on a state means.
+///
+/// No signal for "blocked waiting on a human" exists to be read — it was looked for four
+/// ways and never emitted — so WAITING is reached by inference from silence. A reader has
+/// to be able to tell that apart from a state that was observed, which is why the marker
+/// exists rather than the states simply being printed.
+const INFERENCE_MARKER_CAVEAT: &str =
+    "A state marked ? was inferred from silence, not observed directly.";
+
 /// The fixed columns, in order. Each width holds that column's widest value *or* the
 /// longest reason for a value's absence, since a reason is printed in the value's place.
-const FIXED_COLUMNS: [(&str, u16); 7] = [
+const FIXED_COLUMNS: [(&str, u16); 8] = [
     ("PID", 6),
     ("CLI", 6),
+    // Eight, not seven: the longest state is seven characters and an inferred verdict
+    // carries a trailing marker. Abbreviating STALLED to STALL would be a truncated
+    // state, which is a wrong state rather than a shorter one.
+    ("STATE", 8),
     ("OWN CPU", 9),
     ("CHILD CPU", 9),
     ("MEM", 8),
@@ -87,8 +100,28 @@ pub fn required_height(snapshot: &Snapshot, width: u16) -> u16 {
     if width < minimum_width() {
         return wrap_words(&too_narrow_message(width), width).len() as u16;
     }
-    // top border + header row + one row per session + bottom border + the caveat.
-    (snapshot.sessions.len() + 3) as u16 + wrap_words(FLOOR_CAVEAT, width).len() as u16
+    // top border + header row + one row per session + bottom border + the caveats.
+    (snapshot.sessions.len() + 3) as u16 + footer_lines(snapshot, width).len() as u16
+}
+
+/// The caveats printed under the table.
+///
+/// Produced by one function so the height calculation and the drawing cannot disagree; if
+/// they did, a caveat would be silently clipped, and a clipped caveat is worse than none
+/// because the numbers then look unqualified.
+///
+/// The inference caveat appears only when some verdict actually was inferred. Printing it
+/// unconditionally would train a reader to ignore it.
+fn footer_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
+    let mut lines = wrap_words(FLOOR_CAVEAT, width);
+    if snapshot
+        .sessions
+        .iter()
+        .any(|session| session.liveness.method.is_inferred())
+    {
+        lines.extend(wrap_words(INFERENCE_MARKER_CAVEAT, width));
+    }
+    lines
 }
 
 fn too_narrow_message(width: u16) -> String {
@@ -111,9 +144,10 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot) {
         return;
     }
 
-    let caveat_height = wrap_words(FLOOR_CAVEAT, area.width).len() as u16;
+    let caveats = footer_lines(snapshot, area.width);
     let [table_area, caveat_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(caveat_height)]).areas(area);
+        Layout::vertical([Constraint::Min(3), Constraint::Length(caveats.len() as u16)])
+            .areas(area);
 
     let title = format!(" acmon — {} agent session(s) ", snapshot.sessions.len());
     let workspace_width = workspace_width(area.width);
@@ -138,10 +172,26 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot) {
         .block(Block::default().borders(Borders::ALL).title(title));
 
     frame.render_widget(table, table_area);
-    frame.render_widget(
-        Paragraph::new(wrap_words(FLOOR_CAVEAT, area.width).join("\n")),
-        caveat_area,
-    );
+    frame.render_widget(Paragraph::new(caveats.join("\n")), caveat_area);
+}
+
+/// A state, with a marker when the verdict behind it was inferred rather than observed.
+///
+/// The marker is the whole reason the state column is eight wide. Without it, a WAITING
+/// reached by guessing at a human's intent would be indistinguishable from an ACTIVE
+/// established by a transcript that changed a second ago.
+fn state_cell(verdict: &crate::liveness::Verdict) -> String {
+    let state = match verdict.state {
+        crate::liveness::State::Active => "ACTIVE",
+        crate::liveness::State::Waiting => "WAITING",
+        crate::liveness::State::Stalled => "STALLED",
+        crate::liveness::State::Unknown => "UNKNOWN",
+    };
+    if verdict.method.is_inferred() {
+        format!("{state}?")
+    } else {
+        state.to_string()
+    }
 }
 
 /// One session's row: its identity, its ledger or the reason it has none, then where it
@@ -165,7 +215,11 @@ fn row_for(session: &Session, workspace_width: u16) -> Row<'static> {
         Err(unknown) => unknown.to_string(),
     };
 
-    let mut cells = vec![session.pid.to_string(), session.cli.clone()];
+    let mut cells = vec![
+        session.pid.to_string(),
+        session.cli.clone(),
+        state_cell(&session.liveness),
+    ];
     cells.extend(figures);
     cells.push(workspace);
     Row::new(cells)

@@ -152,6 +152,30 @@ impl std::fmt::Display for ResourcesUnavailable {
     }
 }
 
+/// Why a namespace's activity time could not be read.
+///
+/// Each variant must be TRUE when reported. A suspiciously epoch timestamp that is merely
+/// plausible is worse than an absent value with a stated reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivityUnavailable {
+    /// No directory of that name exists. Distinct from unreadable: this is an answer.
+    NotRecorded,
+    /// The directory exists but its contents or times could not be read.
+    Unreadable(String),
+    /// The directory exists and holds no transcript, so it has no activity time.
+    NoTranscripts,
+}
+
+impl std::fmt::Display for ActivityUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActivityUnavailable::NotRecorded => write!(f, "not-recorded"),
+            ActivityUnavailable::Unreadable(_) => write!(f, "unreadable"),
+            ActivityUnavailable::NoTranscripts => write!(f, "no-transcripts"),
+        }
+    }
+}
+
 /// A Codex session recorded in the transcript store, recent enough to be worth reading.
 ///
 /// Codex's transcript path encodes the date and the session id but **not** the working
@@ -168,6 +192,10 @@ pub struct CodexSession {
     /// That record is metadata: cwd, versions, model provider. No conversation content is
     /// read, and nothing else from the record is retained.
     pub workspace: String,
+    /// When this session last changed, taken from the `updated_at` field in the session
+    /// index. This is the timestamp the index already parses for recency filtering, so
+    /// it is available without reading anything extra.
+    pub last_activity: std::time::SystemTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +266,20 @@ pub trait World {
     /// Only the directory *names* are read. No transcript is opened — they contain
     /// conversation content, which this tool never reads.
     fn recorded_namespaces(&self) -> Result<Vec<String>, WorldError>;
+
+    /// When a Claude session's transcript namespace last changed.
+    ///
+    /// A namespace is a directory under `~/.claude/projects/<namespace>/` holding one or
+    /// more `.jsonl` transcripts. Its last activity is the most recent modification time
+    /// among those files — not the directory's own mtime, which does not update when a
+    /// file inside it is appended to.
+    ///
+    /// Implementations use the directory entries' metadata only — no transcript is
+    /// opened, because they contain conversation content.
+    fn namespace_activity(
+        &self,
+        namespace: &str,
+    ) -> Result<std::time::SystemTime, ActivityUnavailable>;
 
     /// The Codex sessions the index reports as recently active, with their workspaces.
     ///
