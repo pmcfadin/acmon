@@ -12,3 +12,17 @@ id = "claude"
 #   /Users/<user>/.local/share/claude/versions/2.1.233
 #   /Users/<user>/.claude/security/agent-sdk-venv/lib/python3.14/site-packages/claude_agent_sdk/_bundled/claude
 exe_contains = ["/claude/versions/", "/claude_agent_sdk/_bundled/claude"]
+
+[[detector]]
+id = "codex"
+# Anchored to the END of the path, not a substring. "codex" appears in paths that are
+# emphatically not the CLI, and matching them is worse than missing the CLI: a resident
+# desktop application makes a dead session look merely quiet, so the tool goes silent at
+# the moment a session dies. All of these were observed running:
+#   /Applications/ChatGPT.app/.../Codex Framework.framework/...        (desktop app)
+#   ~/.codex/computer-use/.../SkyComputerUseClient                     (Computer Use)
+#   .../vendor/aarch64-apple-darwin/bin/codex-code-mode-host           (helper, same bin dir)
+# Only the last of these shares the CLI's directory, and a suffix rule still separates
+# them. The real CLI, observed:
+#   /opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex
+exe_ends_with = ["/bin/codex"]

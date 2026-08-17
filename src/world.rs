@@ -152,10 +152,31 @@ impl std::fmt::Display for ResourcesUnavailable {
     }
 }
 
+/// A Codex session recorded in the transcript store, recent enough to be worth reading.
+///
+/// Codex's transcript path encodes the date and the session id but **not** the working
+/// directory, so unlike Claude Code there is no namespace to map a path onto. The
+/// workspace can only come from inside the transcript — see
+/// `docs/observability-mechanics.md` §4.4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSession {
+    /// The session id. It appears verbatim in the transcript's filename, which is what
+    /// makes locating the file by id possible without reading any of them.
+    pub id: String,
+    /// The workspace, taken from `payload.cwd` of the transcript's **first record only**.
+    ///
+    /// That record is metadata: cwd, versions, model provider. No conversation content is
+    /// read, and nothing else from the record is retained.
+    pub workspace: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorldError {
     /// The process table could not be enumerated at all.
     ProcessEnumeration(String),
+    /// The Codex session index could not be read, or a transcript it pointed at could
+    /// not be understood.
+    CodexIndex(String),
     /// The recorded transcript namespaces could not be listed.
     ///
     /// Not fatal to a collection: the sessions are still observable, only their
@@ -171,6 +192,9 @@ impl std::fmt::Display for WorldError {
             }
             WorldError::NamespaceListing(msg) => {
                 write!(f, "could not list recorded transcript namespaces: {}", msg)
+            }
+            WorldError::CodexIndex(msg) => {
+                write!(f, "could not read the Codex session index: {}", msg)
             }
         }
     }
@@ -214,6 +238,17 @@ pub trait World {
     /// Only the directory *names* are read. No transcript is opened — they contain
     /// conversation content, which this tool never reads.
     fn recorded_namespaces(&self) -> Result<Vec<String>, WorldError>;
+
+    /// The Codex sessions the index reports as recently active, with their workspaces.
+    ///
+    /// Bounded by recency on purpose. The index on the machine behind the mechanics
+    /// document holds 691 rows against a 7 GB transcript store, of which one was active
+    /// in the last six hours. Only sessions inside that window are opened, so the store
+    /// is never scanned.
+    ///
+    /// Implementations read the **first record only** of each transcript, which is
+    /// metadata. Conversation content is never read, stored, or displayed.
+    fn codex_sessions(&self) -> Result<Vec<CodexSession>, WorldError>;
 
     /// The width available for output, in columns.
     ///

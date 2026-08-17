@@ -44,7 +44,7 @@ Consequences:
 - A subagent's tool calls land in the session's **child CPU**, mixed in with
   everything else.
 - Per-subagent *OS resource* attribution is therefore **impossible**. Per-subagent
-  *token and latency* attribution is possible, but only through telemetry (§3.3).
+  *token and latency* attribution is possible, but only through telemetry (§3.4).
 
 ---
 
@@ -103,6 +103,27 @@ bug, not a finding. Cross-check against `ps -o time=` before trusting the number
 | Grandchild (parent → sh → burner) | **Yes, recursively** | 0.629 s attributed |
 | Orphaned / double-forked (`(cmd &)`) | **No — LOST** | 0.004 s of a 0.6 s burner |
 | Session's own totals after it exits | **Lost** | ledger dies with the process |
+
+The orphaned-child leak has now been reproduced directly, with the burner's execution
+confirmed before its numbers were believed — 29,075,021 loop iterations completed and
+1.0001 s of CPU consumed, so this is not a burner that silently never ran:
+
+- Detached child burned **1.0001 s** of CPU; its parent pid was **1** (reparented to
+  launchd).
+- The original parent's reaped-children CPU stayed at **0.0000 s**.
+
+A snapshot survey of all 28 processes whose parent is pid 1 on this machine found
+**no stranded development work** — every one was a system daemon owned by root or a
+system account. So the *currently observable* leak is 0.
+
+**That 0 is a lower bound, not a measurement of the leak.** A child that detached,
+burned CPU and exited before the survey leaves no process-table entry and no trail in
+any parent's ledger, so it is invisible to any snapshot. The honest conclusion is
+that the leak's size over a session's lifetime remains **unmeasured**, and reported
+child-CPU totals remain floors.
+
+The comparison denominator used above was a single session's CPU rather than all
+sessions on the machine, so no machine-wide ratio should be quoted from it.
 
 Two operational rules follow:
 
@@ -243,7 +264,63 @@ run that demonstrably started a turn counts.)
 Incidental observation: one `mcp_server_connection` reported `duration_ms=73341`
 — 73 seconds to connect. Worth investigating separately.
 
-### 3.3 Per-subagent accounting
+### 3.3 Session silence — measured gaps and threshold limits
+
+Given that no direct "blocked on a human" signal exists, a silence duration is the only
+available proxy for *that* question — though, as the ceiling below shows, not for whether
+a session is alive at all. Measured across 20 sessions, 15,995 timestamped
+records, 15,707 gaps, 14–17 August 2026 (3 days). Only `timestamp` and `type` fields
+were read; no conversation content.
+
+**Gaps between consecutive records, all types:**
+
+| Percentile | Duration |
+| --- | --- |
+| p50 | 0.1 s |
+| p90 | 39 s |
+| p99 | 5.0 min |
+| max | 9.3 h |
+
+**Gaps following an assistant record** (i.e. a human has been asked something and has
+not yet replied), n=3,244:
+
+| Percentile | Duration |
+| --- | --- |
+| p50 | 0.2 s |
+| p90 | 8.2 s |
+| p99 | 3.9 min |
+| max | 8.1 h |
+
+**Gaps following a user record** (i.e. the model is working), n=3,453:
+
+| Percentile | Duration |
+| --- | --- |
+| p50 | 0.0 s |
+| p90 | 0.0 s |
+| p99 | 13.7 s |
+| max | 11.0 min |
+
+Longest gaps that were **followed by more records** — and so provably did not end the
+session — were: 9.3 h, 9.2 h and 8.6 h (each after a system record), 8.2 h (after an
+attachment record), and **8.1 h after an assistant record**.
+
+#### Sampling-window ceiling — why maximum observed gap is not usable
+
+**The maximum observed gap is bounded by the observation window's length.** This
+sample covers three days, so it structurally cannot contain a session left open over
+a weekend and resumed on Monday, which would show a gap exceeding 60 hours. Any
+threshold derived from "the largest gap we saw" is therefore an artefact of the
+sampling window, not a property of the sessions.
+
+**Operational consequence:** a silence duration **cannot soundly establish that a
+session is dead.** The one thing that can is the **absence of a resident process**,
+which is directly observable rather than inferred. Silence should therefore drive
+only the weaker "waiting" verdict, where a false positive costs nothing but a
+notification; the measured post-assistant p99 of 3.9 min is a reasonable basis for
+that, and a threshold of a few minutes sits above normal interaction cadence
+(post-assistant p90 is 8.2 s).
+
+### 3.4 Per-subagent accounting
 
 | Want | Available? | How |
 | --- | --- | --- |
@@ -259,7 +336,7 @@ Main-thread vs subagent LLM calls are distinguished by `query_source`:
 one subagent: `duration_ms=7722`, `total_tokens=20976`, `total_tool_uses=1`, and
 three `api_request` rows, two carrying `agent.name=general-purpose`.
 
-### 3.4 Turns: `prompt.id` is the natural unit of work
+### 3.5 Turns: `prompt.id` is the natural unit of work
 
 `prompt.id` appears on `tool_result`, `api_request`, **and** `subagent_completed` —
 the same value across all three. So everything belonging to one user request can be
@@ -270,7 +347,7 @@ This is a far more useful unit than "session." A session runs for hours and does
 many unrelated things; a **Turn** (one `prompt.id`) has a beginning, an end, and an
 intent.
 
-### 3.5 Commits: outcome attribution
+### 3.6 Commits: outcome attribution
 
 Verified in a throwaway repo — a session that commits emits:
 
@@ -320,7 +397,7 @@ reachability.
 work; cost-per-line would score it as a disaster. Count commits, show diff size as
 context, let a human judge. Denominators invite gaming — including by agents.
 
-### 3.6 Privacy
+### 3.7 Privacy
 
 **Content is redacted by default.** Verified with a canary string planted in a
 prompt: it never reached the wire. The `prompt` and `response` attribute *keys*
@@ -331,7 +408,7 @@ Content is therefore strictly **opt-in** via `OTEL_LOG_USER_PROMPTS`,
 `OTEL_LOG_TOOL_CONTENT`, `OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_ASSISTANT_RESPONSES`.
 Never set them. Assert redaction at ingest as defence in depth.
 
-### 3.7 A separate content channel: argv
+### 3.8 A separate content channel: argv
 
 **Process argv contains prompt text.** Discovered accidentally — another agent's
 prompt spilled into a `ps` listing and broke a line-based parse, because the text
@@ -369,26 +446,55 @@ with no subprocess at all, which avoids both the race and the spawn cost.
 
 ### 4.2 Identifying agent processes
 
-Mechanisms differ per CLI, so detection rules must be **data, not code**:
+Mechanisms differ per CLI, so detection rules must be **data, not code**. The table
+below records the resolved executable paths observed today; note that **the Codex
+CLI's install root has moved** since earlier observations, which is precisely why
+identity must be anchored to the **end** of the resolved path (a conventional binary
+directory) rather than to an install prefix.
 
 | CLI | Real executable | Usable signal |
 | --- | --- | --- |
 | claude | `~/.local/share/claude/versions/<ver>` (via `~/.local/bin/claude`) | exe path — note the basename is a *version string* |
-| codex | `/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex` | exe path ending `bin/codex` |
-| gemini | `/opt/homebrew/lib/node_modules/@google/gemini-cli/bundle/gemini.js` | **argv only** — the exe is `node` |
-| cursor-agent | `~/.local/share/cursor-agent/versions/<ver>/cursor-agent` | exe path |
+| codex | `~/.devbar/pkgs/npm/24.18.0/node-v24.18.0-darwin-arm64/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex` | exe path ending `bin/codex` |
+| gemini | `/opt/homebrew/lib/node_modules/@google/gemini-cli/bundle/gemini.js` | **argv only** — the exe is `node` (unverified on this machine as of today) |
+| cursor-agent | `~/.local/share/cursor-agent/versions/2026.08.11-e8db854/cursor-agent` | exe path ending `cursor-agent` — note the executable is now named `cursor-agent`, where earlier observations saw `node` |
 
 Required exclusions — all matched agent-ish patterns but are **not** sessions:
 
 ```
-/Applications/ChatGPT.app/.../Codex Framework.framework/...   (desktop app)
-/Applications/Claude.app/.../Claude Helper                     (desktop app)
-/Applications/Cursor.app/.../Cursor Helper (*)                 (editor helpers)
-~/.codex/computer-use/.../SkyComputerUseClient                 (Computer Use)
+/Applications/ChatGPT.app/Contents/Resources/codex
+  (the desktop app's codex binary — filename is exactly `codex`, so only its
+   directory distinguishes it from the CLI)
+/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/
+  Versions/151.0.7922.137/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)
+  (also `Codex (GPU)`, `Codex (Alerts)`, `Codex (Service)`)
+/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules/@oai/sky/
+  Codex Computer Use.app/Contents/MacOS/SkyComputerUseService
+  (the Computer Use helper has moved here from `~/.codex/computer-use/...`; the
+   binary's name changed from Client to Service; both locations have been observed)
+~/.codex/computer-use/.../SkyComputerUseClient
+  (earlier Computer Use location — keep both)
+/Applications/Claude.app/Contents/MacOS/Claude
+/Applications/Claude.app/Contents/Frameworks/Claude Helper{, (GPU), (Plugin), (Renderer)}.app/
+  Contents/MacOS/...
+/Applications/Cursor.app/Contents/MacOS/Cursor
+/Applications/Cursor.app/Contents/Frameworks/Cursor Helper{, (GPU), (Plugin), (Renderer)}.app/
+  Contents/MacOS/...
 ```
 
 Also: a `comm` value is **not always a path**. Cursor reports descriptive strings
 such as `Cursor Helper: terminal pty-host`. Detectors must tolerate that.
+
+Two further details worth recording, both bearing on why detection reads the
+**resolved executable path** rather than invocation path or `comm`:
+
+- `ps -o comm=` for a running Claude Code session shows the **invocation** path
+  (`~/.local/bin/claude`, a symlink), whereas the resolved executable path is the
+  version-string file (`~/.local/share/claude/versions/2.1.233`). Two different
+  tools answer two different questions.
+- `comm` is truncated to a fixed short length by the kernel — `endpointsecurityd`
+  appears as `endpointsecurity`. A detector matching on `comm` is therefore matching
+  a possibly-truncated string.
 
 On this machine both CLIs are launched through `cmux` shims in a temp directory, so
 the invoked path is not the real binary. Resolve before matching.
@@ -698,7 +804,7 @@ __PAGEZERO` and **no `__DWARF`** — debug info is already split.
 | What does Falcon actually cost? | It is the prime suspect and the one process whose CPU cannot be read at all (§6) | **Unmeasurable** without Activity Monitor or IT cooperation |
 | How often do agents orphan children? | Orphaned work escapes accounting entirely (§2.4) | Unmeasured |
 | Do `hook_execution_*` events carry a duration? | Would price the 12 registered hook events directly | Attributes seen, duration not confirmed |
-| Does commit→turn timestamp correlation work in practice? | Turn-level outcome attribution depends on it (§3.5) | Untested |
+| Does commit→turn timestamp correlation work in practice? | Turn-level outcome attribution depends on it (§3.6) | Untested |
 | Did a commit survive (revert / squash / rebase)? | "Committed" is output, not success | Not designed |
 | ~~Why is cost/MB 38.1 rather than 8.6?~~ | Was a discrepancy against the prior model | **RESOLVED: arithmetic error on my part.** Slope is ~10.0 ms/MB (close to 8.6); the *fixed* cost doubled to ~131 ms |
 | ~~Rust release binary size and its own cold-exec cost~~ | The tool pays the tax it measures | **RESOLVED:** stripped release binary 0.49 MB, cold 136.4 ms vs warm 4.8 ms (28.6x). Paid once per released version |

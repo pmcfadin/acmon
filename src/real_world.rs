@@ -1,15 +1,16 @@
 //! The real [`World`] — the only code in the crate that touches the operating system.
 
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use libproc::pid_rusage::{pidrusage, RUsageInfoV4};
 use libproc::proc_pid;
 use libproc::processes::{pids_by_type, ProcFilter};
 
+use crate::isotime::unix_seconds_from_iso8601;
 use crate::machtime::{MachTicks, MachTimebase};
 use crate::world::{
-    PathUnavailable, ProcessRecord, ProcessSnapshot, ResourceSource, Resources,
+    CodexSession, PathUnavailable, ProcessRecord, ProcessSnapshot, ResourceSource, Resources,
     ResourcesUnavailable, Unmeasured, World, WorldError,
 };
 
@@ -226,6 +227,130 @@ fn parse_ps_cpu_time(field: &str) -> Result<Duration, String> {
         .map_err(|_| malformed())
 }
 
+/// How recently a Codex session must have been updated to be worth opening.
+///
+/// This is what keeps the transcript store from being scanned. On the machine behind the
+/// mechanics document the index holds 691 rows and exactly one falls inside this window.
+/// Generous rather than tight: the cost of including a stale session is one line read,
+/// while excluding a live one would lose its workspace.
+const CODEX_RECENCY_WINDOW_SECONDS: i64 = 6 * 3_600;
+
+/// The ids the Codex index reports as active within the recency window.
+///
+/// Only `id` and `updated_at` are deserialised. The index also carries a thread name,
+/// which is user-supplied text and is deliberately never read into this program.
+fn recently_active_codex_ids(index: &std::path::Path, now: i64) -> Result<Vec<String>, WorldError> {
+    #[derive(serde::Deserialize)]
+    struct IndexRow {
+        id: String,
+        updated_at: String,
+    }
+
+    let text = std::fs::read_to_string(index)
+        .map_err(|e| WorldError::CodexIndex(format!("{}: {e}", index.display())))?;
+
+    let mut ids = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: IndexRow = serde_json::from_str(line).map_err(|e| {
+            WorldError::CodexIndex(format!("{} line {}: {e}", index.display(), number + 1))
+        })?;
+        // A timestamp that cannot be read is an error, never a silent skip: skipping it
+        // would drop a live session from the table for a reason nobody would see.
+        let updated = unix_seconds_from_iso8601(&row.updated_at).map_err(|e| {
+            WorldError::CodexIndex(format!("{} line {}: {e}", index.display(), number + 1))
+        })?;
+        if now - updated <= CODEX_RECENCY_WINDOW_SECONDS {
+            ids.push(row.id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Find the transcript file for each wanted id, reading directory entries only.
+///
+/// Descends newest date directory first and stops as soon as every wanted id is found,
+/// so in practice this touches one or two directories. An id with no file is simply
+/// absent from the result: the index outlives the transcripts it points at, and that is
+/// not an error.
+fn locate_codex_transcripts(
+    sessions: &std::path::Path,
+    wanted: &[String],
+) -> Result<Vec<(String, std::path::PathBuf)>, WorldError> {
+    let mut found: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut pending = vec![sessions.to_path_buf()];
+
+    while let Some(directory) = pending.pop() {
+        if found.len() == wanted.len() {
+            break;
+        }
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|e| WorldError::CodexIndex(format!("{}: {e}", directory.display())))?;
+
+        let mut subdirectories = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .map_err(|e| WorldError::CodexIndex(format!("{}: {e}", directory.display())))?;
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                subdirectories.push(entry.path());
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(id) = wanted.iter().find(|id| name.contains(id.as_str())) {
+                if !found.iter().any(|(already, _)| already == id) {
+                    found.push((id.clone(), entry.path()));
+                }
+            }
+        }
+        // Names are YYYY, MM, DD, so sorting ascending and popping from the end visits
+        // the most recent first — where a recently updated session most likely lives.
+        subdirectories.sort();
+        pending.extend(subdirectories);
+    }
+    Ok(found)
+}
+
+/// Read a Codex session's workspace from the first record of its transcript.
+///
+/// Exactly one line is read, and exactly one field is taken from it. The record type is
+/// checked first: if the first line is not the metadata record, this is an error rather
+/// than an attempt to look further into a file that holds conversation content.
+fn read_codex_workspace(path: &std::path::Path) -> Result<String, String> {
+    use std::io::BufRead;
+
+    #[derive(serde::Deserialize)]
+    struct FirstRecord {
+        r#type: String,
+        payload: Payload,
+    }
+    #[derive(serde::Deserialize)]
+    struct Payload {
+        cwd: String,
+    }
+
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut first_line = String::new();
+    std::io::BufReader::new(file)
+        .read_line(&mut first_line)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+
+    let record: FirstRecord = serde_json::from_str(&first_line)
+        .map_err(|e| format!("{}: first record is not readable: {e}", path.display()))?;
+    if record.r#type != "session_meta" {
+        return Err(format!(
+            "{}: first record is {:?}, not session_meta",
+            path.display(),
+            record.r#type
+        ));
+    }
+    if record.payload.cwd.is_empty() {
+        return Err(format!("{}: session_meta records no cwd", path.display()));
+    }
+    Ok(record.payload.cwd)
+}
+
 impl World for RealWorld {
     fn process_snapshot(&self) -> Result<ProcessSnapshot, WorldError> {
         let pids = pids_by_type(ProcFilter::All).map_err(|e| {
@@ -294,6 +419,36 @@ impl World for RealWorld {
                 })
             }
         }
+    }
+
+    fn codex_sessions(&self) -> Result<Vec<CodexSession>, WorldError> {
+        let home = std::env::var("HOME")
+            .map_err(|e| WorldError::CodexIndex(format!("HOME is not readable: {e}")))?;
+        let codex = std::path::Path::new(&home).join(".codex");
+
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| WorldError::CodexIndex(format!("the system clock is before 1970: {e}")))?
+            .as_secs() as i64;
+
+        let recent = recently_active_codex_ids(&codex.join("session_index.jsonl"), now)?;
+        if recent.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Locating by id, not by date: a session created weeks ago and updated today
+        // still lives in its creation date's directory (§4.4), so the directory cannot be
+        // derived from `updated_at`. Only filenames are read to find it.
+        let located = locate_codex_transcripts(&codex.join("sessions"), &recent)?;
+
+        located
+            .into_iter()
+            .map(|(id, path)| {
+                read_codex_workspace(&path)
+                    .map(|workspace| CodexSession { id, workspace })
+                    .map_err(WorldError::CodexIndex)
+            })
+            .collect()
     }
 
     fn recorded_namespaces(&self) -> Result<Vec<String>, WorldError> {

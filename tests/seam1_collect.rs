@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use acmon::workspace::{NamespaceUnmatched, WorkspaceUnknown};
-use acmon::world::{ResourceSource, Resources, ResourcesUnavailable, Unmeasured};
+use acmon::world::{CodexSession, ResourceSource, Resources, ResourcesUnavailable, Unmeasured};
 use acmon::{collect, CollectError, ProcessRecord, ProcessSnapshot, World, WorldError};
 
 struct FakeWorld {
@@ -18,6 +18,8 @@ struct FakeWorld {
     ledgers: HashMap<i32, Result<Resources, ResourcesUnavailable>>,
     /// The transcript namespaces this machine is pretending to have recorded.
     namespaces: Result<Vec<String>, WorldError>,
+    /// The Codex sessions this machine is pretending to have recorded.
+    codex_sessions: Result<Vec<CodexSession>, WorldError>,
 }
 
 /// Namespaces that genuinely exist in `~/.claude/projects` on the machine these
@@ -33,6 +35,14 @@ fn recorded_namespaces() -> Vec<String> {
     .collect()
 }
 
+/// A real Codex session observed on this machine, safe to use as a fixture.
+fn recorded_codex_sessions() -> Vec<CodexSession> {
+    vec![CodexSession {
+        id: "01a010c6-9c79-76d1-82da-3fad4bbf3bc4".to_string(),
+        workspace: "/Users/pmcfadin/Documents/Codex/2026-08-17/he".to_string(),
+    }]
+}
+
 impl FakeWorld {
     fn with(records: Vec<ProcessRecord>, observer_pid: i32) -> Self {
         FakeWorld {
@@ -42,6 +52,7 @@ impl FakeWorld {
             }),
             ledgers: HashMap::new(),
             namespaces: Ok(recorded_namespaces()),
+            codex_sessions: Ok(recorded_codex_sessions()),
         }
     }
 
@@ -50,6 +61,7 @@ impl FakeWorld {
             snapshot: Err(error),
             ledgers: HashMap::new(),
             namespaces: Ok(recorded_namespaces()),
+            codex_sessions: Ok(recorded_codex_sessions()),
         }
     }
 
@@ -60,6 +72,11 @@ impl FakeWorld {
 
     fn without_namespace_listing(mut self, why: &str) -> Self {
         self.namespaces = Err(WorldError::NamespaceListing(why.to_string()));
+        self
+    }
+
+    fn with_codex_sessions(mut self, sessions: Result<Vec<CodexSession>, WorldError>) -> Self {
+        self.codex_sessions = sessions;
         self
     }
 }
@@ -110,6 +127,10 @@ impl World for FakeWorld {
 
     fn recorded_namespaces(&self) -> Result<Vec<String>, WorldError> {
         self.namespaces.clone()
+    }
+
+    fn codex_sessions(&self) -> Result<Vec<CodexSession>, WorldError> {
+        self.codex_sessions.clone()
     }
 }
 
@@ -172,25 +193,30 @@ fn captured_process_table() -> Vec<ProcessRecord> {
 }
 
 #[test]
-fn lists_every_live_claude_session() {
+fn lists_every_live_session_of_both_clis_and_nothing_else() {
     let world = FakeWorld::with(captured_process_table(), 88429);
 
     let snapshot = collect(&world).expect("collection should succeed");
 
+    let found: Vec<(i32, &str)> = snapshot
+        .sessions
+        .iter()
+        .map(|s| (s.pid, s.cli.as_str()))
+        .collect();
+
     assert_eq!(
-        snapshot.sessions.len(),
-        11,
-        "expected nine versioned Claude sessions plus two Agent SDK bundled sessions, got {:?}",
-        snapshot
-            .sessions
-            .iter()
-            .map(|s| (s.pid, s.cli.as_str()))
-            .collect::<Vec<_>>()
+        found.len(),
+        12,
+        "expected nine versioned Claude sessions, two Agent SDK bundled ones and one \
+         Codex CLI, got {found:?}"
     );
-    assert!(
-        snapshot.sessions.iter().all(|s| s.cli == "claude"),
-        "ticket #2 recognises only Claude; Codex arrives in #5"
+    assert_eq!(
+        found.iter().filter(|(_, cli)| *cli == "codex").count(),
+        1,
+        "exactly one process in this table is the Codex CLI; the others that mention \
+         codex are a helper and a Computer Use client, got {found:?}"
     );
+    assert_eq!(found.iter().filter(|(_, cli)| *cli == "claude").count(), 11);
 }
 
 #[test]
@@ -554,5 +580,331 @@ fn a_failure_to_list_recorded_namespaces_is_not_a_workspace_without_a_transcript
         ),
         "got {:?}",
         workspace.namespace
+    );
+}
+
+/// The real Codex CLI, observed. Note it ends in a conventional binary directory.
+const CODEX_EXE: &str = "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex";
+
+/// The workspace from the real Codex session fixture.
+const CODEX_WORKSPACE: &str = "/Users/pmcfadin/Documents/Codex/2026-08-17/he";
+
+/// The session id from the real Codex session fixture.
+const CODEX_SESSION_ID: &str = "01a010c6-9c79-76d1-82da-3fad4bbf3bc4";
+
+/// Everything below is a real path on a real machine, matches an agent-ish pattern, and
+/// is NOT a CLI session. Each is a defect the tool being replaced had. A falsely
+/// detected resident process is the worst kind of miss here: it downgrades a dead
+/// session to merely waiting, so the tool goes quiet exactly when a session dies.
+fn near_misses() -> Vec<ProcessRecord> {
+    vec![
+        // A `codex` binary bundled INSIDE the ChatGPT desktop application. This is the
+        // sharpest exclusion of all: the filename is exactly `codex`, so only the
+        // directory it sits in distinguishes it from the CLI.
+        rec(70000, "/Applications/ChatGPT.app/Contents/Resources/codex"),
+        // The desktop application itself, and two of its Codex framework helpers.
+        rec(70001, "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"),
+        rec(70002, "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/151.0.7922.137/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"),
+        rec(70003, "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/151.0.7922.137/Helpers/Codex (GPU).app/Contents/MacOS/Codex (GPU)"),
+        // Codex's Computer Use helper, at both locations it has been observed at.
+        rec(62507, "/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules/@oai/sky/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService"),
+        rec(62508, "/Users/pmcfadin/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"),
+        // A Codex helper that really does live in the CLI's own bin directory.
+        rec(60099, "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"),
+        // The Claude desktop application and its helpers.
+        rec(70004, "/Applications/Claude.app/Contents/MacOS/Claude"),
+        rec(70005, "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper"),
+        rec(70006, "/Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer)"),
+        // The Cursor editor, its helpers, and the cursor-agent CLI — which is a coding
+        // agent, but not one this tool claims to measure.
+        rec(63202, "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/Contents/MacOS/Cursor Helper"),
+        rec(63203, "/Applications/Cursor.app/Contents/MacOS/Cursor"),
+        rec(21023, "/Users/pmcfadin/.local/share/cursor-agent/versions/2026.08.11-e8db854/cursor-agent"),
+    ]
+}
+
+#[test]
+fn the_real_codex_cli_is_a_session() {
+    let world = FakeWorld::with(
+        vec![
+            rec(59293, CODEX_EXE),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    );
+
+    let snapshot = collect(&world).expect("collection should succeed");
+
+    assert_eq!(
+        snapshot
+            .sessions
+            .iter()
+            .map(|s| (s.pid, s.cli.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(59293, "codex")]
+    );
+}
+
+#[test]
+fn no_desktop_application_or_helper_is_ever_a_session() {
+    // Six named regressions in one place. Every path here was observed running.
+    let mut records = near_misses();
+    records.push(rec(
+        88429,
+        "/Users/pmcfadin/projects/acmon/target/debug/acmon",
+    ));
+    let world = FakeWorld::with(records, 88429);
+
+    let snapshot = collect(&world).expect("collection should succeed");
+
+    assert!(
+        snapshot.sessions.is_empty(),
+        "none of these is a session, got {:?}",
+        snapshot
+            .sessions
+            .iter()
+            .map(|s| (s.pid, s.cli.as_str()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn the_codex_cli_is_told_apart_from_a_helper_in_the_same_directory() {
+    // The sharpest case: both live in the same `bin` directory, so only a rule anchored
+    // to the end of the path separates them. A "contains codex" rule claims both.
+    let world = FakeWorld::with(
+        vec![
+            rec(59293, CODEX_EXE),
+            rec(60099, &format!("{CODEX_EXE}-code-mode-host")),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    );
+
+    let snapshot = collect(&world).expect("collection should succeed");
+
+    assert_eq!(snapshot.sessions.len(), 1, "only the CLI is a session");
+    assert_eq!(snapshot.sessions[0].pid, 59293);
+}
+
+#[test]
+fn a_descriptive_process_name_rather_than_a_path_does_not_break_detection() {
+    // Cursor reports names like this through `comm`. Detection reads the resolved
+    // executable path instead, but a descriptive string must still be handled rather
+    // than matched or panicked on.
+    let world = FakeWorld::with(
+        vec![
+            rec(63300, "Cursor Helper: terminal pty-host"),
+            rec(63301, ""),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    );
+
+    let snapshot = collect(&world).expect("a descriptive name is not a crash");
+
+    assert!(snapshot.sessions.is_empty());
+}
+
+#[test]
+fn the_codex_cli_is_recognised_wherever_it_is_installed() {
+    // Both paths are real observations of the same CLI, taken at different times: the
+    // npm install root moved. A rule anchored to an installation prefix would have
+    // stopped recognising it silently; a rule anchored to the end of the path does not.
+    let moved = "/Users/pmcfadin/.devbar/pkgs/npm/24.18.0/node-v24.18.0-darwin-arm64/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex";
+    let world = FakeWorld::with(
+        vec![
+            rec(59293, CODEX_EXE),
+            rec(59294, moved),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    );
+
+    let snapshot = collect(&world).expect("collection should succeed");
+
+    assert_eq!(
+        snapshot.sessions.len(),
+        2,
+        "the same CLI at two installation roots is two sessions, got {:?}",
+        snapshot
+            .sessions
+            .iter()
+            .map(|s| (s.pid, s.cli.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(snapshot.sessions.iter().all(|s| s.cli == "codex"));
+}
+
+#[test]
+fn a_codex_binary_inside_an_application_bundle_is_not_a_cli_session() {
+    // The filename is exactly `codex`. Only its directory tells it apart from the CLI,
+    // which is why the rule requires a conventional binary directory rather than a name.
+    let world = FakeWorld::with(
+        vec![
+            rec(70000, "/Applications/ChatGPT.app/Contents/Resources/codex"),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    );
+
+    let snapshot = collect(&world).expect("collection should succeed");
+
+    assert!(
+        snapshot.sessions.is_empty(),
+        "a bundled binary is not a CLI session, got {:?}",
+        snapshot
+            .sessions
+            .iter()
+            .map(|s| (s.pid, s.cli.as_str()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_codex_sessions_workspace_comes_from_its_transcript_not_from_its_cwd() {
+    // Acceptance criterion 6: the workspace must be what the transcript records, not what
+    // the process reports.
+    //
+    // The two sources have to be told apart for this test to prove anything, so the
+    // process is given a cwd that names the same directory in different capitals. APFS is
+    // case-insensitive but case-preserving, so this really happens: both strings open the
+    // same directory, and only one of them is what the transcript recorded. If the
+    // implementation reported the cwd, this test would show the lowercase spelling.
+    let cwd_in_different_capitals = CODEX_WORKSPACE.to_lowercase();
+    assert_ne!(
+        cwd_in_different_capitals, CODEX_WORKSPACE,
+        "the fixture must actually differ, or this test proves nothing"
+    );
+
+    let world = FakeWorld::with(
+        vec![
+            rec_in(59293, CODEX_EXE, &cwd_in_different_capitals),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    );
+
+    let snapshot = collect(&world).expect("collection should succeed");
+    let session = &snapshot.sessions[0];
+
+    assert_eq!(session.cli, "codex");
+    let workspace = session.workspace.as_ref().expect("workspace is readable");
+    assert_eq!(
+        workspace.path, CODEX_WORKSPACE,
+        "the workspace must be the transcript's spelling, not the process's"
+    );
+    assert_eq!(
+        workspace.namespace,
+        Ok(CODEX_SESSION_ID.to_string()),
+        "the namespace for a Codex session is the session id, not a hyphenated path"
+    );
+}
+
+#[test]
+fn a_codex_session_with_no_recent_transcript_still_appears_with_its_directory() {
+    // A Codex session whose transcript is not in the index — either it is genuinely old,
+    // or the index has not caught up — must still be listed with its directory. The
+    // difference from "no transcript at all" and "could not look" must be preserved.
+    let world = FakeWorld::with(
+        vec![
+            rec_in(59293, CODEX_EXE, "/Users/pmcfadin/projects/never_opened"),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    );
+
+    let snapshot = collect(&world).expect("collection should succeed");
+    let session = &snapshot.sessions[0];
+
+    assert_eq!(session.cli, "codex");
+    let workspace = session.workspace.as_ref().expect("workspace is readable");
+    assert_eq!(workspace.path, "/Users/pmcfadin/projects/never_opened");
+    assert_eq!(
+        workspace.namespace,
+        Err(NamespaceUnmatched::NotRecorded {
+            mapped: "/Users/pmcfadin/projects/never_opened".to_string()
+        }),
+        "a Codex session with no recent transcript shows its directory and states the \
+         transcript is unmatched, never reports the workspace as unknown"
+    );
+}
+
+#[test]
+fn a_codex_index_read_failure_renders_as_could_not_look_not_as_no_transcript() {
+    // Two different facts: "this session has no transcript" and "we could not look".
+    // Collapsing them would report the first when the second is true.
+    let world = FakeWorld::with(
+        vec![
+            rec_in(59293, CODEX_EXE, CODEX_WORKSPACE),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .with_codex_sessions(Err(WorldError::CodexIndex(
+        "~/.codex/session_index.jsonl is not readable".to_string(),
+    )));
+
+    let snapshot = collect(&world).expect("an unreadable Codex index is not fatal");
+    let session = &snapshot.sessions[0];
+
+    let workspace = session.workspace.as_ref().expect("workspace is readable");
+    assert!(
+        matches!(
+            workspace.namespace,
+            Err(NamespaceUnmatched::ListingFailed(_))
+        ),
+        "got {:?}",
+        workspace.namespace
+    );
+}
+
+#[test]
+fn a_claude_session_and_a_codex_session_each_get_their_workspace_from_the_right_source() {
+    // No cross-wiring. A Claude session in agentic_coding_monitor and a Codex session in
+    // the fixture workspace must each resolve correctly, using their respective stores.
+    let world = FakeWorld::with(
+        vec![
+            rec_in(
+                69046,
+                CLAUDE_EXE,
+                "/Users/pmcfadin/projects/agentic_coding_monitor",
+            ),
+            rec_in(59293, CODEX_EXE, CODEX_WORKSPACE),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    );
+
+    let snapshot = collect(&world).expect("collection should succeed");
+
+    let claude_session = snapshot
+        .sessions
+        .iter()
+        .find(|s| s.cli == "claude")
+        .expect("Claude session");
+    let codex_session = snapshot
+        .sessions
+        .iter()
+        .find(|s| s.cli == "codex")
+        .expect("Codex session");
+
+    let claude_ws = claude_session.workspace.as_ref().expect("readable");
+    assert_eq!(
+        claude_ws.path,
+        "/Users/pmcfadin/projects/agentic_coding_monitor"
+    );
+    assert_eq!(
+        claude_ws.namespace,
+        Ok("-Users-pmcfadin-projects-agentic-coding-monitor".to_string()),
+        "Claude session uses hyphenated namespace from recorded namespaces"
+    );
+
+    let codex_ws = codex_session.workspace.as_ref().expect("readable");
+    assert_eq!(codex_ws.path, CODEX_WORKSPACE);
+    assert_eq!(
+        codex_ws.namespace,
+        Ok(CODEX_SESSION_ID.to_string()),
+        "Codex session uses session id from Codex sessions"
     );
 }

@@ -38,9 +38,11 @@ fn collection_over_the_real_machine_yields_only_recognised_clis() {
     let snapshot = collect(&world).expect("collection over the real machine should succeed");
 
     for session in &snapshot.sessions {
-        assert_eq!(
-            session.cli, "claude",
-            "ticket #2 recognises only Claude, so nothing else may be reported"
+        assert!(
+            session.cli == "claude" || session.cli == "codex",
+            "tickets #2 and #5 recognise claude and codex, so nothing else may be reported; \
+             got {:?}",
+            session.cli
         );
         assert!(session.pid > 0, "a pid is always positive");
     }
@@ -390,6 +392,44 @@ fn every_workspace_attribution_on_this_machine_is_true_in_both_directions() {
             Err(NamespaceUnmatched::ListingFailed(why)) => {
                 panic!("the listing succeeded above, so this cannot be: {why}")
             }
+            Err(NamespaceUnmatched::UnknownCli(_)) => {
+                // A session for a CLI we don't know how to attribute is covered by its own
+                // test when that CLI is added.
+            }
         }
     }
+}
+
+#[test]
+fn codex_sessions_from_the_real_machine_are_either_empty_or_well_formed() {
+    // This machine may have zero recent Codex sessions, or it may have several. An empty
+    // result is legitimate and not a failure — the test must not be vacuous in that case.
+    // Invariants only: if sessions are returned, their shape must be correct.
+    let world = RealWorld::new();
+
+    let sessions = world
+        .codex_sessions()
+        .expect("reading the Codex session index should succeed");
+
+    for session in &sessions {
+        assert!(
+            !session.id.is_empty(),
+            "every Codex session must have a non-empty id, got {:?}",
+            session
+        );
+        assert!(
+            !session.workspace.is_empty(),
+            "every Codex session must have a non-empty workspace, got {:?}",
+            session
+        );
+        assert!(
+            session.workspace.starts_with('/'),
+            "every Codex workspace must be an absolute path, got {:?}",
+            session.workspace
+        );
+    }
+
+    // Either result is legitimate: emptiness means no recent Codex sessions on this
+    // machine, which is a valid state. The test proves only that whatever came back has
+    // the right shape, not that any particular count is correct.
 }

@@ -64,6 +64,10 @@ pub enum NamespaceUnmatched {
     /// The recorded namespaces could not be listed, so nothing can be said either way.
     /// This is not the same as a workspace having no transcript.
     ListingFailed(String),
+    /// This CLI is not one we know how to find transcripts for. Carries the cli id that
+    /// was unrecognised, so it can be checked rather than silently falling through to a
+    /// store that would attribute the session wrongly.
+    UnknownCli(String),
 }
 
 impl std::fmt::Display for NamespaceUnmatched {
@@ -74,6 +78,9 @@ impl std::fmt::Display for NamespaceUnmatched {
             }
             NamespaceUnmatched::ListingFailed(why) => {
                 write!(f, "recorded namespaces could not be listed: {why}")
+            }
+            NamespaceUnmatched::UnknownCli(cli) => {
+                write!(f, "no transcript store is known for CLI {cli}")
             }
         }
     }

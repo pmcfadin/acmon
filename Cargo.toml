@@ -11,6 +11,7 @@ libc = "0.2"
 libproc = "0.14"
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "1"
 
 [dev-dependencies]
