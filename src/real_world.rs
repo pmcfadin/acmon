@@ -14,6 +14,19 @@ use crate::world::{
     ResourcesUnavailable, Unmeasured, World, WorldError,
 };
 
+/// How far below a sweep root the descent goes.
+///
+/// Four, because this project's own agent workflows put linked worktrees at
+/// `<repo>/.claude/worktrees/<name>`, which is four levels below the directory the
+/// repositories sit in.
+const SWEEP_MAX_DEPTH: usize = 4;
+
+/// The most directories one sweep may visit before giving up.
+///
+/// Public so a test can exhaust it by name rather than by hard-coding a number that would
+/// silently stop exercising the bound the day the bound changed.
+pub const SWEEP_BUDGET: usize = 4096;
+
 pub struct RealWorld {
     observer_pid: i32,
     /// Read once from this machine, never assumed. Every duration in the kernel's
@@ -770,9 +783,6 @@ impl World for RealWorld {
     fn sweep_for_repositories(&self, roots: &[String]) -> crate::world::Sweep {
         use crate::world::Sweep;
         use std::collections::HashSet;
-
-        const SWEEP_MAX_DEPTH: usize = 4;
-        const SWEEP_BUDGET: usize = 4096;
 
         let mut repositories: Vec<(String, bool)> = Vec::new();
         let mut directories_visited = 0;

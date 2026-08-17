@@ -742,6 +742,13 @@ sweeps. Five seconds is far past the one-second fast-tier budget, so the honest 
 that the full sweep is a slow-tier measurement, and that a concurrent implementation has
 5.0 s sequential as the figure to beat.
 
+It does beat it, but not by enough. Running the version-control queries across a bounded
+pool of threads brings a whole `acmon` collection — process enumeration, per-session
+resource ledgers, namespace resolution, sweep, and 159 candidate workspaces — to **2.51,
+2.57 and 2.66 seconds** over three runs. Still more than twice the fast-tier budget, and the
+remaining cost is `git status` itself rather than anything above it, so the next honest
+lever is asking fewer repositories per pass rather than asking faster.
+
 ---
 
 ## 5. Cost of observing

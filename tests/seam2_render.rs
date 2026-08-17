@@ -857,3 +857,41 @@ fn panel_does_not_clip_existing_caveat() {
         "and so must its last words; got:\n{text}"
     );
 }
+
+/// Finding no workspaces at all must NOT read as reassurance.
+///
+/// Ticket #7 requires an empty panel to read as "checked and clear". An empty *candidate
+/// set* is the opposite situation and has to read the opposite way: nothing was checked, so
+/// nothing is known. On the machine behind `docs/observability-mechanics.md` §4.6 there are
+/// 70 workspaces to find, so discovering none means discovery failed.
+///
+/// Without this test, changing the branch to emit the reassuring wording would leave every
+/// other test passing — which is how a safety net comes to report "0 at risk" for a machine
+/// it never looked at.
+#[test]
+fn finding_no_workspaces_at_all_does_not_read_as_checked_and_clear() {
+    let text = rendered(
+        &Snapshot {
+            sessions: Vec::new(),
+            workspaces: Vec::new(),
+            unlocated: Vec::new(),
+            sweep_complete: true,
+        },
+        WIDE,
+    );
+
+    assert!(
+        text.contains("NOTHING WAS CHECKED"),
+        "an empty candidate set must say that nothing was checked; got:\n{text}"
+    );
+    assert!(
+        !text.contains("are clean"),
+        "an empty candidate set must not claim the workspaces it never found are clean; \
+         got:\n{text}"
+    );
+    assert!(
+        !text.contains("No workspaces at risk"),
+        "an empty candidate set must not report the absence of risk, which it cannot know; \
+         got:\n{text}"
+    );
+}

@@ -1205,3 +1205,52 @@ fn vcs_facts_batch_returns_results_in_order() {
         "position 2 (nonexistent path) must be Err(PathGone)"
     );
 }
+
+/// A sweep that runs out of budget must say the coverage is partial.
+///
+/// This is the "no silent caps" rule from AGENTS.md applied to the one place in this ticket
+/// where a bound could quietly shrink the answer. A truncated list of at-risk workspaces
+/// presented as exhaustive is worse than no list: "0 at risk" stops meaning anything once it
+/// can also mean "stopped looking".
+///
+/// The bound is exercised for real rather than asserted about, so the tree is built wide
+/// enough to exceed it. Flat rather than deep: the sweep visits every child of a root, so
+/// breadth costs one `mkdir` per visit while depth would also need the descent limit raised.
+#[test]
+fn a_sweep_that_exhausts_its_budget_reports_incomplete_coverage() {
+    let unique = format!(
+        "acmon-sweep-budget-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("a temporary directory");
+
+    // One more than the budget, so the root itself plus the children cannot fit inside it.
+    for index in 0..=acmon::real_world::SWEEP_BUDGET {
+        std::fs::create_dir(root.join(format!("d{index}"))).expect("a child directory");
+    }
+
+    let world = RealWorld::new();
+    let sweep = world.sweep_for_repositories(&[root.to_string_lossy().into_owned()]);
+
+    // Clean up before asserting, so a failure does not leave thousands of directories behind.
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        !sweep.complete,
+        "a sweep that visited {} directories against a budget of {} claimed to be complete",
+        sweep.directories_visited,
+        acmon::real_world::SWEEP_BUDGET
+    );
+    assert!(
+        sweep.directories_visited >= acmon::real_world::SWEEP_BUDGET,
+        "the sweep stopped at {} directories, below its budget of {}, so this test did not \
+         exercise the bound at all",
+        sweep.directories_visited,
+        acmon::real_world::SWEEP_BUDGET
+    );
+}
