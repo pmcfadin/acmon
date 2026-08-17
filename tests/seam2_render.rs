@@ -126,6 +126,27 @@ fn states_that_child_totals_are_floors_because_detached_work_escapes() {
 }
 
 #[test]
+fn the_floor_caveat_survives_a_width_too_narrow_to_hold_it_on_one_line() {
+    // The table fits from 73 columns; the caveat is 76 characters. Between those the
+    // caveat has to wrap. Losing its tail to a clipped line would leave the numbers
+    // looking complete, which is the failure the caveat exists to prevent.
+    let text = rendered(&snapshot_of(&[69046]), 74);
+
+    assert!(
+        text.contains("floors,"),
+        "the caveat's first line must survive; got:\n{text}"
+    );
+    assert!(
+        text.contains("totals."),
+        "and so must its last words; got:\n{text}"
+    );
+    assert!(
+        text.contains('┘'),
+        "the table must still be closed off, not pushed off the bottom; got:\n{text}"
+    );
+}
+
+#[test]
 fn a_figure_the_coarser_reader_cannot_see_shows_its_reason_not_a_zero() {
     // `ps` reports own CPU and resident size only. The figures it cannot see must say
     // so on the row: a zero here would report a session with busy children as idle.
