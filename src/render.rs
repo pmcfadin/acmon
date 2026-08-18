@@ -50,6 +50,13 @@ const STALE_MARKER_CAVEAT: &str =
     "A figure marked * is the last reading taken before that session's process exited, not a \
      current one.";
 
+/// How much room a CLI's id gets.
+///
+/// Sized to hold `cursor-agent`, the longest plausible fifth-CLI id on this machine, so the
+/// common cases are never marked. Named rather than inlined because the row builder has to
+/// shorten to exactly this width, and two numbers that must agree should be one number.
+const CLI_WIDTH: u16 = 12;
+
 /// The fixed columns, in order. Each width holds that column's widest value *or* the
 /// longest reason for a value's absence, since a reason is printed in the value's place.
 /// The byte columns are NINE rather than eight because `999.9 GB` is already eight and a
@@ -58,7 +65,14 @@ const STALE_MARKER_CAVEAT: &str =
 /// rather than a measurement.
 const FIXED_COLUMNS: [(&str, u16); 8] = [
     ("PID", 6),
-    ("CLI", 6),
+    // Twelve, not six. Six fitted `claude` and `codex` exactly, and those were the only two
+    // ids possible until detectors became user-configurable (#12) — after which an id is
+    // whatever the user typed. `cursor-agent` is twelve characters and rendered as `cursor`,
+    // silently, which is a different CLI's name rather than a shorter version of this one.
+    //
+    // Twelve is not a guarantee, because no fixed width can be: an id longer than this is
+    // shortened with a visible mark instead. See `shorten_with_a_mark`.
+    ("CLI", CLI_WIDTH),
     // Eight, not seven: the longest state is seven characters and an inferred verdict
     // carries a trailing marker. Abbreviating STALLED to STALL would be a truncated
     // state, which is a wrong state rather than a shorter one.
@@ -669,10 +683,36 @@ fn row_for(session: &Session, workspace_width: u16) -> Row<'static> {
         Identity::Transcript { .. } => "gone".to_string(),
     };
 
-    let mut cells = vec![pid_cell, session.cli.clone(), state_cell(&session.liveness)];
+    let mut cells = vec![
+        pid_cell,
+        // Shortened here rather than left to `ratatui`, which would cut it without saying so.
+        // A CLI id comes from user configuration since #12, so its length is not something
+        // this code gets to assume.
+        shorten_with_a_mark(&session.cli, CLI_WIDTH),
+        state_cell(&session.liveness),
+    ];
     cells.extend(figures);
     cells.push(workspace);
     Row::new(cells)
+}
+
+/// Keep the start of a name, marking that the end was dropped.
+///
+/// The opposite direction to [`shorten_from_the_left`], and for the opposite reason: a
+/// workspace's identity is in its tail, while a CLI's is in its head — `codex` and
+/// `codex-experimental` differ at the end, and nothing shares a prefix by accident the way
+/// every path under one home directory does.
+///
+/// Marked, always. `cursor-agent` cut to `cursor` is not a shorter version of this CLI's name;
+/// it is a plausible name for a different one, and the reader has no way to tell.
+fn shorten_with_a_mark(text: &str, width: u16) -> String {
+    let width = width as usize;
+    let characters: Vec<char> = text.chars().collect();
+    if characters.len() <= width || width == 0 {
+        return text.to_string();
+    }
+    let kept: String = characters[..width - 1].iter().collect();
+    format!("{kept}…")
 }
 
 /// Keep the end of a path, marking that the beginning was dropped.
