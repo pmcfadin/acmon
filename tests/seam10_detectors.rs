@@ -435,3 +435,142 @@ exe_contains = ["/cursor-agent/versions/"]
 
     let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
 }
+
+// --- The limit of what configuration alone can buy ---
+
+#[test]
+fn a_user_configured_cli_is_listed_but_its_liveness_is_honestly_unknown() {
+    // Recognising a process is a data change; knowing where it writes its transcript is not.
+    // A detector says which executables are an agent. Nothing in that file says where the CLI
+    // keeps its conversation log, and liveness is derived entirely from a transcript's
+    // modification time — so a user-configured CLI can be listed, measured and attributed to a
+    // directory, and still have no state.
+    //
+    // This test exists to pin that as the ANSWER rather than let it drift into a surprise. The
+    // wrong outcome here is not UNKNOWN; it is UNKNOWN arrived at by accident, or worse, an
+    // ACTIVE inferred from the absence of evidence. `Method::TranscriptActivityUnknown` is the
+    // proof that the verdict was reached by admitting ignorance.
+    use acmon::liveness::{Method, State};
+    use acmon::world::{ProcessRecord, ProcessSnapshot, World, WorldError};
+
+    struct FakeWorld {
+        detectors: Vec<acmon::detect::Detector>,
+    }
+
+    impl World for FakeWorld {
+        fn process_snapshot(&self) -> Result<ProcessSnapshot, WorldError> {
+            Ok(ProcessSnapshot {
+                records: vec![
+                    ProcessRecord {
+                        pid: 4242,
+                        exe_path: Ok("/usr/bin/acmon".to_string()),
+                        cwd: Ok("/Users/pmcfadin".to_string()),
+                    },
+                    ProcessRecord {
+                        pid: 900,
+                        exe_path: Ok(CURSOR_AGENT_PATH.to_string()),
+                        cwd: Ok("/Users/pmcfadin/projects/testing".to_string()),
+                    },
+                ],
+                observer_pid: 4242,
+            })
+        }
+        fn resources(
+            &self,
+            _pid: i32,
+        ) -> Result<acmon::world::Resources, acmon::world::ResourcesUnavailable> {
+            Err(acmon::world::ResourcesUnavailable::ProcessExited)
+        }
+        fn recorded_namespaces(&self) -> Result<Vec<String>, WorldError> {
+            Ok(Vec::new())
+        }
+        fn namespace_activity(
+            &self,
+            _namespace: &str,
+        ) -> Result<SystemTime, acmon::world::ActivityUnavailable> {
+            Err(acmon::world::ActivityUnavailable::NotRecorded)
+        }
+        fn codex_sessions(&self) -> Result<Vec<acmon::world::CodexSession>, WorldError> {
+            Ok(Vec::new())
+        }
+        fn repository_root(&self, _path: &str) -> Option<(String, bool)> {
+            None
+        }
+        fn vcs_facts(&self, _path: &str) -> Result<acmon::vcs::VcsFacts, acmon::vcs::Unreadable> {
+            Err(acmon::vcs::Unreadable::NotVersionControlled)
+        }
+        fn resolve_namespace(&self, _namespace: &str) -> acmon::workspace::NamespaceResolution {
+            acmon::workspace::NamespaceResolution::NoLongerExists
+        }
+        fn sweep_for_repositories(&self, _roots: &[String]) -> acmon::world::Sweep {
+            acmon::world::Sweep {
+                repositories: Vec::new(),
+                complete: true,
+                directories_visited: 0,
+            }
+        }
+        fn output_width(&self) -> u16 {
+            120
+        }
+        fn read_detector_config(&self) -> acmon::world::DetectorConfig {
+            acmon::world::DetectorConfig {
+                detectors: self.detectors.clone(),
+                unusable: None,
+            }
+        }
+    }
+
+    let world = FakeWorld {
+        detectors: acmon::detect::merge_detectors(
+            acmon::detect::embedded_detectors(),
+            vec![acmon::detect::Detector {
+                id: "cursor-agent".to_string(),
+                exe_contains: vec!["/cursor-agent/versions/".to_string()],
+                exe_ends_with: Vec::new(),
+            }],
+        ),
+    };
+
+    let snapshot = collect(&world, now(), &Thresholds::default()).expect("collection");
+
+    let session = snapshot
+        .sessions
+        .iter()
+        .find(|s| s.cli == "cursor-agent")
+        .expect("the user-configured CLI is recognised");
+
+    assert_eq!(
+        session.liveness.state,
+        State::Unknown,
+        "a CLI whose transcript store is unknown has no observable liveness, and guessing one \
+         would be the calm plausible wrong answer this project exists to remove"
+    );
+    assert_eq!(
+        session.liveness.method,
+        Method::TranscriptActivityUnknown,
+        "and the verdict must be reached by admitting the transcript could not be read, not by \
+         any other route that happens to land on UNKNOWN"
+    );
+
+    // The workspace is still known, because the kernel reports it. Configuration buys real
+    // ground: the session is listed, its directory is named, and its resources are read.
+    let workspace = session
+        .workspace
+        .as_ref()
+        .expect("the kernel's cwd needs no transcript store to be readable");
+    assert_eq!(workspace.path, "/Users/pmcfadin/projects/testing");
+    assert!(
+        workspace.namespace.is_err(),
+        "but no transcript is attributed to it, and that absence carries its reason"
+    );
+    assert!(
+        workspace
+            .namespace
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("cursor-agent"),
+        "which names the CLI, so a reader can tell which store is missing; got {:?}",
+        workspace.namespace
+    );
+}
