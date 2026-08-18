@@ -333,7 +333,7 @@ fn default_stall_threshold_exceeds_measured_maximum_silence_followed_by_resumpti
 
 #[test]
 fn thresholds_come_from_configuration_when_it_is_given() {
-    let configured = Thresholds::from_values(Some("60"), Some("7200"))
+    let configured = Thresholds::from_values(Some("60"), Some("7200"), None)
         .expect("two readable values are a valid configuration");
 
     assert_eq!(configured.quiet, Duration::from_secs(60));
@@ -345,12 +345,12 @@ fn an_unset_threshold_falls_back_to_the_measured_default() {
     let defaults = Thresholds::default();
 
     assert_eq!(
-        Thresholds::from_values(None, None),
+        Thresholds::from_values(None, None, None),
         Ok(defaults),
         "configuring nothing must give exactly the documented defaults"
     );
     assert_eq!(
-        Thresholds::from_values(Some("60"), None)
+        Thresholds::from_values(Some("60"), None, None)
             .expect("valid")
             .stall,
         defaults.stall,
@@ -364,11 +364,11 @@ fn a_threshold_that_cannot_be_read_is_refused_rather_than_ignored() {
     // produced by the rule they thought they had replaced — right-looking, and wrong.
     for bad in ["", "ten", "10m", "-5", "1.5", "  "] {
         assert!(
-            Thresholds::from_values(Some(bad), None).is_err(),
+            Thresholds::from_values(Some(bad), None, None).is_err(),
             "{bad:?} is not a number of seconds and must be refused, not ignored"
         );
         assert!(
-            Thresholds::from_values(None, Some(bad)).is_err(),
+            Thresholds::from_values(None, Some(bad), None).is_err(),
             "{bad:?} must be refused for the stall threshold too"
         );
     }
@@ -378,12 +378,12 @@ fn a_threshold_that_cannot_be_read_is_refused_rather_than_ignored() {
 fn a_stall_threshold_below_the_quiet_one_is_refused() {
     // The states would contradict each other: a session could be past "probably dead"
     // while still inside "recently active".
-    let inverted = Thresholds::from_values(Some("600"), Some("60"));
+    let inverted = Thresholds::from_values(Some("600"), Some("60"), None);
 
     assert!(
         inverted.is_err(),
         "an inverted pair must be refused, got {inverted:?}"
     );
     // Equal is not inverted, and is allowed.
-    assert!(Thresholds::from_values(Some("600"), Some("600")).is_ok());
+    assert!(Thresholds::from_values(Some("600"), Some("600"), None).is_ok());
 }

@@ -121,6 +121,15 @@ pub struct Thresholds {
     /// — only that it has been silent and process-absent for long enough to be worth
     /// investigating.
     pub stall: Duration,
+    /// How long a workspace must stay settled — holding nothing worth protecting, with
+    /// nothing driving it — before it is dropped from the state carried between runs.
+    ///
+    /// Not a liveness threshold, and it is here rather than in
+    /// [`memory`](crate::memory) because this struct is what a collection is already
+    /// configured with. Splitting the tool's two configurable durations across two
+    /// structures would mean two places to look and two to keep consistent. The rule it
+    /// drives lives in `memory`; only the value lives here.
+    pub forget: Duration,
 }
 
 impl Default for Thresholds {
@@ -142,10 +151,13 @@ impl Default for Thresholds {
     /// therefore not a safety guarantee derived from data — it is a floor above what was
     /// seen in the sample. The weight in a STALLED verdict is carried by the absence of a
     /// resident process, which is observed rather than inferred.
+    /// - The retention period is not derived from silence at all; see
+    ///   [`DEFAULT_FORGET`](crate::memory::DEFAULT_FORGET) for what bounds it.
     fn default() -> Self {
         Thresholds {
             quiet: Duration::from_secs(10 * 60),   // 10 minutes
             stall: Duration::from_secs(12 * 3600), // 12 hours
+            forget: crate::memory::DEFAULT_FORGET,
         }
     }
 }
@@ -164,7 +176,11 @@ impl Thresholds {
     ///
     /// Pure, so it can be tested without touching the process environment, which is global
     /// and would make tests race each other.
-    pub fn from_values(quiet: Option<&str>, stall: Option<&str>) -> Result<Self, String> {
+    pub fn from_values(
+        quiet: Option<&str>,
+        stall: Option<&str>,
+        forget: Option<&str>,
+    ) -> Result<Self, String> {
         let defaults = Thresholds::default();
         let parse = |value: Option<&str>, name: &str, fallback: Duration| match value {
             None => Ok(fallback),
@@ -177,6 +193,8 @@ impl Thresholds {
 
         let quiet = parse(quiet, QUIET_THRESHOLD_VARIABLE, defaults.quiet)?;
         let stall = parse(stall, STALL_THRESHOLD_VARIABLE, defaults.stall)?;
+        // The retention rule belongs to `memory`, so the reading of its value does too.
+        let forget = crate::memory::retention_from_value(forget)?;
 
         // A stall threshold below the quiet one would make the states inconsistent: a
         // session could be past "probably dead" while still inside "probably working".
@@ -188,7 +206,11 @@ impl Thresholds {
                 quiet.as_secs()
             ));
         }
-        Ok(Thresholds { quiet, stall })
+        Ok(Thresholds {
+            quiet,
+            stall,
+            forget,
+        })
     }
 
     /// Read the thresholds this machine is configured with.
@@ -196,6 +218,9 @@ impl Thresholds {
         Thresholds::from_values(
             std::env::var(QUIET_THRESHOLD_VARIABLE).ok().as_deref(),
             std::env::var(STALL_THRESHOLD_VARIABLE).ok().as_deref(),
+            std::env::var(crate::memory::FORGET_VARIABLE)
+                .ok()
+                .as_deref(),
         )
     }
 }

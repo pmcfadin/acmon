@@ -4,13 +4,14 @@ use std::time::{Duration, SystemTime};
 
 use crate::detect::embedded_detectors;
 use crate::liveness::{classify, Observation, Thresholds, Verdict};
+use crate::memory::{self, Degraded, Forgotten, Memory, Reading, Sighting};
 use crate::vcs::WorkspaceState;
 use crate::workspace::{
     namespace_for, recorded_namespace, NamespaceResolution, NamespaceUnmatched, Workspace,
     WorkspaceUnknown,
 };
 use crate::world::{
-    CodexSession, PathUnavailable, Resources, ResourcesUnavailable, World, WorldError,
+    CodexSession, PathUnavailable, Resources, ResourcesUnavailable, StateRead, World, WorldError,
 };
 
 /// A session's identity: either a live process, or a transcript without one.
@@ -35,6 +36,17 @@ pub struct Session {
     /// A session with an unreadable ledger is still a session, and is still listed. It
     /// is never dropped and never shown as idle.
     pub resources: Result<Resources, ResourcesUnavailable>,
+    /// The last reading taken while this session's process was alive, when there is one and
+    /// [`Session::resources`] has none.
+    ///
+    /// This is what makes a session's lifetime totals survive its exit: almost all of an
+    /// agent's cost is in its children, and that total is only knowable from the process
+    /// that reaped them. Once it is gone the figure exists nowhere else on the machine.
+    ///
+    /// Present ONLY alongside an `Err` in `resources`. A live reading is never shadowed by a
+    /// remembered one, and a caller must never have to work out which of two figures is the
+    /// current one.
+    pub last_reading: Option<Reading>,
     /// Which directory this session is working in, or why that is unknown.
     pub workspace: Result<Workspace, WorkspaceUnknown>,
     /// Whether this session is working, waiting, stalled, or beyond telling — and which
@@ -71,9 +83,55 @@ pub struct WorkspaceReport {
     pub uncommitted_entries: Option<usize>,
 }
 
+/// What this run remembered from earlier ones, and what it did with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remembered {
+    /// The remembered set as this run leaves it — what the next run will start from.
+    pub memory: Memory,
+    /// Why the state left by earlier runs could not be used, when it could not.
+    ///
+    /// `None` covers both a state that was read and a first run with none stored. Neither is
+    /// a degradation, and the difference between them is not worth reporting; the difference
+    /// between "read it" and "lost it" very much is.
+    pub unusable: Option<Degraded>,
+    /// Whether this run's state was stored for the next one.
+    ///
+    /// An `Err` has to be surfaced. A run that collects perfectly and fails to persist looks
+    /// identical to one that succeeded, right up until the next run starts blind and reports
+    /// a shorter at-risk list.
+    pub persisted: Result<(), String>,
+    /// Workspaces dropped from memory this run because they had been settled past the
+    /// retention period.
+    pub forgotten: Vec<Forgotten>,
+    /// The retention period the pruning above was done with. Carried so that a report of
+    /// what was forgotten can state the rule that forgot it, rather than a bare count.
+    pub retention: Duration,
+}
+
+impl Remembered {
+    /// The state of a run that remembered nothing and stored nothing.
+    pub fn none() -> Self {
+        Remembered {
+            memory: Memory::empty(),
+            unusable: None,
+            persisted: Ok(()),
+            forgotten: Vec::new(),
+            retention: crate::memory::DEFAULT_FORGET,
+        }
+    }
+}
+
 /// Everything observed in one collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
+    /// The instant this collection was taken as of — the `now` it was given.
+    ///
+    /// Recorded because a snapshot now carries figures of two different ages: those read
+    /// during this collection, and those an earlier run read. Without the instant the
+    /// collection belongs to, the age of a remembered figure is not computable from the
+    /// snapshot, and something downstream would have to reach for a clock of its own and get
+    /// a slightly different answer.
+    pub taken_at: SystemTime,
     pub sessions: Vec<Session>,
     /// Every workspace that was located, whatever its state.
     ///
@@ -95,6 +153,8 @@ pub struct Snapshot {
     /// at-risk workspaces presented as exhaustive is the calm, plausible, wrong answer this
     /// project exists to remove.
     pub sweep_complete: bool,
+    /// What earlier runs contributed to this one, and whether this one was stored.
+    pub remembered: Remembered,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -432,6 +492,8 @@ fn transcript_derived_sessions(
                     identity,
                     cli: "claude".to_string(),
                     resources: Err(ResourcesUnavailable::ProcessExited),
+                    // Filled in below, once for every session, from what earlier runs read.
+                    last_reading: None,
                     workspace,
                     liveness,
                 });
@@ -491,6 +553,8 @@ fn transcript_derived_sessions(
                     identity,
                     cli: "codex".to_string(),
                     resources: Err(ResourcesUnavailable::ProcessExited),
+                    // Filled in below, once for every session, from what earlier runs read.
+                    last_reading: None,
                     workspace,
                     liveness,
                 });
@@ -519,6 +583,17 @@ pub fn collect(
             observer_pid: observation.observer_pid,
         });
     }
+
+    // What earlier runs left behind. Read before anything is concluded, because the
+    // remembered workspaces are part of what this run has to check — a workspace whose
+    // session exited days ago is invisible to every observational source below, and is
+    // exactly the case that loses work.
+    let (previous, unusable) = match world.read_state() {
+        StateRead::Found(text) => memory::parse(&text),
+        // Nothing stored yet. An answer, not a degradation: a first run has no history.
+        StateRead::Absent => (Memory::empty(), None),
+        StateRead::Unreadable(why) => (Memory::empty(), Some(Degraded::Unreadable(why))),
+    };
 
     let detectors = embedded_detectors();
 
@@ -562,6 +637,8 @@ pub fn collect(
                 identity: identity.clone(),
                 cli: detector.id.clone(),
                 resources: world.resources(record.pid),
+                // Filled in below, once for every session, from what earlier runs read.
+                last_reading: None,
                 workspace,
                 liveness,
             })
@@ -583,6 +660,24 @@ pub fn collect(
 
     let mut sessions = process_sessions;
     sessions.extend(transcript_sessions);
+
+    // Give any session whose ledger could not be read now the last one that WAS read.
+    //
+    // Done here, in one pass over the assembled list, rather than at each of the three places
+    // a `Session` is built: the invariant is that a remembered figure never shadows a live
+    // one, and an invariant enforced in three places is an invariant that will eventually
+    // hold in two.
+    for session in &mut sessions {
+        if session.resources.is_ok() {
+            continue;
+        }
+        // Copied out before the assignment because the identity borrows the session.
+        let identity = memory::identity_of(session)
+            .map(|(cli, recorded)| (cli.to_string(), recorded.to_string()));
+        if let Some((cli, recorded_as)) = identity {
+            session.last_reading = previous.reading_for(&cli, &recorded_as).cloned();
+        }
+    }
 
     // Sort by identity for stable output: processes by pid, transcripts by recorded_as.
     sessions.sort_by(|a, b| match (&a.identity, &b.identity) {
@@ -680,6 +775,20 @@ pub fn collect(
     let sweep = world.sweep_for_repositories(&sweep_roots);
     candidate_paths.extend(sweep.repositories.iter().map(|(path, _)| path.clone()));
 
+    // Source 6: every workspace an earlier run saw.
+    //
+    // This is the source that makes the safety net durable rather than instantaneous. All
+    // five sources above start from something observable NOW — a process, a transcript, a
+    // directory near a repository someone is working in — and a workspace whose session
+    // exited and whose neighbourhood nobody is working in satisfies none of them. That
+    // workspace is not a corner case; it is the one that loses work.
+    //
+    // Added AFTER the sweep roots are derived, deliberately: a remembered workspace has to be
+    // re-checked, but it does not need to drag its whole neighbourhood into the sweep every
+    // run. Its spelling is added last so a freshly observed spelling of the same path wins
+    // the case-insensitive deduplication below.
+    candidate_paths.extend(previous.workspaces.iter().map(|w| w.path.clone()));
+
     // Deduplicate candidates by path, **case-insensitively**, because APFS is
     // case-insensitive but case-preserving and the same workspace arrives spelled
     // differently from different sources. Keep the first spelling seen.
@@ -736,47 +845,70 @@ pub fn collect(
     // This rests on a live process rather than on the liveness verdict, because process
     // residence is directly observed, whereas a WAITING verdict is inferred from silence,
     // so a DIRTY-DRIVEN classification never depends on a guess.
-    let workspaces: Vec<WorkspaceReport> = unique_workspace_candidates
+    let mut workspaces: Vec<WorkspaceReport> = Vec::new();
+    // What each workspace contributes to memory, gathered in the same pass that classifies it
+    // so that the state a workspace is reported in and the state it is remembered in cannot
+    // be two different answers.
+    let mut sightings: Vec<Sighting> = Vec::new();
+
+    for ((path, linked_from_root), facts) in unique_workspace_candidates
         .iter()
         .zip(vcs_facts_results.iter())
-        .map(|((path, linked_from_root), facts)| {
-            let session_driving = sessions.iter().any(|session| {
-                matches!(&session.identity, Identity::Process { .. })
-                    && session
-                        .workspace
-                        .as_ref()
-                        .ok()
-                        .map(|w| is_inside(&w.path, path))
-                        .unwrap_or(false)
-            });
+    {
+        let session_driving = sessions.iter().any(|session| {
+            matches!(&session.identity, Identity::Process { .. })
+                && session
+                    .workspace
+                    .as_ref()
+                    .ok()
+                    .map(|w| is_inside(&w.path, path))
+                    .unwrap_or(false)
+        });
 
-            let state = crate::vcs::classify(facts, session_driving);
+        let state = crate::vcs::classify(facts, session_driving);
+        sightings.push(Sighting::of(path.clone(), &state, session_driving));
 
-            // `linked_worktree` from the facts when they are `Ok`, otherwise from whatever
-            // `repository_root` reported for that candidate, otherwise `false`.
-            let linked_worktree = facts
-                .as_ref()
-                .map(|f| f.linked_worktree)
-                .unwrap_or(*linked_from_root);
+        // `linked_worktree` from the facts when they are `Ok`, otherwise from whatever
+        // `repository_root` reported for that candidate, otherwise `false`.
+        let linked_worktree = facts
+            .as_ref()
+            .map(|f| f.linked_worktree)
+            .unwrap_or(*linked_from_root);
 
-            // `uncommitted_entries` as `Some(n)` only when the facts are `Ok` — it must be
-            // `None` whenever `state` is `Unknown`, and never `Some(0)` standing in for
-            // "could not tell".
-            let uncommitted_entries = facts.as_ref().ok().map(|f| f.uncommitted_entries);
+        // `uncommitted_entries` as `Some(n)` only when the facts are `Ok` — it must be
+        // `None` whenever `state` is `Unknown`, and never `Some(0)` standing in for
+        // "could not tell".
+        let uncommitted_entries = facts.as_ref().ok().map(|f| f.uncommitted_entries);
 
-            WorkspaceReport {
-                path: path.clone(),
-                state,
-                linked_worktree,
-                uncommitted_entries,
-            }
-        })
-        .collect();
+        workspaces.push(WorkspaceReport {
+            path: path.clone(),
+            state,
+            linked_worktree,
+            uncommitted_entries,
+        });
+    }
+
+    // --- What this run hands to the next ---
+    //
+    // Last, because it folds in everything above: the workspaces as classified, and the
+    // sessions as read. `previous` is consumed here, so nothing after this point can still be
+    // reasoning from the old state.
+    let memory = memory::remember(previous, &sightings, &sessions, now);
+    let (memory, forgotten) = memory::forget(memory, now, thresholds.forget);
+    let persisted = world.write_state(&memory::serialise(&memory));
 
     Ok(Snapshot {
+        taken_at: now,
         sessions,
         workspaces,
         unlocated,
         sweep_complete: sweep.complete,
+        remembered: Remembered {
+            memory,
+            unusable,
+            persisted,
+            forgotten,
+            retention: thresholds.forget,
+        },
     })
 }

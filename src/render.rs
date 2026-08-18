@@ -39,8 +39,23 @@ const FLOOR_CAVEAT: &str =
 const INFERENCE_MARKER_CAVEAT: &str =
     "A state marked ? was inferred from silence, not observed directly.";
 
+/// What the marker on a figure means.
+///
+/// Almost all of an agent's cost is in its children, and only the process that reaped them
+/// can report that total — so once it exits, the figure exists nowhere on the machine except
+/// in what an earlier run wrote down. Showing it is the point of remembering it. Showing it
+/// without saying when it was taken would make a remembered total indistinguishable from a
+/// live one, which is the same defect in the opposite direction.
+const STALE_MARKER_CAVEAT: &str =
+    "A figure marked * is the last reading taken before that session's process exited, not a \
+     current one.";
+
 /// The fixed columns, in order. Each width holds that column's widest value *or* the
 /// longest reason for a value's absence, since a reason is printed in the value's place.
+/// The byte columns are NINE rather than eight because `999.9 GB` is already eight and a
+/// remembered figure carries a trailing `*`. Left at eight, ratatui would cut the marker off
+/// the widest values — silently, and precisely on the rows where the figure is a memory
+/// rather than a measurement.
 const FIXED_COLUMNS: [(&str, u16); 8] = [
     ("PID", 6),
     ("CLI", 6),
@@ -50,9 +65,9 @@ const FIXED_COLUMNS: [(&str, u16); 8] = [
     ("STATE", 8),
     ("OWN CPU", 9),
     ("CHILD CPU", 9),
-    ("MEM", 8),
-    ("PEAK", 8),
-    ("WRITTEN", 8),
+    ("MEM", 9),
+    ("PEAK", 9),
+    ("WRITTEN", 9),
 ];
 
 /// The last column, which absorbs whatever width is left over.
@@ -133,7 +148,105 @@ fn footer_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
     {
         lines.extend(wrap_words(INFERENCE_MARKER_CAVEAT, width));
     }
+
+    // The remembered-figure caveat, and each remembered figure's age. The age is per row
+    // rather than a single sentence because two sessions' last readings can be hours apart,
+    // and "how old is this number" is the only question a reader can have about it.
+    let stale: Vec<&Session> = snapshot
+        .sessions
+        .iter()
+        .filter(|session| session.last_reading.is_some())
+        .collect();
+    if !stale.is_empty() {
+        lines.extend(wrap_words(STALE_MARKER_CAVEAT, width));
+        for session in stale {
+            let reading = session
+                .last_reading
+                .as_ref()
+                .expect("filtered to sessions that have one");
+            let age = snapshot
+                .taken_at
+                .duration_since(reading.taken_at)
+                .map(|age| format!("{} ago", format_age(age)))
+                // A reading stamped in the future means the clock moved backwards between
+                // runs. Say that rather than print a negative age or silently show "0s ago",
+                // which would present the oldest possible figure as the freshest.
+                .unwrap_or_else(|_| "at an unknown time — the clock moved backwards".to_string());
+            lines.extend(wrap_words(
+                &format!("  * {}: last read {}", identify(session), age),
+                width,
+            ));
+        }
+    }
+
+    lines.extend(memory_lines(snapshot, width));
     lines
+}
+
+/// What a row is called when it has to be named in prose rather than pointed at.
+///
+/// The PID column reads `gone` for every transcript-derived session, so a pid alone does not
+/// identify those rows. The transcript identity does, and it is the same string the row shows
+/// in its workspace column.
+fn identify(session: &Session) -> String {
+    match &session.identity {
+        Identity::Process { pid } => format!("{} {}", pid, session.cli),
+        Identity::Transcript { recorded_as } => format!("{} {}", recorded_as, session.cli),
+    }
+}
+
+/// What has to be said about the state carried between runs.
+///
+/// Says nothing when the state was read and stored, which is the ordinary case. Every line
+/// here reports something that changes how the rest of the output should be read: a lost
+/// history makes the at-risk list shorter than it should be, and a failed store makes the
+/// NEXT run's list shorter than it should be.
+fn memory_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
+    let mut lines = Vec::new();
+    let remembered = &snapshot.remembered;
+
+    if let Some(unusable) = &remembered.unusable {
+        lines.extend(wrap_words(
+            &format!(
+                "WARNING: {unusable} — this run started with no history, so a workspace whose \
+                 session has already exited may be missing from the list above.",
+            ),
+            width,
+        ));
+    }
+
+    if let Err(why) = &remembered.persisted {
+        lines.extend(wrap_words(
+            &format!("WARNING: {why} — the next run will start with no history."),
+            width,
+        ));
+    }
+
+    if !remembered.forgotten.is_empty() {
+        lines.extend(wrap_words(
+            &format!(
+                "Stopped watching {} workspace(s) that had been clean and quiet for over {}.",
+                remembered.forgotten.len(),
+                format_age(remembered.retention),
+            ),
+            width,
+        ));
+    }
+
+    lines
+}
+
+/// A duration at the coarsest precision that still says something: days for the retention
+/// period, hours and minutes for a reading's age, seconds only while it is still small.
+fn format_age(age: Duration) -> String {
+    let seconds = age.as_secs();
+    match seconds {
+        s if s >= 172_800 => format!("{} days", s / 86_400),
+        s if s >= 86_400 => "1 day".to_string(),
+        s if s >= 3_600 => format!("{}h{:02}m", s / 3_600, (s % 3_600) / 60),
+        s if s >= 60 => format!("{}m{:02}s", s / 60, s % 60),
+        s => format!("{s}s"),
+    }
 }
 
 /// Build the at-risk workspace panel's content: rows and summary.
@@ -450,11 +563,15 @@ fn state_cell(verdict: &crate::liveness::Verdict) -> String {
 /// One session's row: its identity, its ledger or the reason it has none, then where it
 /// is working or the reason that is unknown.
 fn row_for(session: &Session, workspace_width: u16) -> Row<'static> {
-    let figures = match &session.resources {
-        Ok(resources) => figures_of(resources),
-        // Nothing was read. Every figure carries the same reason rather than the row
-        // being dropped or shown as idle — the session is running either way.
-        Err(reason) => [
+    let figures = match (&session.resources, &session.last_reading) {
+        (Ok(resources), _) => figures_of(resources),
+        // Nothing was read now, but something was read before the process went. Show that,
+        // marked: the total is the point of having remembered it, and almost all of an
+        // agent's cost is a figure only its own process could ever have reported.
+        (Err(_), Some(reading)) => remembered_figures_of(&reading.resources),
+        // Nothing was read and nothing is remembered. Every figure carries the same reason
+        // rather than the row being dropped or shown as idle — the session existed either way.
+        (Err(reason), None) => [
             reason.to_string(),
             reason.to_string(),
             reason.to_string(),
@@ -518,10 +635,33 @@ fn figures_of(resources: &Resources) -> [String; 5] {
     ]
 }
 
+/// The same figures, marked as remembered rather than current.
+fn remembered_figures_of(resources: &Resources) -> [String; 5] {
+    [
+        mark(resources.own_cpu.as_ref().map(format_cpu)),
+        mark(resources.children_cpu.as_ref().map(format_cpu)),
+        mark(resources.current_memory.as_ref().map(format_bytes)),
+        mark(resources.peak_memory.as_ref().map(format_bytes)),
+        mark(resources.bytes_written.as_ref().map(format_bytes)),
+    ]
+}
+
 /// A figure, or the reason it is missing. Never a zero standing in for either.
 fn show<E: std::fmt::Display>(figure: Result<String, E>) -> String {
     match figure {
         Ok(text) => text,
+        Err(reason) => reason.to_string(),
+    }
+}
+
+/// A remembered figure, marked, or the reason it is missing — unmarked.
+///
+/// Only a value gets the marker. A reason the reading could not supply in the first place —
+/// `ps-blind`, say — did not become stale by being remembered: it was that reason when it was
+/// read and it is that reason still, and marking it would imply a number had gone off.
+fn mark<E: std::fmt::Display>(figure: Result<String, E>) -> String {
+    match figure {
+        Ok(text) => format!("{text}*"),
         Err(reason) => reason.to_string(),
     }
 }

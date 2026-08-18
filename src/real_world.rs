@@ -11,7 +11,7 @@ use crate::isotime::unix_seconds_from_iso8601;
 use crate::machtime::{MachTicks, MachTimebase};
 use crate::world::{
     CodexSession, PathUnavailable, ProcessRecord, ProcessSnapshot, ResourceSource, Resources,
-    ResourcesUnavailable, Unmeasured, World, WorldError,
+    ResourcesUnavailable, StateRead, Unmeasured, World, WorldError,
 };
 
 /// How far below a sweep root the descent goes.
@@ -27,11 +27,49 @@ const SWEEP_MAX_DEPTH: usize = 4;
 /// silently stop exercising the bound the day the bound changed.
 pub const SWEEP_BUDGET: usize = 4096;
 
+/// The environment variable that relocates the state file.
+///
+/// Its main job is to let a test drive the real read-and-write path against a temporary
+/// directory. A test that had to write to the developer's own `~/.acmon/state.json` would
+/// either destroy real history or be skipped, and a skipped test of an atomic write is how
+/// a non-atomic write ships.
+pub const STATE_VARIABLE: &str = "ACMON_STATE";
+
+/// Where the state carried between runs is kept.
+///
+/// `~/.acmon/state.json`, alongside the `~/.claude` and `~/.codex` directories the agents
+/// themselves use — findable and deletable by hand, which matters for a file whose contents
+/// change what the tool reports.
+fn state_path() -> Result<std::path::PathBuf, String> {
+    if let Ok(explicit) = std::env::var(STATE_VARIABLE) {
+        if !explicit.trim().is_empty() {
+            return Ok(std::path::PathBuf::from(explicit));
+        }
+    }
+    let home = std::env::var("HOME").map_err(|e| {
+        format!(
+            "HOME is not readable, so {STATE_VARIABLE} \
+             must name the state file explicitly: {e}"
+        )
+    })?;
+    Ok(std::path::Path::new(&home)
+        .join(".acmon")
+        .join("state.json"))
+}
+
 pub struct RealWorld {
     observer_pid: i32,
     /// Read once from this machine, never assumed. Every duration in the kernel's
     /// ledger is a tick count that means nothing without it.
     timebase: MachTimebase,
+    /// Where the state carried between runs is kept, or why that could not be worked out.
+    ///
+    /// Resolved once, at construction, rather than each time it is used. A path that is a
+    /// *field* is a path a test can point somewhere harmless — where one read from the
+    /// environment at the point of use would have made every test that collects write to the
+    /// developer's own `~/.acmon/state.json`, and a test suite that quietly overwrites the
+    /// history the tool depends on is worse than one that skips the case.
+    state_file: Result<std::path::PathBuf, String>,
 }
 
 impl RealWorld {
@@ -40,6 +78,15 @@ impl RealWorld {
         RealWorld {
             observer_pid: std::process::id() as i32,
             timebase: read_timebase(),
+            state_file: state_path(),
+        }
+    }
+
+    /// The same world, keeping its state in a named file instead of the usual one.
+    pub fn with_state_file(path: impl Into<std::path::PathBuf>) -> Self {
+        RealWorld {
+            state_file: Ok(path.into()),
+            ..RealWorld::new()
         }
     }
 }
@@ -986,6 +1033,62 @@ impl World for RealWorld {
         });
 
         results
+    }
+
+    fn read_state(&self) -> StateRead {
+        let path = match &self.state_file {
+            Ok(path) => path,
+            Err(why) => return StateRead::Unreadable(why.clone()),
+        };
+
+        match std::fs::read_to_string(path) {
+            Ok(contents) => StateRead::Found(contents),
+            // Both of these mean nothing has been stored yet: no file, and no `~/.acmon`
+            // for one to be in. Neither is a failure, and reporting them as one would put a
+            // warning on every first run.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => StateRead::Absent,
+            Err(error) => StateRead::Unreadable(format!("{}: {error}", path.display())),
+        }
+    }
+
+    fn write_state(&self, contents: &str) -> Result<(), String> {
+        use std::io::Write;
+
+        let path = self.state_file.as_ref().map_err(String::clone)?;
+        let directory = path
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+        std::fs::create_dir_all(directory)
+            .map_err(|e| format!("could not create {}: {e}", directory.display()))?;
+
+        // Write beside the target, then rename over it. `rename(2)` within one directory is
+        // atomic, so a concurrently reading acmon — and leaving one open while working is the
+        // whole point of the tool — sees either the previous state entire or this one entire.
+        // Writing in place would let it read a truncated file, and a truncated state file
+        // does not fail to parse: it parses as FEWER remembered workspaces, which is a
+        // shorter at-risk list that reads as a safer machine.
+        //
+        // The temporary name carries this process's pid so that two acmon runs writing at the
+        // same moment do not each half-fill one temporary file and then rename the result.
+        let temporary = path.with_extension(format!("new.{}", std::process::id()));
+
+        let write = || -> Result<(), std::io::Error> {
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(contents.as_bytes())?;
+            // Before the rename, not after: the rename is what publishes the file, and
+            // publishing a name that points at unflushed data is the failure this ordering
+            // exists to prevent.
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)
+        };
+
+        write().map_err(|error| {
+            // A failed attempt must not leave the temporary behind to accumulate one file
+            // per run. Its own failure is not reported: the write error is the one that
+            // matters, and a cleanup error stacked on top of it would bury the cause.
+            let _ = std::fs::remove_file(&temporary);
+            format!("could not store state in {}: {error}", path.display())
+        })
     }
 }
 

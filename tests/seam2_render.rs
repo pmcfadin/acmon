@@ -1,17 +1,30 @@
 //! Seam 2 — rendering a snapshot, with no real terminal involved.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use acmon::liveness::{Method, State, Verdict};
 use acmon::render::{minimum_width, render_to_lines, required_height};
 use acmon::vcs::{Unreadable, WorkspaceState};
 use acmon::workspace::{NamespaceResolution, Workspace, WorkspaceUnknown};
 use acmon::world::{ResourceSource, Resources, ResourcesUnavailable, Unmeasured};
-use acmon::{Identity, Session, Snapshot, WorkspaceReport};
+use acmon::{Identity, Remembered, Session, Snapshot, WorkspaceReport};
 
 /// A width that fits the whole table with room to spare. The narrow cases have their
 /// own tests.
-const WIDE: u16 = 120;
+///
+/// Derived from the minimum rather than stated, because a fixed number here turns silently
+/// into a truncation test the day a column changes width — which is exactly what it did.
+fn wide() -> u16 {
+    minimum_width() + 32
+}
+
+/// The instant every snapshot here is taken as of.
+///
+/// A fixed one rather than `SystemTime::now()`, so that a test about the age of a remembered
+/// figure states both ends of the subtraction and cannot drift.
+fn fixture_now() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_987_902)
+}
 
 /// A workspace that exists, recorded under the namespace it really has on disk.
 fn measured_workspace() -> Result<Workspace, WorkspaceUnknown> {
@@ -47,6 +60,8 @@ fn snapshot_of(pids: &[i32]) -> Snapshot {
         workspaces: Vec::new(),
         unlocated: Vec::new(),
         sweep_complete: true,
+        taken_at: fixture_now(),
+        remembered: Remembered::none(),
         sessions: pids
             .iter()
             .map(|&pid| Session {
@@ -54,6 +69,7 @@ fn snapshot_of(pids: &[i32]) -> Snapshot {
                 cli: "claude".to_string(),
                 resources: Ok(measured_ledger()),
                 workspace: measured_workspace(),
+                last_reading: None,
                 liveness: active_verdict(),
             })
             .collect(),
@@ -65,11 +81,14 @@ fn snapshot_with(reading: Result<Resources, ResourcesUnavailable>) -> Snapshot {
         workspaces: Vec::new(),
         unlocated: Vec::new(),
         sweep_complete: true,
+        taken_at: fixture_now(),
+        remembered: Remembered::none(),
         sessions: vec![Session {
             identity: Identity::Process { pid: 264 },
             cli: "claude".to_string(),
             resources: reading,
             workspace: measured_workspace(),
+            last_reading: None,
             liveness: active_verdict(),
         }],
     }
@@ -80,11 +99,14 @@ fn snapshot_in(workspace: Result<Workspace, WorkspaceUnknown>) -> Snapshot {
         workspaces: Vec::new(),
         unlocated: Vec::new(),
         sweep_complete: true,
+        taken_at: fixture_now(),
+        remembered: Remembered::none(),
         sessions: vec![Session {
             identity: Identity::Process { pid: 264 },
             cli: "claude".to_string(),
             resources: Ok(measured_ledger()),
             workspace,
+            last_reading: None,
             liveness: active_verdict(),
         }],
     }
@@ -98,7 +120,7 @@ fn rendered(snapshot: &Snapshot, width: u16) -> String {
 fn renders_one_row_per_session() {
     let snapshot = snapshot_of(&[264, 2880, 5333]);
 
-    let text = rendered(&snapshot, WIDE);
+    let text = rendered(&snapshot, wide());
 
     for pid in [264, 2880, 5333] {
         assert!(
@@ -116,7 +138,7 @@ fn renders_one_row_per_session() {
 fn states_the_session_count_so_zero_is_explicit() {
     // "No sessions" must read as a measured result, not as a blank screen that might
     // equally mean the tool is broken.
-    let text = rendered(&snapshot_of(&[]), WIDE);
+    let text = rendered(&snapshot_of(&[]), wide());
 
     assert!(
         text.contains('0'),
@@ -130,7 +152,7 @@ fn a_row_separates_the_sessions_own_cpu_from_its_childrens() {
     // process and 32,317 s in the processes it launched. A monitor showing one number
     // reports about five per cent of the truth, so both must be present and distinct.
     // Expected renderings worked out by hand: 1,669 s = 27 m 49 s; 32,317 s = 8 h 58 m.
-    let text = rendered(&snapshot_of(&[69046]), WIDE);
+    let text = rendered(&snapshot_of(&[69046]), wide());
 
     assert!(
         text.contains("27m49s"),
@@ -144,7 +166,7 @@ fn a_row_separates_the_sessions_own_cpu_from_its_childrens() {
 
 #[test]
 fn a_row_shows_memory_now_memory_at_peak_and_bytes_written() {
-    let text = rendered(&snapshot_of(&[69046]), WIDE);
+    let text = rendered(&snapshot_of(&[69046]), wide());
 
     for expected in ["482 MB", "622 MB", "166 MB"] {
         assert!(
@@ -159,7 +181,7 @@ fn states_that_child_totals_are_floors_because_detached_work_escapes() {
     // Verified in the mechanics document §2.4: a double-forked child's CPU never
     // reaches its parent's ledger. Every child total printed here is therefore a lower
     // bound, and output that does not say so invites being read as complete.
-    let text = rendered(&snapshot_of(&[69046]), WIDE);
+    let text = rendered(&snapshot_of(&[69046]), wide());
 
     assert!(
         text.contains("floor"),
@@ -194,7 +216,7 @@ fn the_floor_caveat_stays_whole_at_the_narrowest_width_that_renders() {
 
 #[test]
 fn a_row_names_the_directory_the_session_is_working_in() {
-    let text = rendered(&snapshot_of(&[69046]), WIDE);
+    let text = rendered(&snapshot_of(&[69046]), wide());
 
     assert!(
         text.contains("/Users/pmcfadin/projects/agentic_coding_monitor"),
@@ -236,7 +258,10 @@ fn a_path_too_long_for_its_column_is_cut_from_the_left_and_marked() {
 #[test]
 fn a_session_whose_workspace_is_unknown_says_so_with_a_reason() {
     // Never blank, and never a guess. A blank column would read as the root directory.
-    let text = rendered(&snapshot_in(Err(WorkspaceUnknown::PermissionDenied)), WIDE);
+    let text = rendered(
+        &snapshot_in(Err(WorkspaceUnknown::PermissionDenied)),
+        wide(),
+    );
 
     assert!(
         text.contains("unknown"),
@@ -261,7 +286,7 @@ fn a_figure_the_coarser_reader_cannot_see_shows_its_reason_not_a_zero() {
             peak_memory: Err(Unmeasured::NotReportedBy(ResourceSource::Ps)),
             bytes_written: Err(Unmeasured::NotReportedBy(ResourceSource::Ps)),
         })),
-        WIDE,
+        wide(),
     );
 
     assert!(
@@ -284,7 +309,7 @@ fn a_session_whose_ledger_could_not_be_read_at_all_is_still_a_row() {
     // running session as absent, which is the same failure as reporting zero.
     let text = rendered(
         &snapshot_with(Err(ResourcesUnavailable::ProcessExited)),
-        WIDE,
+        wide(),
     );
 
     assert!(
@@ -321,11 +346,14 @@ fn snapshot_in_state(verdict: Verdict) -> Snapshot {
         workspaces: Vec::new(),
         unlocated: Vec::new(),
         sweep_complete: true,
+        taken_at: fixture_now(),
+        remembered: Remembered::none(),
         sessions: vec![Session {
             identity: Identity::Process { pid: 264 },
             cli: "claude".to_string(),
             resources: Ok(measured_ledger()),
             workspace: measured_workspace(),
+            last_reading: None,
             liveness: verdict,
         }],
     }
@@ -356,7 +384,7 @@ fn a_row_names_the_sessions_state() {
             "UNKNOWN",
         ),
     ] {
-        let text = rendered(&snapshot_in_state(verdict), WIDE);
+        let text = rendered(&snapshot_in_state(verdict), wide());
         assert!(
             text.contains(expected),
             "expected state {expected} in the row; got:\n{text}"
@@ -373,14 +401,14 @@ fn an_inferred_state_is_marked_and_an_observed_one_is_not() {
             state: State::Waiting,
             method: Method::ProcessResidentButSilent,
         }),
-        WIDE,
+        wide(),
     );
     let observed = rendered(
         &snapshot_in_state(Verdict {
             state: State::Active,
             method: Method::TranscriptChangedRecently,
         }),
-        WIDE,
+        wide(),
     );
 
     assert!(
@@ -401,14 +429,14 @@ fn the_marker_is_explained_only_when_something_was_actually_inferred() {
             state: State::Waiting,
             method: Method::ProcessResidentButSilent,
         }),
-        WIDE,
+        wide(),
     );
     let without = rendered(
         &snapshot_in_state(Verdict {
             state: State::Active,
             method: Method::TranscriptChangedRecently,
         }),
-        WIDE,
+        wide(),
     );
 
     assert!(
@@ -449,6 +477,8 @@ fn a_transcript_derived_row_shows_gone_not_a_number() {
             workspaces: Vec::new(),
             unlocated: Vec::new(),
             sweep_complete: true,
+            taken_at: fixture_now(),
+            remembered: Remembered::none(),
             sessions: vec![Session {
                 identity: Identity::Transcript {
                     recorded_as: "-Users-pmcfadin-projects-agentic-coding-monitor".to_string(),
@@ -456,13 +486,14 @@ fn a_transcript_derived_row_shows_gone_not_a_number() {
                 cli: "claude".to_string(),
                 resources: Err(ResourcesUnavailable::ProcessExited),
                 workspace: Err(WorkspaceUnknown::WorkspaceGone),
+                last_reading: None,
                 liveness: Verdict {
                     state: State::Stalled,
                     method: Method::NoProcessAndSilencePastStall,
                 },
             }],
         },
-        WIDE,
+        wide(),
     );
 
     assert!(
@@ -498,6 +529,8 @@ fn a_transcript_derived_claude_row_shows_its_namespace_in_the_workspace_column()
             workspaces: Vec::new(),
             unlocated: Vec::new(),
             sweep_complete: true,
+            taken_at: fixture_now(),
+            remembered: Remembered::none(),
             sessions: vec![Session {
                 identity: Identity::Transcript {
                     recorded_as: namespace.to_string(),
@@ -505,13 +538,14 @@ fn a_transcript_derived_claude_row_shows_its_namespace_in_the_workspace_column()
                 cli: "claude".to_string(),
                 resources: Err(ResourcesUnavailable::ProcessExited),
                 workspace: Err(WorkspaceUnknown::WorkspaceGone),
+                last_reading: None,
                 liveness: Verdict {
                     state: State::Stalled,
                     method: Method::NoProcessAndSilencePastStall,
                 },
             }],
         },
-        WIDE,
+        wide(),
     );
 
     assert!(
@@ -541,8 +575,10 @@ fn at_risk_panel_lists_a_stranded_workspace() {
             }],
             unlocated: Vec::new(),
             sweep_complete: true,
+            taken_at: fixture_now(),
+            remembered: Remembered::none(),
         },
-        WIDE,
+        wide(),
     );
 
     assert!(
@@ -573,8 +609,10 @@ fn at_risk_panel_is_present_when_nothing_is_at_risk() {
             }],
             unlocated: Vec::new(),
             sweep_complete: true,
+            taken_at: fixture_now(),
+            remembered: Remembered::none(),
         },
-        WIDE,
+        wide(),
     );
 
     // Panel border and title must be present
@@ -615,8 +653,10 @@ fn dirty_driven_and_dirty_stranded_are_distinguishable() {
             ],
             unlocated: Vec::new(),
             sweep_complete: true,
+            taken_at: fixture_now(),
+            remembered: Remembered::none(),
         },
-        WIDE,
+        wide(),
     );
 
     assert!(
@@ -650,8 +690,10 @@ fn unknown_workspace_is_listed_and_does_not_show_zero() {
             }],
             unlocated: Vec::new(),
             sweep_complete: true,
+            taken_at: fixture_now(),
+            remembered: Remembered::none(),
         },
-        WIDE,
+        wide(),
     );
 
     assert!(
@@ -690,8 +732,10 @@ fn linked_worktree_shows_worktree_attribute() {
             }],
             unlocated: Vec::new(),
             sweep_complete: true,
+            taken_at: fixture_now(),
+            remembered: Remembered::none(),
         },
-        WIDE,
+        wide(),
     );
 
     assert!(
@@ -708,8 +752,10 @@ fn sweep_incomplete_produces_partial_coverage_warning() {
             workspaces: Vec::new(),
             unlocated: Vec::new(),
             sweep_complete: false,
+            taken_at: fixture_now(),
+            remembered: Remembered::none(),
         },
-        WIDE,
+        wide(),
     );
 
     let without_warning = rendered(
@@ -718,8 +764,10 @@ fn sweep_incomplete_produces_partial_coverage_warning() {
             workspaces: Vec::new(),
             unlocated: Vec::new(),
             sweep_complete: true,
+            taken_at: fixture_now(),
+            remembered: Remembered::none(),
         },
-        WIDE,
+        wide(),
     );
 
     assert!(
@@ -757,8 +805,10 @@ fn unlocated_namespaces_are_counted_and_distinguished() {
                 ),
             ],
             sweep_complete: true,
+            taken_at: fixture_now(),
+            remembered: Remembered::none(),
         },
-        WIDE,
+        wide(),
     );
 
     // Must report all three categories
@@ -804,8 +854,10 @@ fn stranded_workspaces_are_ordered_by_count_descending() {
             ],
             unlocated: Vec::new(),
             sweep_complete: true,
+            taken_at: fixture_now(),
+            remembered: Remembered::none(),
         },
-        WIDE,
+        wide(),
     );
 
     // Find the positions of the three workspaces in the output
@@ -833,6 +885,7 @@ fn panel_does_not_clip_existing_caveat() {
                 cli: "claude".to_string(),
                 resources: Ok(measured_ledger()),
                 workspace: measured_workspace(),
+                last_reading: None,
                 liveness: active_verdict(),
             }],
             workspaces: vec![WorkspaceReport {
@@ -843,8 +896,10 @@ fn panel_does_not_clip_existing_caveat() {
             }],
             unlocated: Vec::new(),
             sweep_complete: true,
+            taken_at: fixture_now(),
+            remembered: Remembered::none(),
         },
-        WIDE,
+        wide(),
     );
 
     // The existing floor caveat must still be fully present
@@ -876,8 +931,10 @@ fn finding_no_workspaces_at_all_does_not_read_as_checked_and_clear() {
             workspaces: Vec::new(),
             unlocated: Vec::new(),
             sweep_complete: true,
+            taken_at: fixture_now(),
+            remembered: Remembered::none(),
         },
-        WIDE,
+        wide(),
     );
 
     assert!(
@@ -893,5 +950,206 @@ fn finding_no_workspaces_at_all_does_not_read_as_checked_and_clear() {
         !text.contains("No workspaces at risk"),
         "an empty candidate set must not report the absence of risk, which it cannot know; \
          got:\n{text}"
+    );
+}
+
+// --- Remembered figures and the state carried between runs (ticket #8) ---
+
+/// A session whose process is gone, carrying the last reading taken before it went.
+fn a_session_with_a_remembered_ledger(taken_at: SystemTime) -> Session {
+    Session {
+        identity: Identity::Transcript {
+            recorded_as: "-Users-pmcfadin-projects-agentic-coding-monitor".to_string(),
+        },
+        cli: "claude".to_string(),
+        resources: Err(ResourcesUnavailable::ProcessExited),
+        last_reading: Some(acmon::memory::Reading {
+            resources: measured_ledger(),
+            taken_at,
+        }),
+        workspace: measured_workspace(),
+        liveness: Verdict {
+            state: State::Stalled,
+            method: Method::NoProcessAndSilencePastStall,
+        },
+    }
+}
+
+fn snapshot_of_sessions(sessions: Vec<Session>) -> Snapshot {
+    Snapshot {
+        taken_at: fixture_now(),
+        sessions,
+        workspaces: Vec::new(),
+        unlocated: Vec::new(),
+        sweep_complete: true,
+        remembered: Remembered::none(),
+    }
+}
+
+#[test]
+fn a_remembered_ledger_is_shown_rather_than_lost_with_the_process() {
+    // The figures are the whole reason for remembering: 32,317 s of child CPU exists nowhere
+    // on the machine once the process that reaped it is gone.
+    let text = rendered(
+        &snapshot_of_sessions(vec![a_session_with_a_remembered_ledger(
+            fixture_now() - Duration::from_secs(3 * 3600 + 12 * 60),
+        )]),
+        wide(),
+    );
+
+    for expected in ["27m49s", "8h58m", "482 MB", "622 MB", "166 MB"] {
+        assert!(
+            text.contains(expected),
+            "the remembered figure {expected} must still be shown; got:\n{text}"
+        );
+    }
+    assert!(
+        !text.contains("exited     exited"),
+        "and must not be replaced by the reason its process is gone; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_remembered_figure_is_marked_and_its_age_is_stated() {
+    // Without both of these a remembered total reads as a current one, which is the same
+    // class of wrong answer as the figures this project exists to correct — just pointing the
+    // other way.
+    let text = rendered(
+        &snapshot_of_sessions(vec![a_session_with_a_remembered_ledger(
+            fixture_now() - Duration::from_secs(3 * 3600 + 12 * 60),
+        )]),
+        wide(),
+    );
+
+    assert!(
+        text.contains("8h58m*"),
+        "a remembered figure must carry its marker; got:\n{text}"
+    );
+    assert!(
+        text.contains("166 MB*"),
+        "including the byte columns, which is why they are nine wide; got:\n{text}"
+    );
+    assert!(
+        text.contains("3h12m ago"),
+        "the age has to be stated — a marker alone does not say whether the number is three \
+         minutes or three weeks old; got:\n{text}"
+    );
+    assert!(
+        text.contains("-Users-pmcfadin-projects-agentic-coding-monitor"),
+        "and the age must name the row it belongs to; a transcript-derived row's PID column \
+         reads 'gone', so the pid cannot identify it; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_session_with_nothing_remembered_still_states_the_reason_it_has_no_figures() {
+    // The regression guard for the case above: the marker path must not have replaced the
+    // honest admission with a blank or a zero.
+    let mut session = a_session_with_a_remembered_ledger(fixture_now());
+    session.last_reading = None;
+
+    let text = rendered(&snapshot_of_sessions(vec![session]), wide());
+
+    assert!(
+        text.contains("exited"),
+        "with no reading, ever, the reason takes the figure's place; got:\n{text}"
+    );
+    assert!(
+        !text.contains('*'),
+        "and no marker appears, because nothing was remembered; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_lost_history_is_reported_because_it_shortens_the_at_risk_list() {
+    let text = rendered(
+        &Snapshot {
+            remembered: Remembered {
+                unusable: Some(acmon::memory::Degraded::Unparsable(
+                    "EOF while parsing an object at line 4 column 0".to_string(),
+                )),
+                ..Remembered::none()
+            },
+            ..snapshot_of_sessions(Vec::new())
+        },
+        wide(),
+    );
+
+    assert!(
+        text.contains("WARNING"),
+        "a run that lost its history reports a shorter at-risk list than the machine has, \
+         and nothing else in the output would say so; got:\n{text}"
+    );
+    assert!(
+        text.contains("line 4"),
+        "the parser's own words must survive, so the file can be inspected rather than just \
+         deleted; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_failure_to_store_state_is_reported_because_the_next_run_pays_for_it() {
+    let text = rendered(
+        &Snapshot {
+            remembered: Remembered {
+                persisted: Err(
+                    "could not store state in /Users/pmcfadin/.acmon/state.json: \
+                                Read-only file system"
+                        .to_string(),
+                ),
+                ..Remembered::none()
+            },
+            ..snapshot_of_sessions(Vec::new())
+        },
+        wide(),
+    );
+
+    assert!(
+        text.contains("WARNING") && text.contains("next run"),
+        "this run looks perfect and the next one starts blind; only saying so distinguishes \
+         them; got:\n{text}"
+    );
+    assert!(
+        text.contains("Read-only file system"),
+        "with the reason it failed; got:\n{text}"
+    );
+}
+
+#[test]
+fn workspaces_dropped_from_memory_are_accounted_for() {
+    let text = rendered(
+        &Snapshot {
+            remembered: Remembered {
+                forgotten: vec![acmon::memory::Forgotten {
+                    path: "/Users/pmcfadin/projects/finished".to_string(),
+                    settled_for: Duration::from_secs(30 * 86_400),
+                }],
+                retention: Duration::from_secs(7 * 86_400),
+                ..Remembered::none()
+            },
+            ..snapshot_of_sessions(Vec::new())
+        },
+        wide(),
+    );
+
+    assert!(
+        text.contains("Stopped watching 1 workspace"),
+        "pruning is correct, but a safety net that quietly shrinks is indistinguishable from \
+         one that is working; got:\n{text}"
+    );
+    assert!(
+        text.contains("7 days"),
+        "and it must state the rule that dropped it, not just the count; got:\n{text}"
+    );
+}
+
+#[test]
+fn an_ordinary_run_says_nothing_about_its_own_state_file() {
+    // The counterweight. A line on every run trains a reader to ignore the line.
+    let text = rendered(&snapshot_of_sessions(vec![]), wide());
+
+    assert!(
+        !text.contains("WARNING") && !text.contains("Stopped watching"),
+        "a run that read its state and stored it has nothing to report; got:\n{text}"
     );
 }

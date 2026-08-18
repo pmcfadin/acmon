@@ -3,6 +3,8 @@
 //! Everything else in the crate consumes [`World`], so the rest of the codebase is
 //! pure and testable from captured fixtures.
 
+use serde::{Deserialize, Serialize};
+
 /// Why a path belonging to a process could not be read.
 ///
 /// Each variant must be TRUE when reported. A reason that is merely plausible is
@@ -58,7 +60,7 @@ impl ProcessSnapshot {
 ///
 /// The source is part of the reading, not a detail behind it: the two readers do not
 /// measure the same thing, and only one of them can see a process's children at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResourceSource {
     /// `proc_pid_rusage()` — the full ledger, own and children, for processes owned by
     /// the calling user.
@@ -81,7 +83,7 @@ impl std::fmt::Display for ResourceSource {
 /// Why one figure within a reading is missing.
 ///
 /// Rendered in place of the number, so each variant has to be true and has to be short.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Unmeasured {
     /// The reader that answered does not report this figure at all.
     NotReportedBy(ResourceSource),
@@ -106,7 +108,10 @@ impl std::fmt::Display for Unmeasured {
 ///
 /// Each figure is separately present-or-absent because the fallback reader supplies
 /// only some of them. An absent figure carries a reason; none of them defaults to zero.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serialised into the state file so that a session's lifetime totals outlive its process.
+/// The reasons a figure is absent are serialised with it: a remembered reading that came
+/// back as `ps-blind` must still say so next run rather than reappearing as a zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resources {
     /// Which reader answered, and therefore what could have been seen at all.
     pub source: ResourceSource,
@@ -243,6 +248,23 @@ pub struct Sweep {
     pub directories_visited: usize,
 }
 
+/// What was found where the state left by earlier runs is kept.
+///
+/// Three outcomes, and they are deliberately distinct. "No file yet" is an answer — the
+/// first run on a machine has nothing to remember and that is not a fault. "A file that
+/// could not be read" is not an answer, and collapsing it into the first would silently
+/// discard every workspace this tool had been watching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateRead {
+    /// The state file's contents, exactly as stored.
+    Found(String),
+    /// Nothing has been stored yet. A first run, not a failure.
+    Absent,
+    /// Something is stored and could not be read. Carries what the filesystem said, so the
+    /// reason can be acted on rather than merely noted.
+    Unreadable(String),
+}
+
 /// Everything the collector needs from outside itself.
 pub trait World {
     /// Enumerate all processes with their executable paths.
@@ -356,5 +378,30 @@ pub trait World {
         paths: &[String],
     ) -> Vec<Result<crate::vcs::VcsFacts, crate::vcs::Unreadable>> {
         paths.iter().map(|p| self.vcs_facts(p)).collect()
+    }
+
+    /// Read the state earlier runs left behind.
+    ///
+    /// The **default is a World with no memory at all**, which is what a fixture-driven fake
+    /// is. It answers [`StateRead::Absent`] because that is true of it.
+    fn read_state(&self) -> StateRead {
+        StateRead::Absent
+    }
+
+    /// Replace the stored state with `contents`.
+    ///
+    /// Implementations MUST make the replacement atomic from a reader's point of view: a
+    /// concurrent `acmon` — and running two is expected, since the point of the tool is to
+    /// leave one open while working — must see either the whole previous state or the whole
+    /// new one, never a half-written file. Writing in place would let a reader observe a
+    /// truncated file, and a truncated state file parses as fewer remembered workspaces
+    /// rather than as an error.
+    ///
+    /// The **default refuses**, rather than reporting a write that did not happen. A World
+    /// with no state store is a legitimate thing; one that accepts state and silently drops
+    /// it is the exact defect this project exists to remove, and the caller has to be able
+    /// to tell a reader that the next run will start blind.
+    fn write_state(&self, _contents: &str) -> Result<(), String> {
+        Err("this World has no state store, so nothing was carried to the next run".to_string())
     }
 }
