@@ -131,6 +131,14 @@ impl Remembered {
 pub struct NotifyHealth {
     /// The notification configuration that was active this run.
     pub config: NotifyConfig,
+    /// How many announcements this run decided were worth making.
+    ///
+    /// Counted before any delivery is attempted, which is the whole point of counting it
+    /// separately: with no channel configured, every `delivered` and `failed` tally below
+    /// stays at zero because nothing is ever tried. Reasoning about whether alerting was
+    /// wanted from those tallies alone would make "nothing to say" and "nowhere to say it"
+    /// the same observation, and the second needs reporting.
+    pub notable: usize,
     /// How many announcements were delivered via local channel.
     pub local_delivered: usize,
     /// How many local deliveries failed.
@@ -146,6 +154,7 @@ impl NotifyHealth {
     pub fn none() -> Self {
         NotifyHealth {
             config: NotifyConfig::none(),
+            notable: 0,
             local_delivered: 0,
             local_failed: 0,
             remote_delivered: 0,
@@ -999,9 +1008,13 @@ pub fn collect(
                 }
                 notify::Announcement::WorkspaceStranded { path, .. }
                 | notify::Announcement::WorkspaceUnknownAtRisk { path, .. } => {
+                    // Case-insensitively, matching how `notify::decide` looks the path up and
+                    // how workspace paths are compared everywhere else in this crate. Two
+                    // spellings of one path here would record an alert that was never
+                    // delivered as sent, and it would never be announced again.
                     successfully_announced
                         .workspaces
-                        .retain(|(p, _)| p != path);
+                        .retain(|(p, _)| !p.eq_ignore_ascii_case(path));
                 }
             }
         }
@@ -1027,6 +1040,7 @@ pub fn collect(
             retention: thresholds.forget,
             notify_health: NotifyHealth {
                 config,
+                notable: announcements.len(),
                 local_delivered,
                 local_failed,
                 remote_delivered,

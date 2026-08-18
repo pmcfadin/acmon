@@ -754,3 +754,109 @@ fn the_schema_version_stays_at_1_after_adding_announcements() {
         "adding announcements with #[serde(default)] does not bump the schema version"
     );
 }
+
+// --- The real configuration file on disk ---
+//
+// These drive `RealWorld` against scratch files. The distinction they establish — a config
+// that is absent versus one that cannot be understood — is invisible in the channel tallies,
+// because both deliver nothing. Only the stated reason separates them.
+
+fn scratch_config(name: &str, contents: Option<&str>) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!("acmon-seam9-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("scratch directory");
+    let path = directory.join("notify.toml");
+    if let Some(text) = contents {
+        std::fs::write(&path, text).expect("write the config");
+    }
+    path
+}
+
+#[test]
+fn a_machine_with_no_notification_config_is_not_reported_as_broken() {
+    let path = scratch_config("absent", None);
+    let config = acmon::RealWorld::with_notify_config(&path).read_notify_config();
+
+    assert_eq!(
+        config.unusable, None,
+        "never having configured alerting is a choice, not a fault, and warning about it on \
+         every run would train a reader to ignore the warning"
+    );
+    assert!(!config.has_any());
+
+    let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+}
+
+#[test]
+fn a_malformed_notification_config_carries_the_specific_error() {
+    // The whole point of #9's second paragraph: a channel that delivers nothing must not look
+    // like a machine with nothing to say. A typo here silently disables alerting, and the run
+    // that needed the alert is the run that will not get one.
+    let path = scratch_config(
+        "malformed",
+        Some("local_command = \nremote_url = ]]not toml"),
+    );
+    let config = acmon::RealWorld::with_notify_config(&path).read_notify_config();
+
+    let why = config
+        .unusable
+        .as_ref()
+        .expect("a config that cannot be parsed must say so, not quietly deliver nothing");
+    assert!(
+        why.contains("notify.toml"),
+        "the reason must name the file, or nobody knows where to look; got {why:?}"
+    );
+    assert!(
+        why.len() > "notify.toml".len() + 8,
+        "and must carry the parser's own complaint rather than only the filename; got {why:?}"
+    );
+    assert!(
+        !config.has_any(),
+        "a config that could not be understood configures no channels"
+    );
+
+    let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+}
+
+#[test]
+fn a_well_formed_notification_config_is_read_and_reports_no_problem() {
+    // The control. Without it, a reader could not tell whether the two tests above pass
+    // because the parser is strict or because it rejects everything.
+    let path = scratch_config(
+        "valid",
+        Some("local_command = \"terminal-notifier -message -\"\nremote_url = \"https://example.invalid/hook\"\n"),
+    );
+    let config = acmon::RealWorld::with_notify_config(&path).read_notify_config();
+
+    assert_eq!(config.unusable, None);
+    assert_eq!(
+        config.local_command.as_deref(),
+        Some("terminal-notifier -message -")
+    );
+    assert_eq!(
+        config.remote_url.as_deref(),
+        Some("https://example.invalid/hook")
+    );
+
+    let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+}
+
+#[test]
+fn a_configured_but_blank_channel_counts_as_absent_rather_than_as_a_command() {
+    // An empty string is a command that would run the shell with nothing in it and succeed,
+    // which would record every alert as delivered while sending none.
+    let path = scratch_config(
+        "blank",
+        Some("local_command = \"   \"\nremote_url = \"\"\n"),
+    );
+    let config = acmon::RealWorld::with_notify_config(&path).read_notify_config();
+
+    assert_eq!(config.unusable, None, "a blank value is not malformed");
+    assert!(
+        !config.has_any(),
+        "but it configures nothing — a channel that always succeeds and sends nothing is the \
+         worst of both states"
+    );
+
+    let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+}

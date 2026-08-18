@@ -448,14 +448,36 @@ pub struct NotifyConfig {
     pub local_command: Option<String>,
     /// Remote HTTP URL to POST to, if configured.
     pub remote_url: Option<String>,
+    /// Why the configuration could not be understood, when it could not.
+    ///
+    /// `None` covers both a configuration that parsed and a machine with no configuration
+    /// file at all — neither is a fault. A `Some` must be **reported unconditionally**, not
+    /// only when there happened to be something to announce. A typo in the config file
+    /// otherwise turns alerting off and looks exactly like a quiet machine, which is the
+    /// failure this ticket opens with: an exhausted quota swallowed a full day of alerts
+    /// because a dead channel and a calm machine produced identical output.
+    pub unusable: Option<String>,
 }
 
 impl NotifyConfig {
-    /// No channels configured at all.
+    /// No channels configured at all, and nothing wrong with that.
     pub fn none() -> Self {
         NotifyConfig {
             local_command: None,
             remote_url: None,
+            unusable: None,
+        }
+    }
+
+    /// No channels, because the configuration could not be understood. Carries the reason.
+    ///
+    /// Distinct from [`NotifyConfig::none`] on purpose: both deliver nothing, and only this
+    /// one is a fault. Collapsing them is what makes a broken config invisible.
+    pub fn unusable(why: impl Into<String>) -> Self {
+        NotifyConfig {
+            local_command: None,
+            remote_url: None,
+            unusable: Some(why.into()),
         }
     }
 

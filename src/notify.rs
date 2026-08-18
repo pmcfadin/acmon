@@ -69,7 +69,9 @@ pub enum Announcement {
     },
     WorkspaceStranded {
         path: String,
-        uncommitted_entries: usize,
+        /// How many entries version control reported. `None` is never a stand-in for zero —
+        /// see the payload below for what an absent count says instead.
+        uncommitted_entries: Option<usize>,
     },
     WorkspaceUnknownAtRisk {
         path: String,
@@ -99,12 +101,18 @@ impl Announcement {
             Announcement::WorkspaceStranded {
                 path,
                 uncommitted_entries,
-            } => {
-                format!(
-                    "Workspace {} is STRANDED with {} uncommitted entries",
-                    path, uncommitted_entries
-                )
-            }
+            } => match uncommitted_entries {
+                Some(count) => {
+                    format!("Workspace {path} is STRANDED with {count} uncommitted entries")
+                }
+                // Never "with 0 uncommitted entries". An alert whose whole purpose is to say
+                // work is at risk, reporting none at risk, is the calm plausible wrong answer
+                // this project exists to remove — and the reader would reasonably ignore it.
+                None => format!(
+                    "Workspace {path} is STRANDED, and how many entries are uncommitted could \
+                     not be read"
+                ),
+            },
             Announcement::WorkspaceUnknownAtRisk { path, reason } => {
                 format!(
                     "Workspace {} is at risk (version control: {})",
@@ -149,9 +157,14 @@ fn notable_workspace_state(workspace: &WorkspaceReport) -> Option<AnnouncedWorks
 /// Returns the announcements to deliver and the updated record for the next run.
 ///
 /// A workspace or session that leaves a notable state and later re-enters it announces again.
-/// An unchanged set of notable states does not re-announce. Only outcomes that actually
-/// succeeded update the record — a failed delivery means the alert is re-announced on the
-/// following run.
+/// An unchanged set of notable states does not re-announce.
+///
+/// The returned record describes what is notable **now**, which is not yet what may be
+/// remembered. Delivery has not been attempted at this point, and an alert that fails to
+/// deliver must not be recorded as sent — so the caller removes the undelivered ones before
+/// the record is stored. Keeping that decision at the call site is deliberate: this function
+/// cannot know what was delivered, and a record written here would be a claim about the
+/// future.
 pub fn decide(
     sessions: &[Session],
     workspaces: &[WorkspaceReport],
@@ -208,7 +221,7 @@ pub fn decide(
                     AnnouncedWorkspaceState::DirtyStranded => {
                         announcements.push(Announcement::WorkspaceStranded {
                             path: workspace.path.clone(),
-                            uncommitted_entries: workspace.uncommitted_entries.unwrap_or(0),
+                            uncommitted_entries: workspace.uncommitted_entries,
                         });
                     }
                     AnnouncedWorkspaceState::UnknownAtRisk => {

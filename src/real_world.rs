@@ -64,20 +64,25 @@ fn state_path() -> Result<std::path::PathBuf, String> {
 
 /// Where the notification configuration is kept.
 ///
-/// `~/.acmon/notify.toml`, alongside the state file.
-fn notify_config_path() -> std::path::PathBuf {
+/// `~/.acmon/notify.toml`, alongside the state file. Resolved as a `Result` for the same
+/// reason [`state_path`] is: without a home directory there is no answer, and a stand-in path
+/// chosen because it is certain to fail would report "no alerting configured" — which is a
+/// legitimate state, and therefore the worst possible disguise for a fault.
+fn notify_config_path() -> Result<std::path::PathBuf, String> {
     if let Ok(explicit) = std::env::var(NOTIFY_CONFIG_VARIABLE) {
         if !explicit.trim().is_empty() {
-            return std::path::PathBuf::from(explicit);
+            return Ok(std::path::PathBuf::from(explicit));
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return std::path::Path::new(&home)
-            .join(".acmon")
-            .join("notify.toml");
-    }
-    // Fallback if HOME is not set — use a path that will just fail to read.
-    std::path::PathBuf::from("/dev/null/notify.toml")
+    let home = std::env::var("HOME").map_err(|e| {
+        format!(
+            "HOME is not readable, so {NOTIFY_CONFIG_VARIABLE} must name the notification \
+             configuration explicitly: {e}"
+        )
+    })?;
+    Ok(std::path::Path::new(&home)
+        .join(".acmon")
+        .join("notify.toml"))
 }
 
 pub struct RealWorld {
@@ -93,10 +98,10 @@ pub struct RealWorld {
     /// developer's own `~/.acmon/state.json`, and a test suite that quietly overwrites the
     /// history the tool depends on is worse than one that skips the case.
     state_file: Result<std::path::PathBuf, String>,
-    /// Where the notification configuration is kept.
+    /// Where the notification configuration is kept, or why that could not be worked out.
     ///
     /// Resolved once at construction for the same reason as `state_file`.
-    notify_config_file: std::path::PathBuf,
+    notify_config_file: Result<std::path::PathBuf, String>,
 }
 
 impl RealWorld {
@@ -121,7 +126,7 @@ impl RealWorld {
     /// The same world, reading notification config from a named file.
     pub fn with_notify_config(path: impl Into<std::path::PathBuf>) -> Self {
         RealWorld {
-            notify_config_file: path.into(),
+            notify_config_file: Ok(path.into()),
             ..RealWorld::new()
         }
     }
@@ -1128,27 +1133,52 @@ impl World for RealWorld {
     }
 
     fn read_notify_config(&self) -> NotifyConfig {
-        let contents = match std::fs::read_to_string(&self.notify_config_file) {
-            Ok(text) => text,
-            Err(_) => return NotifyConfig::none(),
+        let path = match &self.notify_config_file {
+            Ok(path) => path,
+            Err(why) => return NotifyConfig::unusable(why.clone()),
         };
 
-        // Parse TOML. A malformed config degrades to no channels configured, which is
-        // legitimate — but the degradation must be visible rather than silent.
+        let contents = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            // No file is an answer: this machine has no alerting configured, which is
+            // allowed. A file that exists and cannot be read is NOT the same thing, and
+            // saying so is what stops a permissions mistake from reading as "no alerts
+            // wanted".
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return NotifyConfig::none()
+            }
+            Err(error) => {
+                return NotifyConfig::unusable(format!(
+                    "{} could not be read: {error}",
+                    path.display()
+                ))
+            }
+        };
+
         #[derive(serde::Deserialize)]
         struct ConfigFile {
             local_command: Option<String>,
             remote_url: Option<String>,
         }
 
+        // A malformed config delivers nothing, so it MUST carry its reason. Discarding the
+        // parser's complaint here would leave a typo in `notify.toml` indistinguishable from
+        // a machine that was never set up to alert — and the second of those is silent by
+        // design, so the first would be silent by accident.
         let parsed: ConfigFile = match toml::from_str(&contents) {
             Ok(config) => config,
-            Err(_) => return NotifyConfig::none(),
+            Err(error) => {
+                return NotifyConfig::unusable(format!(
+                    "{} is not readable as configuration: {error}",
+                    path.display()
+                ))
+            }
         };
 
         NotifyConfig {
             local_command: parsed.local_command.filter(|s| !s.trim().is_empty()),
             remote_url: parsed.remote_url.filter(|s| !s.trim().is_empty()),
+            unusable: None,
         }
     }
 
