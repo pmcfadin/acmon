@@ -5,13 +5,15 @@ use std::time::{Duration, SystemTime};
 use crate::detect::embedded_detectors;
 use crate::liveness::{classify, Observation, Thresholds, Verdict};
 use crate::memory::{self, Degraded, Forgotten, Memory, Reading, Sighting};
+use crate::notify;
 use crate::vcs::WorkspaceState;
 use crate::workspace::{
     namespace_for, recorded_namespace, NamespaceResolution, NamespaceUnmatched, Workspace,
     WorkspaceUnknown,
 };
 use crate::world::{
-    CodexSession, PathUnavailable, Resources, ResourcesUnavailable, StateRead, World, WorldError,
+    CodexSession, NotifyConfig, NotifyOutcome, PathUnavailable, Resources, ResourcesUnavailable,
+    StateRead, World, WorldError,
 };
 
 /// A session's identity: either a live process, or a transcript without one.
@@ -106,6 +108,8 @@ pub struct Remembered {
     /// The retention period the pruning above was done with. Carried so that a report of
     /// what was forgotten can state the rule that forgot it, rather than a bare count.
     pub retention: Duration,
+    /// What notification channels are configured, and their health.
+    pub notify_health: NotifyHealth,
 }
 
 impl Remembered {
@@ -117,7 +121,50 @@ impl Remembered {
             persisted: Ok(()),
             forgotten: Vec::new(),
             retention: crate::memory::DEFAULT_FORGET,
+            notify_health: NotifyHealth::none(),
         }
+    }
+}
+
+/// Channel health and configuration status for notifications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotifyHealth {
+    /// The notification configuration that was active this run.
+    pub config: NotifyConfig,
+    /// How many announcements this run decided were worth making.
+    ///
+    /// Counted before any delivery is attempted, which is the whole point of counting it
+    /// separately: with no channel configured, every `delivered` and `failed` tally below
+    /// stays at zero because nothing is ever tried. Reasoning about whether alerting was
+    /// wanted from those tallies alone would make "nothing to say" and "nowhere to say it"
+    /// the same observation, and the second needs reporting.
+    pub notable: usize,
+    /// How many announcements were delivered via local channel.
+    pub local_delivered: usize,
+    /// How many local deliveries failed.
+    pub local_failed: usize,
+    /// How many announcements were delivered via remote channel.
+    pub remote_delivered: usize,
+    /// How many remote deliveries failed.
+    pub remote_failed: usize,
+}
+
+impl NotifyHealth {
+    /// No channels configured, nothing attempted.
+    pub fn none() -> Self {
+        NotifyHealth {
+            config: NotifyConfig::none(),
+            notable: 0,
+            local_delivered: 0,
+            local_failed: 0,
+            remote_delivered: 0,
+            remote_failed: 0,
+        }
+    }
+
+    /// Whether any deliveries failed this run.
+    pub fn has_failures(&self) -> bool {
+        self.local_failed > 0 || self.remote_failed > 0
     }
 }
 
@@ -894,8 +941,90 @@ pub fn collect(
     // sessions as read. `previous` is consumed here, so nothing after this point can still be
     // reasoning from the old state.
     let memory = memory::remember(previous, &sightings, &sessions, now);
-    let (memory, forgotten) = memory::forget(memory, now, thresholds.forget);
-    let persisted = world.write_state(&memory::serialise(&memory));
+    let (memory_after_forgetting, forgotten) = memory::forget(memory, now, thresholds.forget);
+
+    // --- Notifications ---
+    //
+    // Decided based on this run's observations and what was announced before. Delivery is
+    // verified: only outcomes that actually succeeded update the announcement record, so an
+    // undelivered alert is re-announced on the following run.
+    let config = world.read_notify_config();
+    let (announcements, updated_announcements) = notify::decide(
+        &sessions,
+        &workspaces,
+        &memory_after_forgetting.announcements,
+    );
+
+    let mut local_delivered = 0;
+    let mut local_failed = 0;
+    let mut remote_delivered = 0;
+    let mut remote_failed = 0;
+
+    // Track which announcements were actually delivered, so only those update the record.
+    let mut successfully_announced = updated_announcements.clone();
+
+    for announcement in &announcements {
+        let payload = announcement.payload();
+        let mut delivered_somewhere = false;
+
+        // Local channel
+        if let Some(command) = &config.local_command {
+            match world.notify_local(command, &payload) {
+                NotifyOutcome::Delivered => {
+                    local_delivered += 1;
+                    delivered_somewhere = true;
+                }
+                NotifyOutcome::Failed(_) => {
+                    local_failed += 1;
+                }
+                NotifyOutcome::NoChannelConfigured => {}
+            }
+        }
+
+        // Remote channel
+        if let Some(url) = &config.remote_url {
+            match world.notify_remote(url, &payload) {
+                NotifyOutcome::Delivered => {
+                    remote_delivered += 1;
+                    delivered_somewhere = true;
+                }
+                NotifyOutcome::Failed(_) => {
+                    remote_failed += 1;
+                }
+                NotifyOutcome::NoChannelConfigured => {}
+            }
+        }
+
+        // If neither channel delivered, remove this announcement from the successful set so
+        // it will be re-announced next run.
+        if !delivered_somewhere {
+            match announcement {
+                notify::Announcement::SessionWaiting {
+                    cli, recorded_as, ..
+                } => {
+                    successfully_announced
+                        .sessions
+                        .retain(|a| !(a.cli == *cli && a.recorded_as == *recorded_as));
+                }
+                notify::Announcement::WorkspaceStranded { path, .. }
+                | notify::Announcement::WorkspaceUnknownAtRisk { path, .. } => {
+                    // Case-insensitively, matching how `notify::decide` looks the path up and
+                    // how workspace paths are compared everywhere else in this crate. Two
+                    // spellings of one path here would record an alert that was never
+                    // delivered as sent, and it would never be announced again.
+                    successfully_announced
+                        .workspaces
+                        .retain(|(p, _)| !p.eq_ignore_ascii_case(path));
+                }
+            }
+        }
+    }
+
+    // Only update the announcement record with what actually got delivered.
+    let mut memory_with_announcements = memory_after_forgetting;
+    memory_with_announcements.announcements = successfully_announced;
+
+    let persisted = world.write_state(&memory::serialise(&memory_with_announcements));
 
     Ok(Snapshot {
         taken_at: now,
@@ -904,11 +1033,19 @@ pub fn collect(
         unlocated,
         sweep_complete: sweep.complete,
         remembered: Remembered {
-            memory,
+            memory: memory_with_announcements,
             unusable,
             persisted,
             forgotten,
             retention: thresholds.forget,
+            notify_health: NotifyHealth {
+                config,
+                notable: announcements.len(),
+                local_delivered,
+                local_failed,
+                remote_delivered,
+                remote_failed,
+            },
         },
     })
 }

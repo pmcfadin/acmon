@@ -408,4 +408,92 @@ pub trait World {
     fn write_state(&self, _contents: &str) -> Result<(), String> {
         Err("this World has no state store, so nothing was carried to the next run".to_string())
     }
+
+    /// Read the notification configuration.
+    ///
+    /// The **default returns no channels configured**, which is a legitimate state — a monitor
+    /// with no alerting wired is allowed, but it must be visible rather than silently missing.
+    fn read_notify_config(&self) -> NotifyConfig {
+        NotifyConfig::none()
+    }
+
+    /// Deliver a notification through a local command.
+    ///
+    /// Implementations run the command synchronously and check its exit code. A command that
+    /// exits non-zero is a delivery failure, and the alert is re-announced on the following run.
+    ///
+    /// The **default refuses**, stating that no local channel is configured. A World with no
+    /// local notifier is legitimate; one that silently claims delivery succeeded when nothing
+    /// was configured is the exact defect this ticket exists to prevent.
+    fn notify_local(&self, _command: &str, _payload: &str) -> NotifyOutcome {
+        NotifyOutcome::NoChannelConfigured
+    }
+
+    /// Deliver a notification through a remote HTTP endpoint.
+    ///
+    /// Implementations MUST check both the process exit status and the HTTP status code. A
+    /// request that was sent but got a 5xx response is a delivery failure. Backgrounding the
+    /// request is not allowed: "the process started" is not "the message arrived".
+    ///
+    /// The **default refuses**, stating that no remote channel is configured.
+    fn notify_remote(&self, _url: &str, _payload: &str) -> NotifyOutcome {
+        NotifyOutcome::NoChannelConfigured
+    }
+}
+
+/// Notification channel configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotifyConfig {
+    /// Local command to run, if configured.
+    pub local_command: Option<String>,
+    /// Remote HTTP URL to POST to, if configured.
+    pub remote_url: Option<String>,
+    /// Why the configuration could not be understood, when it could not.
+    ///
+    /// `None` covers both a configuration that parsed and a machine with no configuration
+    /// file at all — neither is a fault. A `Some` must be **reported unconditionally**, not
+    /// only when there happened to be something to announce. A typo in the config file
+    /// otherwise turns alerting off and looks exactly like a quiet machine, which is the
+    /// failure this ticket opens with: an exhausted quota swallowed a full day of alerts
+    /// because a dead channel and a calm machine produced identical output.
+    pub unusable: Option<String>,
+}
+
+impl NotifyConfig {
+    /// No channels configured at all, and nothing wrong with that.
+    pub fn none() -> Self {
+        NotifyConfig {
+            local_command: None,
+            remote_url: None,
+            unusable: None,
+        }
+    }
+
+    /// No channels, because the configuration could not be understood. Carries the reason.
+    ///
+    /// Distinct from [`NotifyConfig::none`] on purpose: both deliver nothing, and only this
+    /// one is a fault. Collapsing them is what makes a broken config invisible.
+    pub fn unusable(why: impl Into<String>) -> Self {
+        NotifyConfig {
+            local_command: None,
+            remote_url: None,
+            unusable: Some(why.into()),
+        }
+    }
+
+    /// Whether any channel is configured.
+    pub fn has_any(&self) -> bool {
+        self.local_command.is_some() || self.remote_url.is_some()
+    }
+}
+
+/// The outcome of a notification delivery attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotifyOutcome {
+    /// The notification was delivered successfully.
+    Delivered,
+    /// No channel of this kind is configured.
+    NoChannelConfigured,
+    /// The channel is configured but delivery failed. Carries the reason.
+    Failed(String),
 }

@@ -1153,3 +1153,120 @@ fn an_ordinary_run_says_nothing_about_its_own_state_file() {
         "a run that read its state and stored it has nothing to report; got:\n{text}"
     );
 }
+
+// --- Notification channel health (ticket #9) ---
+
+fn health(config: acmon::world::NotifyConfig, notable: usize) -> acmon::collect::NotifyHealth {
+    acmon::collect::NotifyHealth {
+        config,
+        notable,
+        ..acmon::collect::NotifyHealth::none()
+    }
+}
+
+fn snapshot_with_health(h: acmon::collect::NotifyHealth) -> Snapshot {
+    Snapshot {
+        taken_at: fixture_now(),
+        sessions: Vec::new(),
+        workspaces: Vec::new(),
+        unlocated: Vec::new(),
+        sweep_complete: true,
+        remembered: Remembered {
+            notify_health: h,
+            ..Remembered::none()
+        },
+    }
+}
+
+#[test]
+fn an_unusable_notification_config_is_reported_even_when_there_was_nothing_to_announce() {
+    // The failure this ticket opens with. A broken config delivers nothing, exactly like a
+    // machine that was never set up to alert — and that second state is silent by design, so
+    // this one would otherwise be silent by accident. Note `notable: 0`: the warning must not
+    // wait for something to go wrong before admitting it cannot report anything going wrong.
+    let text = rendered(
+        &snapshot_with_health(health(
+            acmon::world::NotifyConfig::unusable(
+                "/Users/pmcfadin/.acmon/notify.toml is not readable as configuration: \
+                 expected an equals, found a newline at line 2 column 14",
+            ),
+            0,
+        )),
+        wide(),
+    );
+
+    assert!(
+        text.contains("WARNING") && text.contains("NOTHING WAS ANNOUNCED"),
+        "an unusable config must say that nothing was announced, on every run, whether or not \
+         anything happened to be notable; got:\n{text}"
+    );
+    assert!(
+        text.contains("line 2"),
+        "with the parser's own words, so the file can be fixed rather than just deleted; \
+         got:\n{text}"
+    );
+}
+
+#[test]
+fn no_channels_configured_is_reported_when_something_needed_announcing() {
+    // Reachable only from the count of what was *notable*. With no channel configured nothing
+    // is ever attempted, so every delivered and failed tally stays at zero — reasoning from
+    // those would make this warning unreachable while looking as though it were covered.
+    let text = rendered(
+        &snapshot_with_health(health(acmon::world::NotifyConfig::none(), 3)),
+        wide(),
+    );
+
+    assert!(
+        text.contains("No notification channels configured"),
+        "three notable states and nowhere to send them is worth saying; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_quiet_machine_with_no_channels_configured_says_nothing() {
+    // The counterweight. Nothing to say and nowhere to say it is not a fault, and a warning
+    // on every run trains a reader to ignore the warning.
+    let text = rendered(
+        &snapshot_with_health(health(acmon::world::NotifyConfig::none(), 0)),
+        wide(),
+    );
+
+    assert!(
+        !text.contains("WARNING"),
+        "a quiet machine with no alerting configured has nothing to report; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_failed_delivery_says_which_channel_failed_and_that_it_will_be_retried() {
+    let text = rendered(
+        &snapshot_with_health(acmon::collect::NotifyHealth {
+            config: acmon::world::NotifyConfig {
+                local_command: Some("terminal-notifier".to_string()),
+                remote_url: Some("https://example.invalid/hook".to_string()),
+                unusable: None,
+            },
+            notable: 2,
+            local_delivered: 2,
+            local_failed: 0,
+            remote_delivered: 0,
+            remote_failed: 2,
+        }),
+        wide(),
+    );
+
+    assert!(
+        text.contains("remote: 2 failed"),
+        "naming the channel is the point — a dead remote and a healthy local must not read \
+         the same; got:\n{text}"
+    );
+    assert!(
+        text.contains("re-announced"),
+        "and the reader has to know the alert is not simply lost; got:\n{text}"
+    );
+    assert!(
+        !text.contains("local: "),
+        "the healthy channel is not a failure and must not be listed as one; got:\n{text}"
+    );
+}

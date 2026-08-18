@@ -233,6 +233,57 @@ fn memory_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
         ));
     }
 
+    // Notification channel health
+    let health = &remembered.notify_health;
+
+    // A configuration that could not be understood is reported **unconditionally**, and
+    // before anything else about the channels. It delivers nothing, exactly like a machine
+    // that was never set up to alert — and that second state is silent by design, so this one
+    // would otherwise be silent by accident. This is the failure the ticket opens with: an
+    // exhausted quota swallowed a full day of alerts because a dead channel and a calm machine
+    // produced identical output.
+    if let Some(why) = &health.config.unusable {
+        lines.extend(wrap_words(
+            &format!(
+                "WARNING: notification configuration is unusable, so NOTHING WAS ANNOUNCED \
+                 this run ({why})."
+            ),
+            width,
+        ));
+    }
+
+    if !health.config.has_any() {
+        // A monitor with no alerting wired must say so rather than silently never alerting —
+        // but only when there was actually something it would have announced. Saying it on a
+        // quiet machine every run trains a reader to ignore the line, and the line matters.
+        // Suppressed when the configuration is unusable, because the warning above is the
+        // truer account of the same silence.
+        if health.config.unusable.is_none() && health.notable > 0 {
+            lines.extend(wrap_words(
+                "WARNING: No notification channels configured — notable states were observed \
+                 but not announced.",
+                width,
+            ));
+        }
+    } else if health.has_failures() {
+        // At least one channel is configured, and at least one delivery failed.
+        let mut parts = Vec::new();
+        if health.local_failed > 0 {
+            parts.push(format!("local: {} failed", health.local_failed));
+        }
+        if health.remote_failed > 0 {
+            parts.push(format!("remote: {} failed", health.remote_failed));
+        }
+        lines.extend(wrap_words(
+            &format!(
+                "WARNING: Notification delivery failures ({}) — these alerts will be \
+                 re-announced on the next run.",
+                parts.join(", ")
+            ),
+            width,
+        ));
+    }
+
     lines
 }
 
