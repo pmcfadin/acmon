@@ -1178,6 +1178,65 @@ fn snapshot_with_health(h: acmon::collect::NotifyHealth) -> Snapshot {
     }
 }
 
+fn snapshot_with_detector_config(config: acmon::world::DetectorConfig) -> Snapshot {
+    Snapshot {
+        taken_at: fixture_now(),
+        sessions: Vec::new(),
+        workspaces: Vec::new(),
+        unlocated: Vec::new(),
+        sweep_complete: true,
+        remembered: Remembered {
+            detector_config: config,
+            ..Remembered::none()
+        },
+    }
+}
+
+// --- Detector configuration (ticket #12) ---
+
+#[test]
+fn an_unusable_detector_config_is_reported_even_when_no_sessions_were_found() {
+    // The failure this ticket exists to prevent: a typo in the user's detector file means a
+    // fifth agent CLI silently stops being recognised — the sessions simply are not there,
+    // which is indistinguishable from a quiet machine. The warning must appear on every run,
+    // whether or not sessions were found.
+    let text = rendered(
+        &snapshot_with_detector_config(acmon::world::DetectorConfig::unusable(
+            "/Users/pmcfadin/.acmon/detectors.toml: could not parse detector configuration: \
+             expected an equals, found a newline at line 3 column 18",
+        )),
+        wide(),
+    );
+
+    assert!(
+        text.contains("WARNING") && text.contains("detector configuration is unusable"),
+        "an unusable detector config must be reported, on every run, whether or not sessions \
+         were found; got:\n{text}"
+    );
+    assert!(
+        text.contains("line") && text.contains("column"),
+        "with the parser's own words (line and column numbers), so the file can be fixed \
+         rather than just deleted; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_quiet_machine_with_embedded_detectors_only_says_nothing() {
+    // The counterweight. Using only the embedded detectors is not a fault, and a warning on
+    // every run trains a reader to ignore the warning.
+    let text = rendered(
+        &snapshot_with_detector_config(acmon::world::DetectorConfig::embedded_only()),
+        wide(),
+    );
+
+    assert!(
+        !text.contains("detector") && !text.contains("WARNING"),
+        "a machine using only embedded detectors has nothing to report; got:\n{text}"
+    );
+}
+
+// --- Notification channel health (ticket #9) ---
+
 #[test]
 fn an_unusable_notification_config_is_reported_even_when_there_was_nothing_to_announce() {
     // The failure this ticket opens with. A broken config delivers nothing, exactly like a

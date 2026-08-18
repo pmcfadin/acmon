@@ -40,6 +40,11 @@ pub const STATE_VARIABLE: &str = "ACMON_STATE";
 /// Lets tests configure notifications without touching the developer's real config.
 pub const NOTIFY_CONFIG_VARIABLE: &str = "ACMON_NOTIFY_CONFIG";
 
+/// The environment variable that relocates the detector config file.
+///
+/// Lets tests configure detectors without touching the developer's real config.
+pub const DETECTORS_VARIABLE: &str = "ACMON_DETECTORS";
+
 /// Where the state carried between runs is kept.
 ///
 /// `~/.acmon/state.json`, alongside the `~/.claude` and `~/.codex` directories the agents
@@ -85,6 +90,29 @@ fn notify_config_path() -> Result<std::path::PathBuf, String> {
         .join("notify.toml"))
 }
 
+/// Where the detector configuration is kept.
+///
+/// `~/.acmon/detectors.toml`, alongside the state file and notification config. Resolved as a
+/// `Result` for the same reason [`state_path`] is: without a home directory there is no answer,
+/// and a stand-in path chosen because it is certain to fail would report "no detector config" —
+/// which is a legitimate state, and therefore the worst possible disguise for a fault.
+fn detectors_path() -> Result<std::path::PathBuf, String> {
+    if let Ok(explicit) = std::env::var(DETECTORS_VARIABLE) {
+        if !explicit.trim().is_empty() {
+            return Ok(std::path::PathBuf::from(explicit));
+        }
+    }
+    let home = std::env::var("HOME").map_err(|e| {
+        format!(
+            "HOME is not readable, so {DETECTORS_VARIABLE} must name the detector \
+             configuration explicitly: {e}"
+        )
+    })?;
+    Ok(std::path::Path::new(&home)
+        .join(".acmon")
+        .join("detectors.toml"))
+}
+
 pub struct RealWorld {
     observer_pid: i32,
     /// Read once from this machine, never assumed. Every duration in the kernel's
@@ -102,6 +130,10 @@ pub struct RealWorld {
     ///
     /// Resolved once at construction for the same reason as `state_file`.
     notify_config_file: Result<std::path::PathBuf, String>,
+    /// Where the detector configuration is kept, or why that could not be worked out.
+    ///
+    /// Resolved once at construction for the same reason as `state_file`.
+    detectors_file: Result<std::path::PathBuf, String>,
 }
 
 impl RealWorld {
@@ -112,6 +144,7 @@ impl RealWorld {
             timebase: read_timebase(),
             state_file: state_path(),
             notify_config_file: notify_config_path(),
+            detectors_file: detectors_path(),
         }
     }
 
@@ -127,6 +160,14 @@ impl RealWorld {
     pub fn with_notify_config(path: impl Into<std::path::PathBuf>) -> Self {
         RealWorld {
             notify_config_file: Ok(path.into()),
+            ..RealWorld::new()
+        }
+    }
+
+    /// The same world, reading detector config from a named file.
+    pub fn with_detectors(path: impl Into<std::path::PathBuf>) -> Self {
+        RealWorld {
+            detectors_file: Ok(path.into()),
             ..RealWorld::new()
         }
     }
@@ -1178,6 +1219,48 @@ impl World for RealWorld {
         NotifyConfig {
             local_command: parsed.local_command.filter(|s| !s.trim().is_empty()),
             remote_url: parsed.remote_url.filter(|s| !s.trim().is_empty()),
+            unusable: None,
+        }
+    }
+
+    fn read_detector_config(&self) -> crate::world::DetectorConfig {
+        use crate::world::DetectorConfig;
+
+        let path = match &self.detectors_file {
+            Ok(path) => path,
+            Err(why) => return DetectorConfig::unusable(why.clone()),
+        };
+
+        let contents = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            // No file is an answer: this machine uses only the embedded detectors, which is
+            // allowed and expected. A file that exists and cannot be read is NOT the same
+            // thing, and saying so is what stops a permissions mistake from reading as "uses
+            // defaults".
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return DetectorConfig::embedded_only()
+            }
+            Err(error) => {
+                return DetectorConfig::unusable(format!(
+                    "{} could not be read: {error}",
+                    path.display()
+                ))
+            }
+        };
+
+        // Parse the user detectors. A malformed file or one with a toothless detector must
+        // report the specific error and fall back to embedded defaults.
+        let user_detectors = match crate::detect::parse_user_detectors(&contents) {
+            Ok(detectors) => detectors,
+            Err(why) => return DetectorConfig::unusable(format!("{}: {why}", path.display())),
+        };
+
+        // Layer the user detectors over the embedded ones.
+        let embedded = crate::detect::embedded_detectors();
+        let merged = crate::detect::merge_detectors(embedded, user_detectors);
+
+        DetectorConfig {
+            detectors: merged,
             unusable: None,
         }
     }

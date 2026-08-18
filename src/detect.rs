@@ -5,7 +5,7 @@ use serde::Deserialize;
 const EMBEDDED_DETECTORS: &str = include_str!("../detectors.toml");
 
 /// One CLI's recognition rule.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Detector {
     /// Stable identifier, also used as the displayed CLI name.
     pub id: String,
@@ -65,4 +65,52 @@ pub fn embedded_detectors() -> Vec<Detector> {
         );
     }
     detectors
+}
+
+/// Parse user-supplied detector configuration from TOML.
+///
+/// Returns `Ok(detectors)` when the text parses and every detector has at least one rule.
+/// Returns `Err` when the text is malformed or a detector has no rules — the latter being
+/// a runtime hazard exactly like the embedded case, but one that arrives from user data
+/// rather than from the build.
+pub fn parse_user_detectors(text: &str) -> Result<Vec<Detector>, String> {
+    let file: DetectorFile =
+        toml::from_str(text).map_err(|e| format!("could not parse detector configuration: {e}"))?;
+
+    // A user-supplied detector with no rules is the same hazard as an embedded one: it
+    // matches nothing, for every process, silently. The embedded version panics because
+    // it is a build-time authoring error; this one returns an error because it is runtime
+    // user data, and panicking on user input is never the answer.
+    if let Some(toothless) = file.detector.iter().find(|d| !d.has_a_rule()) {
+        return Err(format!(
+            "detector {:?} has no matching rules — it would silently recognise nothing",
+            toothless.id
+        ));
+    }
+
+    Ok(file.detector)
+}
+
+/// Layer user-supplied detectors over the embedded defaults.
+///
+/// A user detector whose `id` matches an embedded one replaces it entirely — not a
+/// field-wise merge, which would make it impossible to *remove* a rule that is matching
+/// something it should not. A user detector with a new `id` adds to the set.
+///
+/// This is what makes "adding support for an additional agent CLI requires no code change"
+/// true: a user can copy the embedded `detectors.toml`'s shape and either extend it or
+/// override an entry that is over-matching.
+pub fn merge_detectors(embedded: Vec<Detector>, user: Vec<Detector>) -> Vec<Detector> {
+    let mut result = embedded;
+
+    for user_detector in user {
+        // Replace if an embedded detector has the same id, otherwise add.
+        if let Some(pos) = result.iter().position(|d| d.id == user_detector.id) {
+            result[pos] = user_detector;
+        } else {
+            result.push(user_detector);
+        }
+    }
+
+    result
 }
