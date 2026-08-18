@@ -10,6 +10,7 @@ events.jsonl
 spool/
 
 # Local editor / agent settings
+.claude/worktrees/
 .claude/settings.local.json
 
 # Rust
