@@ -206,9 +206,15 @@ baseline.
 
 ### Discovery (v1)
 
-- **F1** Enumerate agent sessions from the running process set, obtaining identity
-  and cwd **in one pass**. Enumerate-then-enrich is forbidden: it produced six
-  phantom "unreadable cwd" entries that were merely dead processes.
+- **F1** Enumerate agent sessions from the running process set. One logical observation,
+  not one instant: pids are enumerated and each path is then read, because macOS offers no
+  call that returns them together. A process that exits in between produces a record
+  carrying `PathUnavailable::ProcessExited` — a reason established by asking, not assumed.
+  Such a record is excluded when sessions are formed, so an exiting process is never
+  reported as a session, nor as one with an unreadable field. Stated because the opposite
+  was measured: six phantom "unreadable cwd" entries turned out to be dead processes, and a
+  dead process reported as an unreadable one is indistinguishable from a live session we
+  failed to see unless the reason is established rather than guessed.
 - **F2** Recognise CLIs via **detectors as data** — exe-path glob plus optional argv
   pattern, with exclusions. Adding a CLI must not require a code change.
 - **F3** Detectors MUST exclude `/Applications/ChatGPT.app/`,

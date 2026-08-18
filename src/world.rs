@@ -269,16 +269,20 @@ pub enum StateRead {
 pub trait World {
     /// Enumerate all processes with their executable paths.
     ///
-    /// Returns a snapshot of the process table at a single point in time. The
-    /// implementation may perform multiple system calls to gather process details;
-    /// the contract is that the result represents one logical observation, not that
-    /// it's gathered in a single syscall.
+    /// One logical observation, not one instant: pids are enumerated and each path is then
+    /// read, because macOS offers no call that returns them together. A process that exits
+    /// in between produces a record carrying [`PathUnavailable::ProcessExited`] — a reason
+    /// established by asking, not assumed. Such a record is excluded when sessions are
+    /// formed, so an exiting process is never reported as a session, nor as one with an
+    /// unreadable field.
     ///
-    /// A process that exits mid-enumeration reports
-    /// [`PathUnavailable::ProcessExited`] and one that is merely unreadable reports
-    /// [`PathUnavailable::PermissionDenied`]. Implementations MUST establish which
-    /// is true rather than assuming, because a confidently wrong reason is worse than
-    /// an admitted unknown.
+    /// Establishing the reason rather than guessing it is what makes that last clause hold.
+    /// A process that is merely unreadable reports [`PathUnavailable::PermissionDenied`] and
+    /// is a different thing entirely: it is alive, and it is a session we are failing to see.
+    /// Implementations MUST determine which of the two is true, because a confidently wrong
+    /// reason is worse than an admitted unknown — six phantom "unreadable" entries that were
+    /// merely dead processes were observed while writing
+    /// `docs/observability-mechanics.md` §4.1.
     fn process_snapshot(&self) -> Result<ProcessSnapshot, WorldError>;
 
     /// Read one process's resource ledger.
