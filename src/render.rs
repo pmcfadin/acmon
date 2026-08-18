@@ -233,6 +233,22 @@ fn memory_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
         ));
     }
 
+    // Detector configuration health
+    //
+    // An unusable detector config is reported **unconditionally**, and first. A typo in the
+    // user's detector file means a fifth agent CLI silently stops being recognised — the
+    // sessions simply are not there, which is indistinguishable from a quiet machine and
+    // exactly the failure this whole project exists to remove.
+    if let Some(why) = &remembered.detector_config.unusable {
+        lines.extend(wrap_words(
+            &format!(
+                "WARNING: detector configuration is unusable — sessions from user-configured \
+                 CLIs will not be recognised ({why})."
+            ),
+            width,
+        ));
+    }
+
     // Notification channel health
     let health = &remembered.notify_health;
 

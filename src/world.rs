@@ -417,6 +417,15 @@ pub trait World {
         NotifyConfig::none()
     }
 
+    /// Read the detector configuration.
+    ///
+    /// The **default returns only the embedded detectors**, which is a legitimate state — a
+    /// machine with no user configuration uses the defaults. User configuration is optional,
+    /// and a World with no detector file is expected.
+    fn read_detector_config(&self) -> DetectorConfig {
+        DetectorConfig::embedded_only()
+    }
+
     /// Deliver a notification through a local command.
     ///
     /// Implementations run the command synchronously and check its exit code. A command that
@@ -459,6 +468,22 @@ pub struct NotifyConfig {
     pub unusable: Option<String>,
 }
 
+/// User-supplied detector configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectorConfig {
+    /// The detectors to use, after layering user config over embedded defaults.
+    pub detectors: Vec<crate::detect::Detector>,
+    /// Why the configuration could not be understood, when it could not.
+    ///
+    /// `None` covers both a configuration that parsed and a machine with no configuration
+    /// file at all — neither is a fault. A `Some` must be **reported unconditionally**, not
+    /// only when a collection happened to find sessions. A typo in the detector file means
+    /// a fifth agent CLI silently stops being recognised — the sessions simply are not there,
+    /// which is indistinguishable from a quiet machine and exactly the failure this whole
+    /// project exists to remove.
+    pub unusable: Option<String>,
+}
+
 impl NotifyConfig {
     /// No channels configured at all, and nothing wrong with that.
     pub fn none() -> Self {
@@ -484,6 +509,30 @@ impl NotifyConfig {
     /// Whether any channel is configured.
     pub fn has_any(&self) -> bool {
         self.local_command.is_some() || self.remote_url.is_some()
+    }
+}
+
+impl DetectorConfig {
+    /// Only embedded detectors, no user configuration, and nothing wrong with that.
+    pub fn embedded_only() -> Self {
+        DetectorConfig {
+            detectors: crate::detect::embedded_detectors(),
+            unusable: None,
+        }
+    }
+
+    /// Embedded detectors only, because the user configuration could not be understood. Carries
+    /// the reason.
+    ///
+    /// Distinct from [`DetectorConfig::embedded_only`] on purpose: both use only the embedded
+    /// detectors, and only this one is a fault. Collapsing them is what makes a broken config
+    /// invisible — a fifth agent CLI's sessions simply would not appear, which is
+    /// indistinguishable from the machine being quiet.
+    pub fn unusable(why: impl Into<String>) -> Self {
+        DetectorConfig {
+            detectors: crate::detect::embedded_detectors(),
+            unusable: Some(why.into()),
+        }
     }
 }
 

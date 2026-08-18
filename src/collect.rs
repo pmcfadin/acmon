@@ -2,7 +2,6 @@
 
 use std::time::{Duration, SystemTime};
 
-use crate::detect::embedded_detectors;
 use crate::liveness::{classify, Observation, Thresholds, Verdict};
 use crate::memory::{self, Degraded, Forgotten, Memory, Reading, Sighting};
 use crate::notify;
@@ -110,6 +109,8 @@ pub struct Remembered {
     pub retention: Duration,
     /// What notification channels are configured, and their health.
     pub notify_health: NotifyHealth,
+    /// What detector configuration was active this run.
+    pub detector_config: crate::world::DetectorConfig,
 }
 
 impl Remembered {
@@ -122,6 +123,7 @@ impl Remembered {
             forgotten: Vec::new(),
             retention: crate::memory::DEFAULT_FORGET,
             notify_health: NotifyHealth::none(),
+            detector_config: crate::world::DetectorConfig::embedded_only(),
         }
     }
 }
@@ -642,7 +644,10 @@ pub fn collect(
         StateRead::Unreadable(why) => (Memory::empty(), Some(Degraded::Unreadable(why))),
     };
 
-    let detectors = embedded_detectors();
+    // Read the detector configuration. This layers user-supplied detectors over the embedded
+    // defaults, so a fifth agent CLI can be recognised without waiting for a release.
+    let detector_config = world.read_detector_config();
+    let detectors = &detector_config.detectors;
 
     // Read both attribution sources once per collection, not once per session: the
     // answers cannot change between sessions, and each is a directory listing or file
@@ -702,7 +707,7 @@ pub fn collect(
         world,
         now,
         thresholds,
-        &detectors,
+        detectors,
     );
 
     let mut sessions = process_sessions;
@@ -1046,6 +1051,7 @@ pub fn collect(
                 remote_delivered,
                 remote_failed,
             },
+            detector_config,
         },
     })
 }
