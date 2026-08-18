@@ -13,6 +13,23 @@ use acmon::workspace::NamespaceUnmatched;
 use acmon::world::{PathUnavailable, ResourceSource, ResourcesUnavailable, Unmeasured};
 use acmon::{collect, Identity, RealWorld, World};
 
+/// A real world that keeps its remembered state somewhere disposable.
+///
+/// Any test that collects must use this. A collection now stores what it found, and a test
+/// suite that stored it in the developer's own `~/.acmon/state.json` would overwrite the
+/// history the running tool depends on — with a fixture-shaped version of this machine,
+/// silently, on every `cargo test`.
+///
+/// One path for the whole binary, deliberately. The tests below run concurrently and none of
+/// them reads the file back, so sharing it costs nothing — and a shared target is the
+/// condition the atomic replacement exists to survive, so several of them writing it at once
+/// is a use of the guarantee rather than a hazard.
+fn world_with_scratch_state() -> RealWorld {
+    RealWorld::with_state_file(
+        std::env::temp_dir().join(format!("acmon-seam3-{}.json", std::process::id())),
+    )
+}
+
 /// Helper to format a session identity for error messages.
 fn format_identity(identity: &Identity) -> String {
     match identity {
@@ -42,7 +59,7 @@ fn the_real_process_table_contains_the_observing_process() {
 
 #[test]
 fn collection_over_the_real_machine_yields_only_recognised_clis() {
-    let world = RealWorld::new();
+    let world = world_with_scratch_state();
 
     let snapshot = collect(&world, SystemTime::now(), &Thresholds::default())
         .expect("collection over the real machine should succeed");
@@ -381,7 +398,7 @@ fn every_workspace_attribution_on_this_machine_is_true_in_both_directions() {
     // ones, and an unresolved one must really be absent — the second direction is what
     // catches a matcher that is too strict, which is how the underscore defect
     // presented: a calm "no session here" for a workspace that had one.
-    let world = RealWorld::new();
+    let world = world_with_scratch_state();
     let recorded = world.recorded_namespaces().expect("listable");
     let snapshot = collect(&world, SystemTime::now(), &Thresholds::default())
         .expect("collection over the real machine should succeed");
@@ -672,7 +689,7 @@ fn codex_sessions_carry_last_activity_within_the_recency_window() {
 fn no_session_may_be_stalled_while_its_process_is_resident() {
     // Invariant: a session with a resident process can be ACTIVE, WAITING, or UNKNOWN,
     // but never STALLED. STALLED requires the absence of a process, which is observable.
-    let world = RealWorld::new();
+    let world = world_with_scratch_state();
     let snapshot = collect(&world, SystemTime::now(), &Thresholds::default())
         .expect("collection over the real machine should succeed");
 
@@ -692,7 +709,7 @@ fn no_session_may_be_stalled_while_its_process_is_resident() {
 fn every_transcript_derived_session_has_process_resident_false() {
     // Invariant: a transcript-derived session exists precisely because its process is
     // gone. The liveness logic depends on this being false to reach the STALLED verdict.
-    let world = RealWorld::new();
+    let world = world_with_scratch_state();
     let snapshot = collect(&world, SystemTime::now(), &Thresholds::default())
         .expect("collection over the real machine should succeed");
 
