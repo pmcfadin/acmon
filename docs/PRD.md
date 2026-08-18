@@ -206,9 +206,12 @@ baseline.
 
 ### Discovery (v1)
 
-- **F1** Enumerate agent sessions from the running process set, obtaining identity
-  and cwd **in one pass**. Enumerate-then-enrich is forbidden: it produced six
-  phantom "unreadable cwd" entries that were merely dead processes.
+- **F1** Enumerate agent sessions from the running process set. Process identity and
+  details represent one logical observation taken at one point in time. The
+  implementation enumerates all processes, then reads each executable path; a process
+  that exits in between produces a record with `PathUnavailable::ProcessExited` as a
+  stated reason. Such records are excluded when forming the session list, so an exiting
+  process never appears as a session with an unreadable field.
 - **F2** Recognise CLIs via **detectors as data** — exe-path glob plus optional argv
   pattern, with exclusions. Adding a CLI must not require a code change.
 - **F3** Detectors MUST exclude `/Applications/ChatGPT.app/`,

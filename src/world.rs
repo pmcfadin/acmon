@@ -269,16 +269,16 @@ pub enum StateRead {
 pub trait World {
     /// Enumerate all processes with their executable paths.
     ///
-    /// Returns a snapshot of the process table at a single point in time. The
-    /// implementation may perform multiple system calls to gather process details;
-    /// the contract is that the result represents one logical observation, not that
-    /// it's gathered in a single syscall.
+    /// Process identity and details represent one logical observation taken at one point
+    /// in time. The implementation enumerates all processes, then reads each executable
+    /// path; a process that exits in between produces a record with
+    /// [`PathUnavailable::ProcessExited`] as a stated reason. Such records are excluded
+    /// when forming the session list, so an exiting process never appears as a session
+    /// with an unreadable field.
     ///
-    /// A process that exits mid-enumeration reports
-    /// [`PathUnavailable::ProcessExited`] and one that is merely unreadable reports
-    /// [`PathUnavailable::PermissionDenied`]. Implementations MUST establish which
-    /// is true rather than assuming, because a confidently wrong reason is worse than
-    /// an admitted unknown.
+    /// A process that is merely unreadable reports [`PathUnavailable::PermissionDenied`].
+    /// Implementations MUST establish which is true rather than assuming, because a
+    /// confidently wrong reason is worse than an admitted unknown.
     fn process_snapshot(&self) -> Result<ProcessSnapshot, WorldError>;
 
     /// Read one process's resource ledger.
