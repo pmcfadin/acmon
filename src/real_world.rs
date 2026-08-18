@@ -10,8 +10,8 @@ use libproc::processes::{pids_by_type, ProcFilter};
 use crate::isotime::unix_seconds_from_iso8601;
 use crate::machtime::{MachTicks, MachTimebase};
 use crate::world::{
-    CodexSession, PathUnavailable, ProcessRecord, ProcessSnapshot, ResourceSource, Resources,
-    ResourcesUnavailable, StateRead, Unmeasured, World, WorldError,
+    CodexSession, NotifyConfig, NotifyOutcome, PathUnavailable, ProcessRecord, ProcessSnapshot,
+    ResourceSource, Resources, ResourcesUnavailable, StateRead, Unmeasured, World, WorldError,
 };
 
 /// How far below a sweep root the descent goes.
@@ -35,6 +35,11 @@ pub const SWEEP_BUDGET: usize = 4096;
 /// a non-atomic write ships.
 pub const STATE_VARIABLE: &str = "ACMON_STATE";
 
+/// The environment variable that relocates the notification config file.
+///
+/// Lets tests configure notifications without touching the developer's real config.
+pub const NOTIFY_CONFIG_VARIABLE: &str = "ACMON_NOTIFY_CONFIG";
+
 /// Where the state carried between runs is kept.
 ///
 /// `~/.acmon/state.json`, alongside the `~/.claude` and `~/.codex` directories the agents
@@ -57,6 +62,24 @@ fn state_path() -> Result<std::path::PathBuf, String> {
         .join("state.json"))
 }
 
+/// Where the notification configuration is kept.
+///
+/// `~/.acmon/notify.toml`, alongside the state file.
+fn notify_config_path() -> std::path::PathBuf {
+    if let Ok(explicit) = std::env::var(NOTIFY_CONFIG_VARIABLE) {
+        if !explicit.trim().is_empty() {
+            return std::path::PathBuf::from(explicit);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::Path::new(&home)
+            .join(".acmon")
+            .join("notify.toml");
+    }
+    // Fallback if HOME is not set — use a path that will just fail to read.
+    std::path::PathBuf::from("/dev/null/notify.toml")
+}
+
 pub struct RealWorld {
     observer_pid: i32,
     /// Read once from this machine, never assumed. Every duration in the kernel's
@@ -70,6 +93,10 @@ pub struct RealWorld {
     /// developer's own `~/.acmon/state.json`, and a test suite that quietly overwrites the
     /// history the tool depends on is worse than one that skips the case.
     state_file: Result<std::path::PathBuf, String>,
+    /// Where the notification configuration is kept.
+    ///
+    /// Resolved once at construction for the same reason as `state_file`.
+    notify_config_file: std::path::PathBuf,
 }
 
 impl RealWorld {
@@ -79,6 +106,7 @@ impl RealWorld {
             observer_pid: std::process::id() as i32,
             timebase: read_timebase(),
             state_file: state_path(),
+            notify_config_file: notify_config_path(),
         }
     }
 
@@ -86,6 +114,14 @@ impl RealWorld {
     pub fn with_state_file(path: impl Into<std::path::PathBuf>) -> Self {
         RealWorld {
             state_file: Ok(path.into()),
+            ..RealWorld::new()
+        }
+    }
+
+    /// The same world, reading notification config from a named file.
+    pub fn with_notify_config(path: impl Into<std::path::PathBuf>) -> Self {
+        RealWorld {
+            notify_config_file: path.into(),
             ..RealWorld::new()
         }
     }
@@ -1089,6 +1125,86 @@ impl World for RealWorld {
             let _ = std::fs::remove_file(&temporary);
             format!("could not store state in {}: {error}", path.display())
         })
+    }
+
+    fn read_notify_config(&self) -> NotifyConfig {
+        let contents = match std::fs::read_to_string(&self.notify_config_file) {
+            Ok(text) => text,
+            Err(_) => return NotifyConfig::none(),
+        };
+
+        // Parse TOML. A malformed config degrades to no channels configured, which is
+        // legitimate — but the degradation must be visible rather than silent.
+        #[derive(serde::Deserialize)]
+        struct ConfigFile {
+            local_command: Option<String>,
+            remote_url: Option<String>,
+        }
+
+        let parsed: ConfigFile = match toml::from_str(&contents) {
+            Ok(config) => config,
+            Err(_) => return NotifyConfig::none(),
+        };
+
+        NotifyConfig {
+            local_command: parsed.local_command.filter(|s| !s.trim().is_empty()),
+            remote_url: parsed.remote_url.filter(|s| !s.trim().is_empty()),
+        }
+    }
+
+    fn notify_local(&self, command: &str, payload: &str) -> NotifyOutcome {
+        // Run the command synchronously with the payload on stdin.
+        let mut child = match Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => return NotifyOutcome::Failed(format!("could not spawn: {e}")),
+        };
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(payload.as_bytes());
+        }
+
+        match child.wait() {
+            Ok(status) if status.success() => NotifyOutcome::Delivered,
+            Ok(status) => NotifyOutcome::Failed(format!("exited {}", status)),
+            Err(e) => NotifyOutcome::Failed(format!("wait failed: {e}")),
+        }
+    }
+
+    fn notify_remote(&self, url: &str, payload: &str) -> NotifyOutcome {
+        // Use curl synchronously. Check both process exit status and HTTP status code.
+        let output = match Command::new("curl")
+            .arg("--fail") // Exit non-zero on HTTP 4xx/5xx
+            .arg("--silent") // No progress meter
+            .arg("--show-error") // But do show errors
+            .arg("--max-time")
+            .arg("10") // 10 second timeout
+            .arg("-X")
+            .arg("POST")
+            .arg("-H")
+            .arg("Content-Type: application/json")
+            .arg("--data")
+            .arg(payload)
+            .arg(url)
+            .output()
+        {
+            Ok(output) => output,
+            Err(e) => return NotifyOutcome::Failed(format!("could not spawn curl: {e}")),
+        };
+
+        if output.status.success() {
+            NotifyOutcome::Delivered
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            NotifyOutcome::Failed(format!("curl exited {}: {}", output.status, stderr.trim()))
+        }
     }
 }
 

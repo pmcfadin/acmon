@@ -233,6 +233,39 @@ fn memory_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
         ));
     }
 
+    // Notification channel health
+    let health = &remembered.notify_health;
+    if !health.config.has_any() {
+        // A monitor with no alerting wired must say so rather than silently never alerting.
+        // Only warn when there were actually notable states to announce.
+        let total_announced = health.local_delivered + health.remote_delivered;
+        let total_failed = health.local_failed + health.remote_failed;
+        if total_announced > 0 || total_failed > 0 {
+            lines.extend(wrap_words(
+                "WARNING: No notification channels configured — notable states were observed \
+                 but not announced.",
+                width,
+            ));
+        }
+    } else if health.has_failures() {
+        // At least one channel is configured, and at least one delivery failed.
+        let mut parts = Vec::new();
+        if health.local_failed > 0 {
+            parts.push(format!("local: {} failed", health.local_failed));
+        }
+        if health.remote_failed > 0 {
+            parts.push(format!("remote: {} failed", health.remote_failed));
+        }
+        lines.extend(wrap_words(
+            &format!(
+                "WARNING: Notification delivery failures ({}) — these alerts will be \
+                 re-announced on the next run.",
+                parts.join(", ")
+            ),
+            width,
+        ));
+    }
+
     lines
 }
 

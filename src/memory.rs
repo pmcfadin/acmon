@@ -109,6 +109,10 @@ pub struct RememberedSession {
 pub struct Memory {
     pub workspaces: Vec<RememberedWorkspace>,
     pub sessions: Vec<RememberedSession>,
+    /// What has been announced on earlier runs. Added in schema v1 with `#[serde(default)]`,
+    /// so that a state file written before this field existed still parses.
+    #[serde(default)]
+    pub announcements: crate::notify::AnnouncementRecord,
 }
 
 impl Memory {
@@ -262,6 +266,7 @@ pub fn remember(
     let Memory {
         workspaces: previous_workspaces,
         sessions: previous_sessions,
+        announcements,
     } = previous;
 
     let mut workspaces: Vec<RememberedWorkspace> = Vec::new();
@@ -337,6 +342,7 @@ pub fn remember(
     Memory {
         workspaces,
         sessions: remembered_sessions,
+        announcements,
     }
 }
 
@@ -350,6 +356,7 @@ pub fn forget(memory: Memory, now: SystemTime, retention: Duration) -> (Memory, 
     let Memory {
         workspaces,
         sessions,
+        announcements,
     } = memory;
 
     let mut kept = Vec::new();
@@ -376,6 +383,7 @@ pub fn forget(memory: Memory, now: SystemTime, retention: Duration) -> (Memory, 
         Memory {
             workspaces: kept,
             sessions,
+            announcements,
         },
         forgotten,
     )
