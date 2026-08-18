@@ -1329,3 +1329,78 @@ fn a_failed_delivery_says_which_channel_failed_and_that_it_will_be_retried() {
         "the healthy channel is not a failure and must not be listed as one; got:\n{text}"
     );
 }
+
+// --- A CLI id is whatever the user typed (ticket #12) ---
+
+fn snapshot_of_cli(cli: &str) -> Snapshot {
+    Snapshot {
+        taken_at: fixture_now(),
+        sessions: vec![Session {
+            identity: Identity::Process { pid: 900 },
+            cli: cli.to_string(),
+            resources: Ok(measured_ledger()),
+            workspace: measured_workspace(),
+            last_reading: None,
+            liveness: active_verdict(),
+        }],
+        workspaces: Vec::new(),
+        unlocated: Vec::new(),
+        sweep_complete: true,
+        remembered: Remembered::none(),
+    }
+}
+
+#[test]
+fn a_user_configured_cli_id_is_shown_in_full_when_it_fits() {
+    // `cursor-agent` is twelve characters and the most likely fifth CLI on this machine. Until
+    // detectors became user-configurable the only ids possible were `claude` and `codex`, both
+    // of which fit in six — so six was correct right up until it silently was not.
+    let text = rendered(&snapshot_of_cli("cursor-agent"), wide());
+
+    assert!(
+        text.contains("cursor-agent"),
+        "a plausible user-configured id must appear whole; got:\n{text}"
+    );
+    assert!(
+        !text.contains("cursor-agent…"),
+        "and unmarked, because nothing was dropped; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_cli_id_too_long_for_its_column_is_marked_rather_than_quietly_cut() {
+    // The failure this guards. `codex-experimental` cut to `codex-` is not a shorter version of
+    // this CLI's name — it is a plausible name for a different CLI, and an unmarked cut gives
+    // the reader no way to know which one the row is about. Same class as a truncated CPU total.
+    let text = rendered(&snapshot_of_cli("codex-experimental"), wide());
+
+    assert!(
+        text.contains('…'),
+        "an id that does not fit must carry the mark; got:\n{text}"
+    );
+    assert!(
+        text.contains("codex-exper…"),
+        "keeping the head, because a CLI's identity is at its start — unlike a path, whose \
+         identity is at its end; got:\n{text}"
+    );
+}
+
+#[test]
+fn two_cli_ids_sharing_a_prefix_are_still_distinguishable_at_the_shortened_width() {
+    // The reason the mark alone is not enough and the column had to widen too. At six, both of
+    // these render as `codex-`, and the table would assert that two different CLIs are one.
+    let short = rendered(&snapshot_of_cli("codex-alpha"), wide());
+    let long = rendered(&snapshot_of_cli("codex-bravo"), wide());
+
+    assert!(short.contains("codex-alpha") && long.contains("codex-bravo"));
+    assert_ne!(
+        short
+            .lines()
+            .find(|l| l.contains("codex"))
+            .expect("a row naming the cli"),
+        long.lines()
+            .find(|l| l.contains("codex"))
+            .expect("a row naming the cli"),
+        "two distinct CLIs must not render identically"
+    );
+}
