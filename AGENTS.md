@@ -39,6 +39,18 @@ rule, and each produced a calm, plausible, wrong answer instead of an error.
 vary by roughly 2x between runs; only *ratios* and *invariants* reproduce. A test
 asserting "cold exec takes 79 ms" fails for reasons unrelated to correctness.
 
+**Run the suite with `cargo suite`, not `cargo test`.** `cargo test` stops at the first
+failing test binary, so one red seam silently skips every later one — that hid 80 of 203
+tests once, and the run still read as "123 passed, 1 failed". `cargo suite` is the alias
+in [`.cargo/config.toml`](.cargo/config.toml) for `cargo test --no-fail-fast`. A partial
+run is never evidence that the rest is green.
+
+**No test may assert which checkout it is running in.** Work here happens in linked
+worktrees under `.claude/worktrees/<name>`, where `.git` is a file rather than a
+directory. The suite has to pass there and in the primary checkout, so a test that cares
+about the difference establishes the expected value independently and asserts the
+invariant — the same family as the rule about absolute timings.
+
 **Assert success before believing a measurement.** Two measurements behind the
 mechanics document were void because test binaries never actually executed while
 still reporting plausible timings. Check exit codes first.

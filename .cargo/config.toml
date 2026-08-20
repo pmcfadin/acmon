@@ -1,0 +1,6 @@
+# `cargo test` cannot be made to stop failing fast from a config file, so this is an
+# alias rather than a default: `cargo suite` is the command to run, and the one
+# `AGENTS.md` documents. It keeps going past a failing test binary, so a red early seam
+# cannot hide the seams after it.
+[alias]
+suite = "test --no-fail-fast"

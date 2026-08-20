@@ -738,7 +738,11 @@ fn every_transcript_derived_session_has_process_resident_false() {
 #[test]
 fn repository_root_of_this_crates_directory_is_this_crate() {
     // This crate is a git repository, so asking for the root of its own directory must
-    // return the root, and it must not be a linked worktree (it is the primary).
+    // return the root, and the `linked_worktree` flag must agree with what this checkout
+    // actually is. Which of the two it is depends on where the suite runs — agents here
+    // work in linked worktrees under `.claude/worktrees/<name>` — so the test establishes
+    // the expected value from `CARGO_MANIFEST_DIR/.git` (a file in a linked worktree, a
+    // directory in a primary checkout) rather than asserting a location.
     let world = RealWorld::new();
     let cwd = std::env::current_dir().expect("this test process has a working directory");
     let cwd_str = cwd.to_str().expect("a UTF-8 path");
@@ -757,10 +761,20 @@ fn repository_root_of_this_crates_directory_is_this_crate() {
         "repository root {root} must be an ancestor of this directory {cwd_str}"
     );
 
-    // This is the primary repository, not a linked worktree.
-    assert!(
-        !linked_worktree,
-        "this crate's repository is not a linked worktree"
+    // Establish the expected value independently of the code under test: `.git` beside
+    // this crate's manifest is a file in a linked worktree and a directory in a primary
+    // checkout. `CARGO_MANIFEST_DIR` is known at compile time, so this does not reuse the
+    // returned root or repeat the ancestor walk.
+    let dot_git = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".git");
+    let dot_git_metadata =
+        std::fs::metadata(&dot_git).expect("this crate's checkout has a `.git` entry");
+    let expected_linked_worktree = dot_git_metadata.is_file();
+
+    assert_eq!(
+        linked_worktree, expected_linked_worktree,
+        "`linked_worktree` must be derived from whether {} is a file (linked worktree) \
+         or a directory (primary checkout)",
+        dot_git.display()
     );
 }
 
