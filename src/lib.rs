@@ -10,6 +10,7 @@ pub mod memory;
 pub mod notify;
 pub mod real_world;
 pub mod render;
+pub mod state;
 pub mod vcs;
 pub mod workspace;
 pub mod world;
