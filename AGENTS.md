@@ -4,13 +4,18 @@ Measuring what AI coding agents actually cost on a managed macOS developer machi
 and how much of that cost is the machine's fault rather than the work's. See
 [`README.md`](README.md).
 
-**Status:** v1 implementation in progress. `acmon` runs and is worth running: it prints a
-session table and an at-risk workspace panel in about 2.5 s. **Ask GitHub which tickets
-are open and unblocked** — that is authoritative, and any list written here goes stale.
-Two carried-forward notes that GitHub would not tell you: #13 records a #2 criterion met
-in effect rather than in letter, and the whole collection currently takes ~2.5 s against a
-one-second fast-tier budget, which the tiering tickets own rather than being a defect in
-what exists.
+**Status:** v1 implementation in progress. The crate now builds **two binaries** — `amon`,
+the monitor, and `agtop`, the display. **If it measures, it is `amon`; if it draws, it is
+`agtop`.** `agtop` runs and is worth running: it prints a session table and an at-risk
+workspace panel in about 2.5 s. `amon` is a verb surface only so far; every verb it
+advertises fails loudly rather than exiting zero having done nothing, and `amon --help`
+names the ticket that will deliver each one.
+
+**Ask GitHub which tickets are open and unblocked** — that is authoritative, and any list
+written here goes stale. Two carried-forward notes that GitHub would not tell you: #13
+records a #2 criterion met in effect rather than in letter, and the whole collection
+currently takes ~2.5 s against a one-second fast-tier budget, which the tiering tickets own
+rather than being a defect in what exists.
 
 ## Orientation
 

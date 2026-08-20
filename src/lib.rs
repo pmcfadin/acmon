@@ -1,5 +1,6 @@
 //! acmon — measuring what AI coding agents cost on a managed macOS machine.
 
+pub mod cli;
 pub mod collect;
 pub mod detect;
 mod isotime;
