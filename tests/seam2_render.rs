@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use acmon::liveness::{Method, State, Verdict};
 use acmon::render::{minimum_width, render_to_lines, required_height};
 use acmon::vcs::{Unreadable, WorkspaceState};
-use acmon::workspace::{NamespaceResolution, Workspace, WorkspaceUnknown};
+use acmon::workspace::{NamespaceResolution, NamespaceUnmatched, Workspace, WorkspaceUnknown};
 use acmon::world::{ResourceSource, Resources, ResourcesUnavailable, Unmeasured};
 use acmon::{Identity, Remembered, Session, Snapshot, WorkspaceReport};
 
@@ -114,6 +114,19 @@ fn snapshot_in(workspace: Result<Workspace, WorkspaceUnknown>) -> Snapshot {
 
 fn rendered(snapshot: &Snapshot, width: u16) -> String {
     render_to_lines(snapshot, width, required_height(snapshot, width)).join("\n")
+}
+
+/// The rendered output with its line breaks and padding collapsed to single spaces.
+///
+/// For asserting on a *sentence*. A footer caveat is wrapped to the terminal's width, so
+/// where the break falls is a property of the width rather than of what was said — and an
+/// assertion on a phrase that happens to straddle one fails for a reason that has nothing to
+/// do with the behaviour being tested.
+fn prose(snapshot: &Snapshot, width: u16) -> String {
+    rendered(snapshot, width)
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
 }
 
 #[test]
@@ -465,6 +478,130 @@ fn a_state_is_never_abbreviated_to_fit() {
         text.contains("STALLED"),
         "the full state must survive at the narrowest renderable width; got:\n{text}"
     );
+}
+
+// ===== An UNKNOWN state has to say why it is unknown =====
+//
+// Both snapshots below carry the same state reached by the same method. They differ only in
+// whether a transcript store exists for the CLI at all — a structural limit against a fault —
+// and that difference is the one a reader acts on.
+
+/// A session from a CLI added by configuration, as the collector really produces it: listed,
+/// measured, attributed to a directory, and with no store to measure silence against. Pinned
+/// against the collector in seam 10 by
+/// `a_user_configured_cli_is_listed_but_its_liveness_is_honestly_unknown`.
+fn snapshot_of_a_cli_with_no_transcript_store() -> Snapshot {
+    Snapshot {
+        workspaces: Vec::new(),
+        unlocated: Vec::new(),
+        sweep_complete: true,
+        taken_at: fixture_now(),
+        remembered: Remembered::none(),
+        sessions: vec![Session {
+            identity: Identity::Process { pid: 900 },
+            cli: "cursor-agent".to_string(),
+            resources: Ok(measured_ledger()),
+            workspace: Ok(Workspace {
+                path: "/Users/pmcfadin/projects/testing".to_string(),
+                namespace: Err(NamespaceUnmatched::UnknownCli("cursor-agent".to_string())),
+            }),
+            last_reading: None,
+            liveness: Verdict {
+                state: State::Unknown,
+                method: Method::TranscriptActivityUnknown,
+            },
+        }],
+    }
+}
+
+/// A session whose CLI does have a transcript store, which was found and then would not say
+/// when the transcript last changed. The same UNKNOWN, and a fault rather than a limit.
+fn snapshot_of_a_transcript_that_would_not_answer() -> Snapshot {
+    snapshot_in_state(Verdict {
+        state: State::Unknown,
+        method: Method::TranscriptActivityUnknown,
+    })
+}
+
+#[test]
+fn a_session_whose_cli_has_no_transcript_store_says_so_on_screen() {
+    // The whole of #22: the reason was computed, stored on the workspace, and then dropped by
+    // the renderer, leaving a row nobody could act on or account for.
+    let text = prose(&snapshot_of_a_cli_with_no_transcript_store(), wide());
+
+    assert!(
+        text.contains("no transcript store is known for CLI cursor-agent"),
+        "the row's state is unknown for a stated reason, and the reason must be on screen; \
+         got:\n{text}"
+    );
+    assert!(
+        text.contains("900 cursor-agent"),
+        "and it must name which row it is about, or a machine with several sessions cannot use \
+         it; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_missing_transcript_store_and_an_unreadable_one_read_differently() {
+    // A limit and a fault. One is investigated and may clear by itself; the other never will,
+    // and the reader has to stop waiting for it. Identical output would be the calm plausible
+    // wrong answer in the shape of a missing distinction.
+    let limit = prose(&snapshot_of_a_cli_with_no_transcript_store(), wide());
+    let fault = prose(&snapshot_of_a_transcript_that_would_not_answer(), wide());
+
+    assert!(
+        limit.contains("UNKNOWN!"),
+        "a state no later run can determine must be marked in the row itself; got:\n{limit}"
+    );
+    assert!(
+        !fault.contains("UNKNOWN!"),
+        "a store that merely would not answer this time must not be marked as a limit; \
+         got:\n{fault}"
+    );
+    assert!(
+        fault.contains("activity could not be established"),
+        "and the fault must state its own reason rather than being left blank; got:\n{fault}"
+    );
+    assert!(
+        !fault.contains("no transcript store is known"),
+        "the two reasons must not be interchangeable; got:\n{fault}"
+    );
+}
+
+#[test]
+fn a_session_that_can_never_be_announced_says_so_rather_than_simply_never_alerting() {
+    // The more serious half of #22. #12's headline is that a fifth CLI needs no code change,
+    // and a reader could reasonably assume alerting came with it. WAITING is the only session
+    // state ever announced and reaching it needs a silence measurement, so this session is
+    // monitored and will never alert — which must be readable rather than deducible from an
+    // alert that never arrives.
+    let limit = prose(&snapshot_of_a_cli_with_no_transcript_store(), wide());
+    let fault = prose(&snapshot_of_a_transcript_that_would_not_answer(), wide());
+
+    assert!(
+        limit.contains("never announced"),
+        "a session that cannot alert must say so; got:\n{limit}"
+    );
+    assert!(
+        !fault.contains("never announced"),
+        "and a session that merely has no verdict this run must not, or the note becomes \
+         furniture a reader stops seeing; got:\n{fault}"
+    );
+}
+
+#[test]
+fn nothing_is_claimed_about_a_user_configured_clis_liveness() {
+    // The row must not acquire a state by being explained. Absence of evidence stays absence
+    // of evidence, however much prose is printed underneath it.
+    let text = prose(&snapshot_of_a_cli_with_no_transcript_store(), wide());
+
+    for state in ["ACTIVE", "WAITING", "STALLED"] {
+        assert!(
+            !text.contains(state),
+            "no state but UNKNOWN was observed for this session, so {state} must appear \
+             nowhere; got:\n{text}"
+        );
+    }
 }
 
 #[test]

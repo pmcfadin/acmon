@@ -16,7 +16,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
 
-use crate::collect::{Identity, Session, Snapshot, WorkspaceReport};
+use crate::collect::{Identity, LivenessUnknown, Session, Snapshot, WorkspaceReport};
 use crate::vcs::{Unreadable, WorkspaceState};
 use crate::workspace::NamespaceResolution;
 use crate::world::Resources;
@@ -38,6 +38,18 @@ const FLOOR_CAVEAT: &str =
 /// exists rather than the states simply being printed.
 const INFERENCE_MARKER_CAVEAT: &str =
     "A state marked ? was inferred from silence, not observed directly.";
+
+/// What the other marker on a state means.
+///
+/// `?` says a verdict was reached by inference. This says something worse: no verdict was
+/// reached at all, and not for a reason that will clear on its own. Only WAITING is ever
+/// announced (see [`notify`](crate::notify)) and reaching it needs a silence measurement, so a
+/// session whose CLI has no transcript store is monitored and never alerts. Unsaid, that is
+/// something a reader could only ever infer from an alert that did not arrive — which is how
+/// a fifth CLI comes to be watched by a tool that will never speak about it.
+const LIMIT_MARKER_CAVEAT: &str =
+    "A state marked ! could not be determined at all, and will not be on any later run \
+     either — such a session is monitored but is never announced.";
 
 /// What the marker on a figure means.
 ///
@@ -193,7 +205,41 @@ fn footer_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
         }
     }
 
+    lines.extend(unknown_state_lines(snapshot, width));
     lines.extend(memory_lines(snapshot, width));
+    lines
+}
+
+/// What has to be said about a state that could not be determined, one line per row.
+///
+/// UNKNOWN with nothing beside it is the one verdict a reader can neither act on nor account
+/// for: a transcript store that broke and a store that was never there for this CLI look
+/// identical in the state column, and they need opposite responses — investigate the first,
+/// live with the second. So each undetermined state names its own reason here, and a reason
+/// that is a structural limit rather than a fault is marked as one.
+fn unknown_state_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
+    let undetermined: Vec<(&Session, LivenessUnknown)> = snapshot
+        .sessions
+        .iter()
+        .filter_map(|session| session.liveness_unknown().map(|why| (session, why)))
+        .collect();
+    if undetermined.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    // Explained only where the marker actually appears, for the same reason the inference
+    // caveat is: a note printed on every run becomes furniture a reader stops seeing.
+    if undetermined.iter().any(|(_, why)| why.is_structural()) {
+        lines.extend(wrap_words(LIMIT_MARKER_CAVEAT, width));
+    }
+    for (session, why) in &undetermined {
+        let marker = if why.is_structural() { "! " } else { "" };
+        lines.extend(wrap_words(
+            &format!("  {marker}{}: {why}.", identify(session)),
+            width,
+        ));
+    }
     lines
 }
 
@@ -653,20 +699,31 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot) {
     frame.render_widget(Paragraph::new(caveats.join("\n")), caveat_area);
 }
 
-/// A state, with a marker when the verdict behind it was inferred rather than observed.
+/// A state, with a marker when the verdict behind it was inferred rather than observed, or
+/// when there is no verdict to be had at all.
 ///
 /// The marker is the whole reason the state column is eight wide. Without it, a WAITING
 /// reached by guessing at a human's intent would be indistinguishable from an ACTIVE
-/// established by a transcript that changed a second ago.
-fn state_cell(verdict: &crate::liveness::Verdict) -> String {
-    let state = match verdict.state {
+/// established by a transcript that changed a second ago — and an UNKNOWN that no later run
+/// can resolve would be indistinguishable from one that the next run may well answer.
+///
+/// At most one marker is ever appended, which is what keeps the cell inside its eight
+/// columns. The two cannot co-occur: an inferred verdict is always WAITING, and a structural
+/// limit is always UNKNOWN.
+fn state_cell(session: &Session) -> String {
+    let state = match session.liveness.state {
         crate::liveness::State::Active => "ACTIVE",
         crate::liveness::State::Waiting => "WAITING",
         crate::liveness::State::Stalled => "STALLED",
         crate::liveness::State::Unknown => "UNKNOWN",
     };
-    if verdict.method.is_inferred() {
+    if session.liveness.method.is_inferred() {
         format!("{state}?")
+    } else if session
+        .liveness_unknown()
+        .is_some_and(|why| why.is_structural())
+    {
+        format!("{state}!")
     } else {
         state.to_string()
     }
@@ -720,7 +777,7 @@ fn row_for(session: &Session, workspace_width: u16) -> Row<'static> {
         // A CLI id comes from user configuration since #12, so its length is not something
         // this code gets to assume.
         shorten_with_a_mark(&session.cli, CLI_WIDTH),
-        state_cell(&session.liveness),
+        state_cell(session),
     ];
     cells.extend(figures);
     cells.push(workspace);

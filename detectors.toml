@@ -4,6 +4,14 @@
 # Matching is on the RESOLVED EXECUTABLE PATH, never the process command name.
 # Claude Code sets its process title to its version string, so a name-based match
 # finds nothing at all.
+#
+# WHAT A DETECTOR DOES NOT BUY. A detector says which executables are an agent. It does
+# not say where that CLI keeps its conversation log, and liveness is derived entirely from
+# a transcript's modification time. So a CLI added here is listed, measured and attributed
+# to a directory, and its state stays UNKNOWN — marked `!` in the display, with the reason
+# printed beneath the table. Because WAITING is the only session state that is ever
+# announced, such a session is monitored and never alerts. Recognising a fifth CLI is a
+# data change; giving it a state is not.
 
 [[detector]]
 id = "claude"

@@ -17,7 +17,8 @@ pub mod workspace;
 pub mod world;
 
 pub use collect::{
-    collect, CollectError, Identity, NotifyHealth, Remembered, Session, Snapshot, WorkspaceReport,
+    collect, CollectError, Identity, LivenessUnknown, NotifyHealth, Remembered, Session, Snapshot,
+    WorkspaceReport,
 };
 pub use deliver::DeliveryReport;
 pub use detect::Detector;

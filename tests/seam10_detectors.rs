@@ -7,7 +7,7 @@
 use std::time::{Duration, SystemTime};
 
 use acmon::liveness::Thresholds;
-use acmon::world::World;
+use acmon::world::{ProcessRecord, ProcessSnapshot, World, WorldError};
 use acmon::{collect, RealWorld};
 
 fn now() -> SystemTime {
@@ -282,83 +282,86 @@ fn an_empty_user_detector_file_is_treated_as_no_additions() {
 
 // --- Integration: detectors actually used in collection ---
 
+/// A machine with exactly the processes and detector configuration a test states.
+///
+/// At module scope so that more than one test can drive a whole collection against it. It
+/// answers every other question the way a machine with nothing else on it would: no recorded
+/// namespaces, no Codex sessions, no repositories, and no transcript activity.
+struct FakeMachine {
+    detector_config: acmon::world::DetectorConfig,
+    records: Vec<ProcessRecord>,
+}
+
+impl World for FakeMachine {
+    fn process_snapshot(&self) -> Result<ProcessSnapshot, WorldError> {
+        Ok(ProcessSnapshot {
+            records: self.records.clone(),
+            observer_pid: 4242,
+        })
+    }
+
+    fn resources(
+        &self,
+        _pid: i32,
+    ) -> Result<acmon::world::Resources, acmon::world::ResourcesUnavailable> {
+        Ok(acmon::world::Resources {
+            source: acmon::world::ResourceSource::Rusage,
+            own_cpu: Ok(Duration::from_secs(10)),
+            children_cpu: Ok(Duration::from_secs(50)),
+            current_memory: Ok(100_000_000),
+            peak_memory: Ok(200_000_000),
+            bytes_written: Ok(50_000_000),
+        })
+    }
+
+    fn recorded_namespaces(&self) -> Result<Vec<String>, WorldError> {
+        Ok(Vec::new())
+    }
+
+    fn namespace_activity(
+        &self,
+        _namespace: &str,
+    ) -> Result<SystemTime, acmon::world::ActivityUnavailable> {
+        Err(acmon::world::ActivityUnavailable::NotRecorded)
+    }
+
+    fn codex_sessions(&self) -> Result<Vec<acmon::world::CodexSession>, WorldError> {
+        Ok(Vec::new())
+    }
+
+    fn repository_root(&self, _path: &str) -> Option<(String, bool)> {
+        None
+    }
+
+    fn vcs_facts(&self, _path: &str) -> Result<acmon::vcs::VcsFacts, acmon::vcs::Unreadable> {
+        Err(acmon::vcs::Unreadable::NotVersionControlled)
+    }
+
+    fn resolve_namespace(&self, _namespace: &str) -> acmon::workspace::NamespaceResolution {
+        acmon::workspace::NamespaceResolution::NoLongerExists
+    }
+
+    fn sweep_for_repositories(&self, _roots: &[String]) -> acmon::world::Sweep {
+        acmon::world::Sweep {
+            repositories: Vec::new(),
+            complete: true,
+            directories_visited: 0,
+        }
+    }
+
+    fn output_width(&self) -> u16 {
+        120
+    }
+
+    fn read_detector_config(&self) -> acmon::world::DetectorConfig {
+        self.detector_config.clone()
+    }
+}
+
 #[test]
 fn a_session_from_a_user_defined_cli_is_collected() {
     // End-to-end: a cursor-agent process with a user detector should produce a session.
     // This drives the whole collect path, not just the config reader.
-    use acmon::world::{ProcessRecord, ProcessSnapshot, World, WorldError};
-
-    struct FakeWorld {
-        detector_config: acmon::world::DetectorConfig,
-        records: Vec<ProcessRecord>,
-    }
-
-    impl World for FakeWorld {
-        fn process_snapshot(&self) -> Result<ProcessSnapshot, WorldError> {
-            Ok(ProcessSnapshot {
-                records: self.records.clone(),
-                observer_pid: 4242,
-            })
-        }
-
-        fn resources(
-            &self,
-            _pid: i32,
-        ) -> Result<acmon::world::Resources, acmon::world::ResourcesUnavailable> {
-            Ok(acmon::world::Resources {
-                source: acmon::world::ResourceSource::Rusage,
-                own_cpu: Ok(Duration::from_secs(10)),
-                children_cpu: Ok(Duration::from_secs(50)),
-                current_memory: Ok(100_000_000),
-                peak_memory: Ok(200_000_000),
-                bytes_written: Ok(50_000_000),
-            })
-        }
-
-        fn recorded_namespaces(&self) -> Result<Vec<String>, WorldError> {
-            Ok(Vec::new())
-        }
-
-        fn namespace_activity(
-            &self,
-            _namespace: &str,
-        ) -> Result<SystemTime, acmon::world::ActivityUnavailable> {
-            Err(acmon::world::ActivityUnavailable::NotRecorded)
-        }
-
-        fn codex_sessions(&self) -> Result<Vec<acmon::world::CodexSession>, WorldError> {
-            Ok(Vec::new())
-        }
-
-        fn repository_root(&self, _path: &str) -> Option<(String, bool)> {
-            None
-        }
-
-        fn vcs_facts(&self, _path: &str) -> Result<acmon::vcs::VcsFacts, acmon::vcs::Unreadable> {
-            Err(acmon::vcs::Unreadable::NotVersionControlled)
-        }
-
-        fn resolve_namespace(&self, _namespace: &str) -> acmon::workspace::NamespaceResolution {
-            acmon::workspace::NamespaceResolution::NoLongerExists
-        }
-
-        fn sweep_for_repositories(&self, _roots: &[String]) -> acmon::world::Sweep {
-            acmon::world::Sweep {
-                repositories: Vec::new(),
-                complete: true,
-                directories_visited: 0,
-            }
-        }
-
-        fn output_width(&self) -> u16 {
-            120
-        }
-
-        fn read_detector_config(&self) -> acmon::world::DetectorConfig {
-            self.detector_config.clone()
-        }
-    }
-
     // Build a detector config with cursor-agent.
     let embedded = acmon::detect::embedded_detectors();
     let user = vec![acmon::detect::Detector {
@@ -372,7 +375,7 @@ fn a_session_from_a_user_defined_cli_is_collected() {
         unusable: None,
     };
 
-    let world = FakeWorld {
+    let world = FakeMachine {
         detector_config,
         records: vec![
             ProcessRecord {
@@ -572,5 +575,75 @@ fn a_user_configured_cli_is_listed_but_its_liveness_is_honestly_unknown() {
             .contains("cursor-agent"),
         "which names the CLI, so a reader can tell which store is missing; got {:?}",
         workspace.namespace
+    );
+}
+
+#[test]
+fn a_user_configured_clis_row_says_why_it_has_no_state_and_that_it_cannot_alert() {
+    // The other half of the same truth, and the one #22 is about: the verdict above is correct
+    // *silently*. A row reading UNKNOWN forever, with nothing beside it, is indistinguishable
+    // from a Claude session whose transcript genuinely could not be read — which is a fault,
+    // where this is a structural limit. And because WAITING is the only session state ever
+    // announced, this session is monitored and will never alert; a reader must be able to read
+    // that rather than deduce it from an alert that never comes.
+    //
+    // Driven through the real collection so the reason on screen is the one the collector
+    // produced, not one a fixture asserted into existence.
+    let world = FakeMachine {
+        detector_config: acmon::world::DetectorConfig {
+            detectors: acmon::detect::merge_detectors(
+                acmon::detect::embedded_detectors(),
+                vec![acmon::detect::Detector {
+                    id: "cursor-agent".to_string(),
+                    exe_contains: vec!["/cursor-agent/versions/".to_string()],
+                    exe_ends_with: Vec::new(),
+                }],
+            ),
+            unusable: None,
+        },
+        records: vec![
+            ProcessRecord {
+                pid: 4242,
+                exe_path: Ok("/usr/bin/acmon".to_string()),
+                cwd: Ok("/Users/pmcfadin".to_string()),
+            },
+            ProcessRecord {
+                pid: 900,
+                exe_path: Ok(CURSOR_AGENT_PATH.to_string()),
+                cwd: Ok("/Users/pmcfadin/projects/testing".to_string()),
+            },
+        ],
+    };
+
+    let snapshot =
+        collect(&world, now(), &Thresholds::default()).expect("collection should succeed");
+
+    // Wide enough that nothing here is a truncation test; the narrow cases belong to seam 2.
+    // Whitespace is collapsed because a footer caveat is wrapped to the terminal's width, so
+    // where a line breaks is a property of that width and not of what was said.
+    let width = acmon::render::minimum_width() + 40;
+    let text = acmon::render::render_to_lines(
+        &snapshot,
+        width,
+        acmon::render::required_height(&snapshot, width),
+    )
+    .join(" ")
+    .split_whitespace()
+    .collect::<Vec<&str>>()
+    .join(" ");
+
+    assert!(
+        text.contains("no transcript store is known for CLI cursor-agent"),
+        "the row must say why its state is unknown; got:\n{text}"
+    );
+    assert!(
+        text.contains("UNKNOWN!"),
+        "and mark the state as one no later run can determine, so it is not read as a fault \
+         that might clear; got:\n{text}"
+    );
+    assert!(
+        text.contains("never announced"),
+        "and say that such a session never alerts, rather than leaving that to be inferred \
+         from an alert that never arrives; got:\n{text}"
     );
 }

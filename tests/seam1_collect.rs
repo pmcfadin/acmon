@@ -1162,6 +1162,67 @@ fn a_session_with_no_recorded_transcript_is_unknown_rather_than_stalled() {
 }
 
 #[test]
+fn an_unknown_state_carries_the_reason_it_could_not_be_determined() {
+    // UNKNOWN is honest, and on its own it is unusable: a store that exists and would not
+    // answer looks exactly like a CLI that has no store at all, and those need opposite
+    // responses from a human. Both worlds below are the first kind, so both must read as a
+    // fault this machine could fix rather than a limit to be lived with.
+    let unreadable = FakeWorld::with(
+        vec![
+            rec(69046, CLAUDE_EXE),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    )
+    .namespace_activity(
+        CLAUDE_NAMESPACE.to_string(),
+        Err(ActivityUnavailable::Unreadable(
+            "permission denied".to_string(),
+        )),
+    );
+
+    let snapshot = collect(&unreadable, fixture_now(), &Thresholds::default())
+        .expect("collection should succeed");
+    let why = snapshot.sessions[0]
+        .liveness_unknown()
+        .expect("an UNKNOWN state has a reason, and dropping it is what #22 reports");
+    assert!(
+        !why.is_structural(),
+        "a transcript this machine holds and could not read is a fault, not a limit: it is \
+         worth investigating and may answer on the next run; got {why}"
+    );
+    assert!(
+        why.to_string().contains(CLAUDE_NAMESPACE),
+        "and it must name the transcript it could not read; got {why}"
+    );
+
+    // A workspace with nothing recorded against it: the store was read and had no answer,
+    // which is still a fault of attribution rather than a missing store.
+    let unrecorded = FakeWorld::with(
+        vec![
+            rec_in(69046, CLAUDE_EXE, "/Users/pmcfadin/projects/never_opened"),
+            rec(88429, "/Users/pmcfadin/projects/acmon/target/debug/acmon"),
+        ],
+        88429,
+    );
+
+    let snapshot = collect(&unrecorded, fixture_now(), &Thresholds::default())
+        .expect("collection should succeed");
+    let why = snapshot.sessions[0]
+        .liveness_unknown()
+        .expect("an UNKNOWN state has a reason");
+    assert!(
+        !why.is_structural(),
+        "a workspace with no transcript recorded against it is not a missing store; got {why}"
+    );
+    assert!(
+        why.to_string().contains("never-opened"),
+        "and it must name what was looked for, so the absence can be checked rather than \
+         merely believed; got {why}"
+    );
+}
+
+#[test]
 fn a_codex_sessions_silence_comes_from_the_index_rather_than_a_transcript_read() {
     // Codex records when each session was last updated in its index, so liveness costs no
     // further read at all.

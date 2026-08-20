@@ -3,7 +3,7 @@
 use std::time::{Duration, SystemTime};
 
 use crate::deliver::DeliveryReport;
-use crate::liveness::{classify, Observation, Thresholds, Verdict};
+use crate::liveness::{classify, Method, Observation, Thresholds, Verdict};
 use crate::memory::{self, Degraded, Forgotten, Memory, Reading, Sighting};
 use crate::notify;
 use crate::vcs::WorkspaceState;
@@ -54,6 +54,134 @@ pub struct Session {
     /// Whether this session is working, waiting, stalled, or beyond telling — and which
     /// observation produced that answer, so an inference never reads as an assertion.
     pub liveness: Verdict,
+}
+
+/// Why a session's liveness could not be determined.
+///
+/// [`Method`] already records which rule produced UNKNOWN. That is not the question a reader
+/// has. Theirs is what about *this machine* put the verdict out of reach, and above all
+/// whether it is a fault that can be fixed or a limit that has to be lived with — because a
+/// bare UNKNOWN is identical either way, and the two need opposite responses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LivenessUnknown {
+    /// No transcript store is known for this CLI at all, so there is no file whose
+    /// modification time could be read and no verdict to be had.
+    ///
+    /// A **limit**, not a fault: a detector says which executables are an agent and nothing
+    /// more, so no amount of configuration buys a state here. Carries the CLI's id, because
+    /// the whole point is being able to see which store is missing.
+    NoTranscriptStore { cli: String },
+    /// A transcript store is known for this CLI, and it did not yield an activity time —
+    /// nothing was attributed to this workspace, the store would not be listed, or the
+    /// attributed transcript's own modification time could not be read.
+    ///
+    /// A **fault**: something that exists failed to answer, so it can be investigated and
+    /// may well answer on the next run.
+    ActivityUnreadable { why: String },
+    /// The session's working directory could not be read, so there is nothing to look a
+    /// transcript up by. Carries the workspace's own reason rather than restating it.
+    WorkspaceUnknown { why: String },
+    /// The process enumeration could not be reasoned from, so a missing process is not
+    /// evidence of an absent one.
+    SnapshotUntrustworthy,
+    /// Silent with no resident process, but not for long enough to call it stalled.
+    TooSoonToTell,
+}
+
+impl LivenessUnknown {
+    /// Whether this is a structural limit of what can be observed rather than a fault that
+    /// was found.
+    ///
+    /// The distinction is what a reader acts on. A fault is worth investigating and may clear
+    /// by itself; a limit will not clear on any later run, and — because [`Waiting`] is the
+    /// only session state ever announced (see [`notify`](crate::notify)) and reaching it needs
+    /// a silence measurement — a session held by one is monitored and never alerts. That
+    /// consequence is otherwise only knowable from an alert that never arrives.
+    ///
+    /// [`Waiting`]: crate::liveness::State::Waiting
+    pub fn is_structural(&self) -> bool {
+        matches!(self, LivenessUnknown::NoTranscriptStore { .. })
+    }
+}
+
+impl std::fmt::Display for LivenessUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LivenessUnknown::NoTranscriptStore { cli } => write!(
+                f,
+                "no transcript store is known for CLI {cli}, so its silence cannot be measured"
+            ),
+            LivenessUnknown::ActivityUnreadable { why } => {
+                write!(
+                    f,
+                    "its transcript's activity could not be established: {why}"
+                )
+            }
+            LivenessUnknown::WorkspaceUnknown { why } => write!(
+                f,
+                "its workspace is unknown ({why}), so no transcript can be attributed to it"
+            ),
+            LivenessUnknown::SnapshotUntrustworthy => write!(
+                f,
+                "the process enumeration was incomplete, so its absence is not evidence"
+            ),
+            LivenessUnknown::TooSoonToTell => write!(
+                f,
+                "it has been silent with no resident process, but not for long enough to call it \
+                 stalled"
+            ),
+        }
+    }
+}
+
+impl Session {
+    /// Why this session's liveness could not be determined, or `None` when it was.
+    ///
+    /// Derived rather than stored, because everything it needs was already recorded by the
+    /// collection. That was the defect #22 reports: the reason existed, travelled as far as
+    /// [`Workspace::namespace`], and was then dropped by the only code that could have shown
+    /// it.
+    pub fn liveness_unknown(&self) -> Option<LivenessUnknown> {
+        match self.liveness.method {
+            Method::TranscriptActivityUnknown => Some(match &self.workspace {
+                // No workspace, so nothing to look a transcript up by. The workspace column
+                // carries this reason already; it is repeated against the state because a
+                // reader looking at UNKNOWN should not have to work out which other column
+                // happens to explain it.
+                Err(why) => LivenessUnknown::WorkspaceUnknown {
+                    why: why.to_string(),
+                },
+                Ok(workspace) => match &workspace.namespace {
+                    // The limit. A detector names executables; nothing in one says where the
+                    // CLI keeps its conversation log, so this arm is reachable for every CLI
+                    // the tool has no store for — which is every CLI a user adds (#12).
+                    Err(NamespaceUnmatched::UnknownCli(cli)) => {
+                        LivenessUnknown::NoTranscriptStore { cli: cli.clone() }
+                    }
+                    Err(why) => LivenessUnknown::ActivityUnreadable {
+                        why: why.to_string(),
+                    },
+                    // A namespace was matched and the silence still is not known, so the
+                    // store answered about the workspace and not about the transcript. Said
+                    // as exactly that and no more: which read failed is not recorded on the
+                    // session, and naming one would be a guess.
+                    Ok(namespace) => LivenessUnknown::ActivityUnreadable {
+                        why: format!("the last activity of {namespace} could not be read"),
+                    },
+                },
+            }),
+            Method::SnapshotCannotEstablishAbsence => Some(LivenessUnknown::SnapshotUntrustworthy),
+            Method::ProcessAbsentBeforeStallThreshold => Some(LivenessUnknown::TooSoonToTell),
+            // The remaining methods reached a verdict from an observation, so there is
+            // nothing to explain. Listed rather than caught by a wildcard, so that a new
+            // method has to be classified here deliberately instead of silently becoming a
+            // state with no reason.
+            Method::TranscriptChangedRecently
+            | Method::ProcessResidentButSilent
+            | Method::WorkRunningInWorkspace
+            | Method::NoProcessAndSilencePastStall => None,
+        }
+    }
 }
 
 /// One workspace, as the at-risk panel needs to see it.
