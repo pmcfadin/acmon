@@ -66,6 +66,34 @@ fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
+/// Seconds since the Unix epoch, for a time that may precede it.
+///
+/// Shared by `memory.rs` and `state.rs` for their ISO 8601 timestamp serialization.
+/// Extracted here to avoid duplication; the conversion logic itself is kept in this module
+/// since it pairs with `iso8601_from_unix_seconds`.
+pub fn unix_seconds(time: std::time::SystemTime) -> i64 {
+    use std::time::UNIX_EPOCH;
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(since) => since.as_secs() as i64,
+        // Before the epoch. Should not occur, but negating is the correct reading rather
+        // than clamping to zero, which would silently move the time to 1970.
+        Err(before) => -(before.duration().as_secs() as i64),
+    }
+}
+
+/// A time from seconds since the Unix epoch, for a value that may be negative.
+///
+/// The inverse of [`unix_seconds`]. Shared by `memory.rs` and `state.rs` for deserializing
+/// ISO 8601 timestamps back to `SystemTime`.
+pub fn time_from_unix_seconds(seconds: i64) -> std::time::SystemTime {
+    use std::time::{Duration, UNIX_EPOCH};
+    if seconds >= 0 {
+        UNIX_EPOCH + Duration::from_secs(seconds as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_secs(seconds.unsigned_abs())
+    }
+}
+
 /// A UTC ISO 8601 timestamp from seconds since the Unix epoch.
 ///
 /// The inverse of [`unix_seconds_from_iso8601`], to whole seconds. It exists so that the

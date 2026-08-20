@@ -15,7 +15,7 @@
 //! what makes the retention rules testable without a filesystem, and the retention rules are
 //! where the subtlety is.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -464,25 +464,6 @@ pub fn parse(text: &str) -> (Memory, Option<Degraded>) {
     (file.memory, None)
 }
 
-/// Seconds since the Unix epoch, for a time that may precede it.
-fn unix_seconds(time: SystemTime) -> i64 {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(since) => since.as_secs() as i64,
-        // Before the epoch. Should not occur, but negating is the correct reading rather
-        // than clamping to zero, which would silently move the time to 1970.
-        Err(before) => -(before.duration().as_secs() as i64),
-    }
-}
-
-/// A time from seconds since the Unix epoch, for a value that may be negative.
-fn time_from_unix_seconds(seconds: i64) -> SystemTime {
-    if seconds >= 0 {
-        UNIX_EPOCH + Duration::from_secs(seconds as u64)
-    } else {
-        UNIX_EPOCH - Duration::from_secs(seconds.unsigned_abs())
-    }
-}
-
 /// Timestamps as ISO 8601, so the state file can be read without a converter.
 mod iso {
     use std::time::SystemTime;
@@ -490,13 +471,14 @@ mod iso {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error> {
-        crate::isotime::iso8601_from_unix_seconds(super::unix_seconds(*time)).serialize(serializer)
+        crate::isotime::iso8601_from_unix_seconds(crate::isotime::unix_seconds(*time))
+            .serialize(serializer)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SystemTime, D::Error> {
         let text = String::deserialize(deserializer)?;
         crate::isotime::unix_seconds_from_iso8601(&text)
-            .map(super::time_from_unix_seconds)
+            .map(crate::isotime::time_from_unix_seconds)
             .map_err(serde::de::Error::custom)
     }
 }
@@ -511,7 +493,7 @@ mod iso_option {
         time: &Option<SystemTime>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        time.map(|t| crate::isotime::iso8601_from_unix_seconds(super::unix_seconds(t)))
+        time.map(|t| crate::isotime::iso8601_from_unix_seconds(crate::isotime::unix_seconds(t)))
             .serialize(serializer)
     }
 
@@ -522,7 +504,7 @@ mod iso_option {
         match text {
             None => Ok(None),
             Some(text) => crate::isotime::unix_seconds_from_iso8601(&text)
-                .map(|seconds| Some(super::time_from_unix_seconds(seconds)))
+                .map(|seconds| Some(crate::isotime::time_from_unix_seconds(seconds)))
                 .map_err(serde::de::Error::custom),
         }
     }
