@@ -314,6 +314,37 @@ fn memory_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
         ));
     }
 
+    // Alerts that were never offered to a channel at all.
+    //
+    // Reported separately from the failures above, and never merely counted: an alerting step
+    // that ran out of its budget with six strandings left to announce, and said nothing about
+    // them, is a silent cap in the one path where silence is read as "nothing is wrong". Both
+    // warnings can appear in the same run — a channel that answered badly for the alerts it
+    // was given and a run that did not reach the rest are two different facts.
+    if health.has_unattempted() {
+        let mut parts = Vec::new();
+        if health.local_not_attempted > 0 {
+            parts.push(format!("local: {}", health.local_not_attempted));
+        }
+        if health.remote_not_attempted > 0 {
+            parts.push(format!("remote: {}", health.remote_not_attempted));
+        }
+        let why = health
+            .not_attempted_reason
+            .as_deref()
+            .unwrap_or("and no reason was reported for it, which is itself a fault in this tool");
+        lines.extend(wrap_words(
+            &format!(
+                "WARNING: {} alert(s) were NOT SENT at all ({}) — {}. They are not recorded as \
+                 announced, and will be re-announced on the next run.",
+                health.not_attempted(),
+                parts.join(", "),
+                why
+            ),
+            width,
+        ));
+    }
+
     lines
 }
 

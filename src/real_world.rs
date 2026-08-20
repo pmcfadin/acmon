@@ -7,6 +7,7 @@ use libproc::pid_rusage::{pidrusage, RUsageInfoV4};
 use libproc::proc_pid;
 use libproc::processes::{pids_by_type, ProcFilter};
 
+use crate::deliver::{self, DeliveryReport};
 use crate::isotime::unix_seconds_from_iso8601;
 use crate::machtime::{MachTicks, MachTimebase};
 use crate::world::{
@@ -134,6 +135,13 @@ pub struct RealWorld {
     ///
     /// Resolved once at construction for the same reason as `state_file`.
     detectors_file: Result<std::path::PathBuf, String>,
+    /// How long one notification delivery gets, and — the same figure — how long a whole
+    /// channel's deliveries get in one run.
+    ///
+    /// A field rather than a constant for the same reason the paths above are: the tests that
+    /// prove a hanging channel is reported rather than waited on would otherwise each cost
+    /// [`crate::deliver::REQUEST_BUDGET`], and a suite nobody runs proves nothing.
+    notify_request_budget: Duration,
 }
 
 impl RealWorld {
@@ -145,6 +153,7 @@ impl RealWorld {
             state_file: state_path(),
             notify_config_file: notify_config_path(),
             detectors_file: detectors_path(),
+            notify_request_budget: crate::deliver::REQUEST_BUDGET,
         }
     }
 
@@ -169,6 +178,29 @@ impl RealWorld {
         RealWorld {
             detectors_file: Ok(path.into()),
             ..RealWorld::new()
+        }
+    }
+
+    /// The same world, giving each notification — and each run's alerting step — less time.
+    ///
+    /// For tests about what happens when a channel will not answer. At the real budget of
+    /// [`crate::deliver::REQUEST_BUDGET`] every such test would sit for ten seconds a case.
+    pub fn with_notify_request_budget(budget: Duration) -> Self {
+        RealWorld {
+            notify_request_budget: budget,
+            ..RealWorld::new()
+        }
+    }
+
+    /// What one run's deliveries to one channel are allowed to spend.
+    ///
+    /// [`deliver::CONCURRENCY`] in flight, and the whole batch held to a single request's
+    /// budget — so a dead endpoint costs one timeout per run instead of one per alert, and the
+    /// alerts the budget did not reach are reported as not attempted rather than dropped.
+    fn notify_bounds(&self) -> deliver::Bounds {
+        deliver::Bounds {
+            workers: deliver::CONCURRENCY,
+            budget: self.notify_request_budget,
         }
     }
 }
@@ -1284,21 +1316,52 @@ impl World for RealWorld {
             let _ = stdin.write_all(payload.as_bytes());
         }
 
-        match child.wait() {
-            Ok(status) if status.success() => NotifyOutcome::Delivered,
-            Ok(status) => NotifyOutcome::Failed(format!("exited {}", status)),
-            Err(e) => NotifyOutcome::Failed(format!("wait failed: {e}")),
+        // Bounded, the same way a version-control query is. `child.wait()` on its own is
+        // unbounded, and a notifier that never exits — a GUI helper waiting on a dialog, a
+        // command left in the config with a typo that makes it read stdin forever — would stop
+        // the collection returning at all. Killing our own notifier child is not a breach of
+        // "the tool observes; it never acts": that rule protects agent sessions.
+        let started = std::time::Instant::now();
+        let poll_interval = Duration::from_millis(20);
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return NotifyOutcome::Delivered,
+                Ok(Some(status)) => return NotifyOutcome::Failed(format!("exited {}", status)),
+                Ok(None) => {
+                    if started.elapsed() >= self.notify_request_budget {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return NotifyOutcome::Failed(format!(
+                            "the local command did not exit within {:?}, so nothing can be said \
+                             to have been delivered",
+                            self.notify_request_budget
+                        ));
+                    }
+                    std::thread::sleep(poll_interval);
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return NotifyOutcome::Failed(format!("wait failed: {e}"));
+                }
+            }
         }
     }
 
     fn notify_remote(&self, url: &str, payload: &str) -> NotifyOutcome {
         // Use curl synchronously. Check both process exit status and HTTP status code.
+        //
+        // `--max-time` carries the same budget the local channel polls against, expressed with
+        // millisecond precision because a test budget under a second would otherwise round to
+        // `0`, which curl reads as no limit at all — the one value that must never reach it.
+        let max_time = format!("{:.3}", self.notify_request_budget.as_secs_f64().max(0.01));
         let output = match Command::new("curl")
             .arg("--fail") // Exit non-zero on HTTP 4xx/5xx
             .arg("--silent") // No progress meter
             .arg("--show-error") // But do show errors
             .arg("--max-time")
-            .arg("10") // 10 second timeout
+            .arg(&max_time)
             .arg("-X")
             .arg("POST")
             .arg("-H")
@@ -1318,6 +1381,18 @@ impl World for RealWorld {
             let stderr = String::from_utf8_lossy(&output.stderr);
             NotifyOutcome::Failed(format!("curl exited {}: {}", output.status, stderr.trim()))
         }
+    }
+
+    fn notify_local_batch(&self, command: &str, payloads: &[String]) -> DeliveryReport {
+        deliver::in_parallel(payloads, self.notify_bounds(), |payload| {
+            self.notify_local(command, payload)
+        })
+    }
+
+    fn notify_remote_batch(&self, url: &str, payloads: &[String]) -> DeliveryReport {
+        deliver::in_parallel(payloads, self.notify_bounds(), |payload| {
+            self.notify_remote(url, payload)
+        })
     }
 }
 

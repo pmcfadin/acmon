@@ -2,6 +2,7 @@
 
 use std::time::{Duration, SystemTime};
 
+use crate::deliver::DeliveryReport;
 use crate::liveness::{classify, Observation, Thresholds, Verdict};
 use crate::memory::{self, Degraded, Forgotten, Memory, Reading, Sighting};
 use crate::notify;
@@ -145,10 +146,33 @@ pub struct NotifyHealth {
     pub local_delivered: usize,
     /// How many local deliveries failed.
     pub local_failed: usize,
+    /// How many announcements were never offered to the configured local channel.
+    ///
+    /// Counted apart from `local_failed` because they say different things: a failure is
+    /// evidence about the channel, and this is evidence about the run. Folding them together
+    /// would make a healthy notifier that ran out of time look broken, and — worse — would let
+    /// a run that alerted about four of fourteen strandings read as one that had four to
+    /// report.
+    pub local_not_attempted: usize,
     /// How many announcements were delivered via remote channel.
     pub remote_delivered: usize,
     /// How many remote deliveries failed.
     pub remote_failed: usize,
+    /// How many announcements were never offered to the configured remote channel.
+    pub remote_not_attempted: usize,
+    /// Why alerts went unattempted, when any did.
+    ///
+    /// The first reason reported this run. A count on its own would be a silent cap wearing a
+    /// number: "six alerts were not sent" tells a reader nothing they can act on, and this is
+    /// an alerting path, where the absence of an alert is read as the absence of a problem.
+    pub not_attempted_reason: Option<String>,
+    /// Wall time this run spent delivering, across both channels.
+    ///
+    /// Attributable on purpose. The alerting step is the only part of a collection that waits
+    /// on something outside the machine, so the self-metering the display carries has to be
+    /// able to name it rather than absorb it into the total. `ZERO` when nothing was
+    /// attempted, which is the honest measurement of a run that asked no channel anything.
+    pub delivery_cost: Duration,
 }
 
 impl NotifyHealth {
@@ -159,14 +183,28 @@ impl NotifyHealth {
             notable: 0,
             local_delivered: 0,
             local_failed: 0,
+            local_not_attempted: 0,
             remote_delivered: 0,
             remote_failed: 0,
+            remote_not_attempted: 0,
+            not_attempted_reason: None,
+            delivery_cost: Duration::ZERO,
         }
     }
 
     /// Whether any deliveries failed this run.
     pub fn has_failures(&self) -> bool {
         self.local_failed > 0 || self.remote_failed > 0
+    }
+
+    /// How many channel deliveries were never attempted this run, across both channels.
+    pub fn not_attempted(&self) -> usize {
+        self.local_not_attempted + self.remote_not_attempted
+    }
+
+    /// Whether anything went unattempted this run.
+    pub fn has_unattempted(&self) -> bool {
+        self.not_attempted() > 0
     }
 }
 
@@ -380,6 +418,23 @@ fn is_inside(candidate: &str, workspace_path: &str) -> bool {
         || candidate.len() > workspace_path.len()
             && candidate[..workspace_path.len()].eq_ignore_ascii_case(workspace_path)
             && candidate.as_bytes()[workspace_path.len()] == b'/'
+}
+
+/// What a channel reported about one alert in a batch.
+///
+/// A `World` that answered about fewer alerts than it was asked about has broken the batch
+/// contract, and the missing answers are treated as not attempted. Never as delivered: the
+/// alternative is retiring an alert on the strength of an answer nobody gave, and indexing
+/// past the end would take the whole collection down over a channel's bug.
+fn outcome_for(report: &DeliveryReport, index: usize) -> NotifyOutcome {
+    report.outcomes.get(index).cloned().unwrap_or_else(|| {
+        NotifyOutcome::NotAttempted(format!(
+            "the channel answered about {} alerts and said nothing about this one, which was \
+             number {}",
+            report.outcomes.len(),
+            index + 1
+        ))
+    })
 }
 
 /// Whether any process other than the session itself is working in its workspace.
@@ -953,6 +1008,12 @@ pub fn collect(
     // Decided based on this run's observations and what was announced before. Delivery is
     // verified: only outcomes that actually succeeded update the announcement record, so an
     // undelivered alert is re-announced on the following run.
+    //
+    // Each channel is asked **once for the whole run** rather than once per alert. A steady
+    // state of fourteen at-risk workspaces used to be fourteen sequential requests at up to
+    // ten seconds each, and a first run — where nothing has been announced yet, so everything
+    // notable fires at once — is the worst case of that. What the channel does with the batch
+    // is its business; what it owes back is one verified outcome per alert, in order.
     let config = world.read_notify_config();
     let (announcements, updated_announcements) = notify::decide(
         &sessions,
@@ -960,21 +1021,38 @@ pub fn collect(
         &memory_after_forgetting.announcements,
     );
 
+    let payloads: Vec<String> = announcements.iter().map(|a| a.payload()).collect();
+
+    // Nothing notable means no channel is asked anything at all, so neither the local command
+    // nor the remote endpoint is touched on a quiet machine.
+    let local_report = config
+        .local_command
+        .as_ref()
+        .filter(|_| !payloads.is_empty())
+        .map(|command| world.notify_local_batch(command, &payloads));
+    let remote_report = config
+        .remote_url
+        .as_ref()
+        .filter(|_| !payloads.is_empty())
+        .map(|url| world.notify_remote_batch(url, &payloads));
+
     let mut local_delivered = 0;
     let mut local_failed = 0;
+    let mut local_not_attempted = 0;
     let mut remote_delivered = 0;
     let mut remote_failed = 0;
+    let mut remote_not_attempted = 0;
+    let mut not_attempted_reason: Option<String> = None;
 
     // Track which announcements were actually delivered, so only those update the record.
     let mut successfully_announced = updated_announcements.clone();
 
-    for announcement in &announcements {
-        let payload = announcement.payload();
+    for (index, announcement) in announcements.iter().enumerate() {
         let mut delivered_somewhere = false;
 
         // Local channel
-        if let Some(command) = &config.local_command {
-            match world.notify_local(command, &payload) {
+        if let Some(report) = &local_report {
+            match outcome_for(report, index) {
                 NotifyOutcome::Delivered => {
                     local_delivered += 1;
                     delivered_somewhere = true;
@@ -982,13 +1060,17 @@ pub fn collect(
                 NotifyOutcome::Failed(_) => {
                     local_failed += 1;
                 }
+                NotifyOutcome::NotAttempted(why) => {
+                    local_not_attempted += 1;
+                    not_attempted_reason.get_or_insert(why);
+                }
                 NotifyOutcome::NoChannelConfigured => {}
             }
         }
 
         // Remote channel
-        if let Some(url) = &config.remote_url {
-            match world.notify_remote(url, &payload) {
+        if let Some(report) = &remote_report {
+            match outcome_for(report, index) {
                 NotifyOutcome::Delivered => {
                     remote_delivered += 1;
                     delivered_somewhere = true;
@@ -996,12 +1078,18 @@ pub fn collect(
                 NotifyOutcome::Failed(_) => {
                     remote_failed += 1;
                 }
+                NotifyOutcome::NotAttempted(why) => {
+                    remote_not_attempted += 1;
+                    not_attempted_reason.get_or_insert(why);
+                }
                 NotifyOutcome::NoChannelConfigured => {}
             }
         }
 
         // If neither channel delivered, remove this announcement from the successful set so
-        // it will be re-announced next run.
+        // it will be re-announced next run. An alert that was never attempted lands here too:
+        // "not sent" and "sent and refused" differ in what they say about the channel, not in
+        // what may be recorded as announced.
         if !delivered_somewhere {
             match announcement {
                 notify::Announcement::SessionWaiting {
@@ -1048,8 +1136,15 @@ pub fn collect(
                 notable: announcements.len(),
                 local_delivered,
                 local_failed,
+                local_not_attempted,
                 remote_delivered,
                 remote_failed,
+                remote_not_attempted,
+                not_attempted_reason,
+                // Summed rather than maximised: the two channels are asked one after the
+                // other, so the run really did wait for both.
+                delivery_cost: local_report.as_ref().map(|r| r.cost).unwrap_or_default()
+                    + remote_report.as_ref().map(|r| r.cost).unwrap_or_default(),
             },
             detector_config,
         },

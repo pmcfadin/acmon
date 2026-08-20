@@ -57,6 +57,20 @@ fn measured_ledger() -> Resources {
     }
 }
 
+/// Which channel a delivery went to, recorded in the order the channels were asked.
+///
+/// The order is the observable that separates "one request per alert" from "one batch per
+/// channel". Under the per-alert loop this seam started with, two configured channels
+/// interleaved — local, remote, local, remote — because each announcement was carried through
+/// both before the next was looked at. A batched run asks one channel about everything it has
+/// to say and then the other, which is what allows a channel to overlap the requests inside
+/// its own batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Channel {
+    Local,
+    Remote,
+}
+
 struct FakeWorld {
     records: Vec<ProcessRecord>,
     ledgers: HashMap<i32, Result<Resources, ResourcesUnavailable>>,
@@ -75,6 +89,17 @@ struct FakeWorld {
     local_outcome: NotifyOutcome,
     /// Outcome to return for remote notifications
     remote_outcome: NotifyOutcome,
+    /// Which channels were asked, in the order they were asked.
+    call_order: RefCell<Vec<Channel>>,
+    /// An outcome chosen from the payload itself, when set, in place of `local_outcome`.
+    ///
+    /// This is what makes per-alert verification testable under batching: a channel that
+    /// delivers some of a run's alerts and refuses others must retire exactly the ones that
+    /// arrived, and a batch whose outcomes came back against the wrong payloads would retire
+    /// the wrong alert while every tally still added up.
+    local_outcome_by_payload: Option<fn(&str) -> NotifyOutcome>,
+    /// How long each local delivery takes, so the cost of the alerting step is observable.
+    local_delay: Duration,
     /// What sweep_for_repositories returns
     sweep: Option<Sweep>,
 }
@@ -95,6 +120,9 @@ impl FakeWorld {
             remote_log: RefCell::new(Vec::new()),
             local_outcome: NotifyOutcome::NoChannelConfigured,
             remote_outcome: NotifyOutcome::NoChannelConfigured,
+            call_order: RefCell::new(Vec::new()),
+            local_outcome_by_payload: None,
+            local_delay: Duration::ZERO,
             sweep: None,
         }
     }
@@ -126,27 +154,43 @@ impl FakeWorld {
                 linked_worktree: false,
             }),
         );
-        // Make the sweep return this workspace so it gets discovered
-        let sweep = Sweep {
-            repositories: vec![(path.to_string(), false)],
-            complete: true,
-            directories_visited: 1,
-        };
-        self.sweep = Some(sweep);
-        self
+        self.discover(path)
     }
 
     fn with_unreadable_workspace(mut self, path: &str, why: Unreadable) -> Self {
         self.roots
             .insert(path.to_string(), (path.to_string(), false));
         self.facts.insert(path.to_string(), Err(why));
-        // Make the sweep return this workspace so it gets discovered
-        let sweep = Sweep {
-            repositories: vec![(path.to_string(), false)],
+        self.discover(path)
+    }
+
+    /// Make the sweep return this workspace, alongside any already added.
+    ///
+    /// Accumulating rather than replacing, because the cost shape this seam now has to hold to
+    /// only shows up with several notable states at once — fourteen is the steady state on the
+    /// machine behind the ticket, and one workspace can never demonstrate it.
+    fn discover(mut self, path: &str) -> Self {
+        let mut sweep = self.sweep.take().unwrap_or_else(|| Sweep {
+            repositories: Vec::new(),
             complete: true,
-            directories_visited: 1,
-        };
+            directories_visited: 0,
+        });
+        sweep.repositories.push((path.to_string(), false));
+        sweep.directories_visited += 1;
         self.sweep = Some(sweep);
+        self
+    }
+
+    /// A local channel whose answer depends on which alert it was given.
+    fn with_local_channel_answering(mut self, decide: fn(&str) -> NotifyOutcome) -> Self {
+        self.config.local_command = Some("echo".to_string());
+        self.local_outcome_by_payload = Some(decide);
+        self
+    }
+
+    /// A local channel that takes a stated amount of time per delivery.
+    fn with_local_delay(mut self, delay: Duration) -> Self {
+        self.local_delay = delay;
         self
     }
 
@@ -265,13 +309,21 @@ impl World for FakeWorld {
         self.local_log
             .borrow_mut()
             .push((command.to_string(), payload.to_string()));
-        self.local_outcome.clone()
+        self.call_order.borrow_mut().push(Channel::Local);
+        if !self.local_delay.is_zero() {
+            std::thread::sleep(self.local_delay);
+        }
+        match self.local_outcome_by_payload {
+            Some(decide) => decide(payload),
+            None => self.local_outcome.clone(),
+        }
     }
 
     fn notify_remote(&self, url: &str, payload: &str) -> NotifyOutcome {
         self.remote_log
             .borrow_mut()
             .push((url.to_string(), payload.to_string()));
+        self.call_order.borrow_mut().push(Channel::Remote);
         self.remote_outcome.clone()
     }
 }
@@ -520,6 +572,413 @@ fn a_failed_alert_is_re_announced_on_the_following_run() {
             .is_empty(),
         "successful delivery updates the record"
     );
+}
+
+// --- Cost shape: one batch per channel, not one request per alert (ticket #20) ---
+//
+// The failure these prevent is not a wrong answer, it is a collection that has not returned.
+// Fourteen at-risk workspaces is the steady state on the machine behind the ticket, and the
+// first run on any machine announces everything notable at once, so a per-alert loop against a
+// channel allowed ten seconds a request could sit for over two minutes inside the alerting
+// step. What must survive the fix is #9's rule: an alert is recorded as sent only if it
+// actually arrived.
+
+const ALPHA: &str = "/Users/pmcfadin/projects/alpha";
+const BETA: &str = "/Users/pmcfadin/projects/beta";
+const GAMMA: &str = "/Users/pmcfadin/projects/gamma";
+
+#[test]
+fn each_channel_is_asked_about_a_whole_run_before_the_other_channel_is_asked_at_all() {
+    // The observable that separates the two cost shapes. A per-alert loop carries each
+    // announcement through every channel before looking at the next, so two channels
+    // interleave; a batched run hands one channel everything it has to say. Only the second
+    // shape lets a channel overlap its own requests or bound what the lot may cost.
+    let world = FakeWorld::quiet()
+        .with_workspace(ALPHA, 3)
+        .with_workspace(BETA, 4)
+        .with_workspace(GAMMA, 5)
+        .with_local_channel("echo", NotifyOutcome::Delivered)
+        .with_remote_channel("https://example.com/notify", NotifyOutcome::Delivered);
+
+    let snapshot = collect(&world, now(), &Thresholds::default()).expect("collection");
+
+    assert_eq!(
+        snapshot.remembered.notify_health.notable, 3,
+        "three stranded workspaces are three notable states"
+    );
+    assert_eq!(
+        *world.call_order.borrow(),
+        vec![
+            Channel::Local,
+            Channel::Local,
+            Channel::Local,
+            Channel::Remote,
+            Channel::Remote,
+            Channel::Remote
+        ],
+        "each channel is asked once for the whole run, not once per alert"
+    );
+}
+
+#[test]
+fn a_batched_run_retires_exactly_the_alerts_that_arrived_and_no_others() {
+    // The guarantee #9 bought, under the new cost shape. A batch whose outcomes came back
+    // against the wrong payloads would retire the wrong alert while every tally still added up
+    // — and the alert that never arrived would never be announced again.
+    let world = FakeWorld::quiet()
+        .with_workspace(ALPHA, 3)
+        .with_workspace(BETA, 4)
+        .with_workspace(GAMMA, 5)
+        .with_local_channel_answering(|payload| {
+            if payload.contains("beta") {
+                NotifyOutcome::Failed("this one was refused".to_string())
+            } else {
+                NotifyOutcome::Delivered
+            }
+        });
+
+    let snapshot = collect(&world, now(), &Thresholds::default()).expect("collection");
+
+    let health = &snapshot.remembered.notify_health;
+    assert_eq!((health.local_delivered, health.local_failed), (2, 1));
+
+    let announced: Vec<String> = snapshot
+        .remembered
+        .memory
+        .announcements
+        .workspaces
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect();
+    assert_eq!(
+        announced,
+        vec![ALPHA.to_string(), GAMMA.to_string()],
+        "the two that arrived are recorded and the one that was refused is not — by identity, \
+         not by count"
+    );
+}
+
+#[test]
+fn an_alert_the_channel_was_never_given_is_not_recorded_as_sent() {
+    // The trap this ticket had to avoid: taking delivery off the critical path by bounding it,
+    // and then booking the alerts that did not fit as announced. That is the same
+    // fire-and-forget with optimistic bookkeeping that #9 exists to remove, wearing a budget.
+    let world = FakeWorld::quiet()
+        .with_workspace(ALPHA, 3)
+        .with_workspace(BETA, 4)
+        .with_local_channel(
+            "echo",
+            NotifyOutcome::NotAttempted("the run's alerting budget was spent".to_string()),
+        );
+
+    let snapshot = collect(&world, now(), &Thresholds::default()).expect("collection");
+
+    assert!(
+        snapshot
+            .remembered
+            .memory
+            .announcements
+            .workspaces
+            .is_empty(),
+        "an alert nobody was given must not be recorded as announced"
+    );
+
+    // Run again against the state the first run left, with a channel that now answers.
+    let again = FakeWorld::quiet()
+        .with_workspace(ALPHA, 3)
+        .with_workspace(BETA, 4)
+        .with_local_channel("echo", NotifyOutcome::Delivered)
+        .remembering(&snapshot.remembered.memory);
+
+    let second = collect(&again, now(), &Thresholds::default()).expect("second run");
+    assert_eq!(
+        again.local_payloads().len(),
+        2,
+        "both unattempted alerts are announced on the following run"
+    );
+    assert_eq!(
+        second.remembered.memory.announcements.workspaces.len(),
+        2,
+        "and are recorded once they arrive"
+    );
+}
+
+#[test]
+fn an_alert_that_was_never_attempted_is_counted_apart_from_one_the_channel_refused() {
+    // Both are re-announced, and only one is evidence the channel is broken. A reader deciding
+    // whether their notifier still works has to be able to tell them apart — and a run that
+    // announced two of four strandings must not read as a run that had two to announce.
+    let world = FakeWorld::quiet()
+        .with_workspace(ALPHA, 3)
+        .with_workspace(BETA, 4)
+        .with_local_channel(
+            "echo",
+            NotifyOutcome::NotAttempted("the run's alerting budget was spent".to_string()),
+        );
+
+    let health = collect(&world, now(), &Thresholds::default())
+        .expect("collection")
+        .remembered
+        .notify_health;
+
+    assert_eq!(health.notable, 2, "two states were worth announcing");
+    assert_eq!(health.local_not_attempted, 2, "and neither was sent");
+    assert_eq!(
+        health.local_failed, 0,
+        "a channel that was never asked did not fail"
+    );
+    assert!(
+        !health.has_failures() && health.has_unattempted(),
+        "the two conditions are separately reportable"
+    );
+    let why = health
+        .not_attempted_reason
+        .as_deref()
+        .expect("a count with no reason is a silent cap wearing a number");
+    assert!(
+        why.contains("budget"),
+        "the reason has to say what stopped it; got {why:?}"
+    );
+}
+
+#[test]
+fn a_run_with_nothing_notable_asks_no_channel_anything() {
+    // The counterweight, and the reason a quiet machine costs nothing to alert on: no spawn,
+    // no request, no wait. Both channels are configured and neither is touched.
+    let world = FakeWorld::quiet()
+        .with_workspace(ALPHA, 0)
+        .with_local_channel("echo", NotifyOutcome::Delivered)
+        .with_remote_channel("https://example.com/notify", NotifyOutcome::Delivered);
+
+    let snapshot = collect(&world, now(), &Thresholds::default()).expect("collection");
+
+    assert_eq!(snapshot.remembered.notify_health.notable, 0);
+    assert!(
+        world.call_order.borrow().is_empty(),
+        "a clean workspace is not worth waking a notifier for; got {:?}",
+        world.call_order.borrow()
+    );
+    assert_eq!(
+        snapshot.remembered.notify_health.delivery_cost,
+        Duration::ZERO,
+        "and a run that asked nothing spent nothing asking"
+    );
+}
+
+#[test]
+fn the_cost_of_the_alerting_step_is_reported_rather_than_absorbed_into_the_run() {
+    // Ticket #10 meters this tool against a one-second fast tier, and alerting is the one part
+    // of a collection that waits on something outside the machine. A cost it cannot name is a
+    // cost it cannot budget. Asserted as a floor derived from the delay this test injected —
+    // never as a wall-clock figure, which varies by about 2x between runs on this machine.
+    const PER_DELIVERY: Duration = Duration::from_millis(40);
+
+    let world = FakeWorld::quiet()
+        .with_workspace(ALPHA, 3)
+        .with_workspace(BETA, 4)
+        .with_local_channel("echo", NotifyOutcome::Delivered)
+        .with_local_delay(PER_DELIVERY);
+
+    let health = collect(&world, now(), &Thresholds::default())
+        .expect("collection")
+        .remembered
+        .notify_health;
+
+    assert_eq!(health.local_delivered, 2, "both alerts were delivered");
+    assert!(
+        health.delivery_cost >= 2 * PER_DELIVERY,
+        "two deliveries that each took {PER_DELIVERY:?} cannot have cost less than both of \
+         them; got {:?}",
+        health.delivery_cost
+    );
+}
+
+// --- The delivery scheduler itself (ticket #20) ---
+
+fn alerts(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|i| format!("Workspace /Users/pmcfadin/projects/w{i} is STRANDED"))
+        .collect()
+}
+
+#[test]
+fn delivering_a_run_concurrently_costs_a_fraction_of_delivering_it_one_at_a_time() {
+    // The whole point of the ticket, as a ratio rather than a wall-clock figure: the same
+    // channel, the same alerts, the same per-delivery cost, scheduled two ways. An absolute
+    // assertion here would fail for reasons unrelated to correctness.
+    const PER_DELIVERY: Duration = Duration::from_millis(60);
+    const GENEROUS: Duration = Duration::from_secs(60);
+    let payloads = alerts(8);
+
+    let channel = |_: &str| {
+        std::thread::sleep(PER_DELIVERY);
+        NotifyOutcome::Delivered
+    };
+
+    let one_at_a_time = acmon::deliver::sequentially(&payloads, GENEROUS, channel);
+    let overlapped = acmon::deliver::in_parallel(
+        &payloads,
+        acmon::deliver::Bounds {
+            workers: 8,
+            budget: GENEROUS,
+        },
+        channel,
+    );
+
+    // Assert success before believing either measurement.
+    for report in [&one_at_a_time, &overlapped] {
+        assert_eq!(report.outcomes.len(), payloads.len());
+        assert!(
+            report.outcomes.iter().all(|o| o.delivered()),
+            "every alert was delivered in both schedules; got {:?}",
+            report.outcomes
+        );
+    }
+
+    assert!(
+        overlapped.cost * 2 < one_at_a_time.cost,
+        "eight overlapped deliveries must not cost what eight sequential ones do; overlapped \
+         {:?} against sequential {:?}",
+        overlapped.cost,
+        one_at_a_time.cost
+    );
+}
+
+#[test]
+fn alerts_the_budget_did_not_reach_are_reported_as_not_attempted_and_never_dropped() {
+    // A silent cap in an alerting path reads as "nothing to report". Every alert the batch was
+    // given comes back with an outcome, and the ones nobody was told about say why.
+    const PER_DELIVERY: Duration = Duration::from_millis(400);
+    const BUDGET: Duration = Duration::from_millis(150);
+    const WORKERS: usize = 3;
+    let payloads = alerts(12);
+
+    let report = acmon::deliver::in_parallel(
+        &payloads,
+        acmon::deliver::Bounds {
+            workers: WORKERS,
+            budget: BUDGET,
+        },
+        |_| {
+            std::thread::sleep(PER_DELIVERY);
+            NotifyOutcome::Delivered
+        },
+    );
+
+    assert_eq!(
+        report.outcomes.len(),
+        payloads.len(),
+        "nothing is dropped: one outcome per alert, always"
+    );
+    let delivered = report.count(|o| o.delivered());
+    let unattempted = report.count(|o| o.not_attempted());
+    assert_eq!(
+        delivered + unattempted,
+        payloads.len(),
+        "and every outcome is one or the other — a channel that answered nothing did not fail; \
+         got {:?}",
+        report.outcomes
+    );
+    assert!(
+        delivered <= WORKERS,
+        "only the deliveries already in flight when the budget ran out can have completed; \
+         {delivered} of {} did",
+        payloads.len()
+    );
+    for outcome in report.outcomes.iter().filter(|o| o.not_attempted()) {
+        let why = outcome.why().expect("a stated reason");
+        assert!(
+            why.contains("budget"),
+            "an unsent alert names what stopped it; got {why:?}"
+        );
+    }
+    assert!(
+        report.cost < 4 * PER_DELIVERY,
+        "the run stopped at its budget instead of working through all twelve; cost {:?} \
+         against {:?} per delivery",
+        report.cost,
+        PER_DELIVERY
+    );
+}
+
+#[test]
+fn the_sequential_fallback_also_stops_at_the_budget() {
+    // The default every World gets. The guarantee that a run does not spend its alert count
+    // times a timeout belongs to every implementation, not only the concurrent one — a fake or
+    // a future World that did not override the batch must not be the slow path that hangs a
+    // collection.
+    const PER_DELIVERY: Duration = Duration::from_millis(300);
+    const BUDGET: Duration = Duration::from_millis(120);
+    let payloads = alerts(12);
+
+    let report = acmon::deliver::sequentially(&payloads, BUDGET, |_| {
+        std::thread::sleep(PER_DELIVERY);
+        NotifyOutcome::Delivered
+    });
+
+    assert_eq!(report.outcomes.len(), payloads.len());
+    assert!(
+        report.count(|o| o.delivered()) <= 1,
+        "the first delivery already outran the budget; got {:?}",
+        report.outcomes
+    );
+    assert_eq!(
+        report.count(|o| o.not_attempted()),
+        payloads.len() - report.count(|o| o.delivered()),
+        "and the rest are stated as unsent rather than silently skipped"
+    );
+    assert!(
+        report.cost < 3 * PER_DELIVERY,
+        "cost {:?} shows it did not work through all twelve",
+        report.cost
+    );
+}
+
+#[test]
+fn every_outcome_comes_back_against_the_alert_it_belongs_to() {
+    // Concurrency reorders completions, so the mapping from alert to outcome cannot be the
+    // order things finished in. If it were, a batch would retire the alert that happened to
+    // finish where a delivered one used to be — verification that lands on the wrong alert is
+    // worse than none, because it looks correct.
+    let payloads = alerts(20);
+
+    let report = acmon::deliver::in_parallel(
+        &payloads,
+        acmon::deliver::Bounds {
+            workers: 6,
+            budget: Duration::from_secs(60),
+        },
+        |payload| {
+            if payload.ends_with('7') {
+                NotifyOutcome::Failed(payload.to_string())
+            } else {
+                NotifyOutcome::Delivered
+            }
+        },
+    );
+
+    assert_eq!(report.outcomes.len(), payloads.len());
+    for (payload, outcome) in payloads.iter().zip(report.outcomes.iter()) {
+        let expected = if payload.ends_with('7') {
+            NotifyOutcome::Failed(payload.clone())
+        } else {
+            NotifyOutcome::Delivered
+        };
+        assert_eq!(
+            outcome, &expected,
+            "the outcome for {payload:?} landed on the wrong alert"
+        );
+    }
+}
+
+#[test]
+fn a_run_with_no_alerts_starts_no_delivery_at_all() {
+    let report = acmon::deliver::in_parallel(&[], acmon::deliver::Bounds::standard(), |_| {
+        panic!("a run with nothing to announce must not touch a channel")
+    });
+
+    assert!(report.outcomes.is_empty());
+    assert_eq!(report.cost, Duration::ZERO);
 }
 
 // --- Independent channel delivery ---
@@ -859,4 +1318,115 @@ fn a_configured_but_blank_channel_counts_as_absent_rather_than_as_a_command() {
     );
 
     let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+}
+
+// --- The real local channel, running real commands (ticket #20) ---
+//
+// These drive `RealWorld`, because the concurrency and the per-request bound live in the
+// implementation that actually spawns something. Every assertion below is a ratio against a
+// figure this test injected, never a wall-clock threshold: measurements on this class of
+// machine vary by roughly 2x between runs.
+
+/// How long the tests below let a delivery — and a whole run's deliveries — take.
+///
+/// A quarter second rather than the real ten, so a suite that has to prove what happens when a
+/// channel will not answer is still a suite somebody runs.
+const SHORT_BUDGET: Duration = Duration::from_millis(250);
+
+#[test]
+fn many_local_deliveries_do_not_cost_one_wait_each() {
+    const PER_DELIVERY: &str = "sleep 0.4";
+    let world = acmon::RealWorld::new();
+
+    // One delivery first, to establish what a single wait costs on this machine right now —
+    // and to assert it succeeded before any timing is believed.
+    let started = std::time::Instant::now();
+    let single_outcome = world.notify_local(PER_DELIVERY, "Workspace /w is STRANDED");
+    let single = started.elapsed();
+    assert_eq!(
+        single_outcome,
+        NotifyOutcome::Delivered,
+        "the command has to succeed before its timing means anything"
+    );
+
+    let payloads = alerts(12);
+    let report = world.notify_local_batch(PER_DELIVERY, &payloads);
+
+    assert_eq!(report.outcomes.len(), payloads.len());
+    assert!(
+        report.outcomes.iter().all(|o| o.delivered()),
+        "all twelve arrived; got {:?}",
+        report.outcomes
+    );
+    assert!(
+        report.cost * 3 < single * payloads.len() as u32,
+        "twelve deliveries must not cost twelve waits; the batch took {:?} where one took \
+         {single:?}",
+        report.cost
+    );
+}
+
+#[test]
+fn a_local_command_that_never_exits_is_reported_as_a_failure_rather_than_waited_on() {
+    // Before this ticket the wait was unbounded. A notifier that never exits — a helper waiting
+    // on a dialog, a command left in the config that reads stdin forever — stopped the
+    // collection returning at all, and a monitor that has not returned is not monitoring.
+    let world = acmon::RealWorld::with_notify_request_budget(SHORT_BUDGET);
+
+    let started = std::time::Instant::now();
+    let outcome = world.notify_local("sleep 30", "Workspace /w is STRANDED");
+    let elapsed = started.elapsed();
+
+    assert!(
+        outcome.failed(),
+        "a command that would not finish delivered nothing; got {outcome:?}"
+    );
+    let why = outcome.why().expect("a stated reason");
+    assert!(
+        why.contains("did not exit"),
+        "and says so, rather than blaming the payload; got {why:?}"
+    );
+    assert!(
+        elapsed < 10 * SHORT_BUDGET,
+        "it gave up near its own budget instead of waiting out the command; took {elapsed:?} \
+         against a budget of {SHORT_BUDGET:?}"
+    );
+}
+
+#[test]
+fn a_run_whose_local_channel_hangs_states_what_it_did_not_send() {
+    // The shape of the worst case in the ticket: a channel that answers nothing, and more
+    // notable states than one run's budget can carry. What must not happen is a run that sits
+    // for alert-count times the budget, and what must not happen instead is a run that quietly
+    // forgets the alerts it never sent.
+    let world = acmon::RealWorld::with_notify_request_budget(SHORT_BUDGET);
+    let payloads = alerts(12);
+
+    let report = world.notify_local_batch("sleep 30", &payloads);
+
+    assert_eq!(
+        report.outcomes.len(),
+        payloads.len(),
+        "every alert comes back with an outcome"
+    );
+    assert_eq!(
+        report.count(|o| o.delivered()),
+        0,
+        "a command that was killed delivered nothing"
+    );
+    assert!(
+        report.count(|o| o.not_attempted()) >= 1,
+        "the budget ran out before the last of twelve, and that is stated; got {:?}",
+        report.outcomes
+    );
+    assert_eq!(
+        report.count(|o| o.failed()) + report.count(|o| o.not_attempted()),
+        payloads.len(),
+        "refused and never-sent between them account for all twelve"
+    );
+    assert!(
+        report.cost * 4 < payloads.len() as u32 * SHORT_BUDGET,
+        "the run cost about one budget, not twelve; took {:?}",
+        report.cost
+    );
 }

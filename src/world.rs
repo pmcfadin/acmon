@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::deliver::DeliveryReport;
+
 /// Why a path belonging to a process could not be read.
 ///
 /// Each variant must be TRUE when reported. A reason that is merely plausible is
@@ -430,6 +432,8 @@ pub trait World {
     ///
     /// Implementations run the command synchronously and check its exit code. A command that
     /// exits non-zero is a delivery failure, and the alert is re-announced on the following run.
+    /// A command that does not exit at all is also a failure: an unbounded wait here stops the
+    /// collection returning, and a monitor that has not returned is not monitoring.
     ///
     /// The **default refuses**, stating that no local channel is configured. A World with no
     /// local notifier is legitimate; one that silently claims delivery succeeded when nothing
@@ -447,6 +451,38 @@ pub trait World {
     /// The **default refuses**, stating that no remote channel is configured.
     fn notify_remote(&self, _url: &str, _payload: &str) -> NotifyOutcome {
         NotifyOutcome::NoChannelConfigured
+    }
+
+    /// Deliver a whole run's notifications through the local command.
+    ///
+    /// Asked **once per run**, not once per alert. One at-risk workspace and fourteen of them
+    /// are the same number of calls, so an implementation is free to overlap them and to
+    /// bound what the lot may cost — which a caller looping over [`World::notify_local`]
+    /// could not do, and which is what stopped a steady state of fourteen strandings costing
+    /// fourteen timeouts.
+    ///
+    /// The contract that keeps delivery verified: the report carries **one outcome per
+    /// payload, in the payloads' own order**. An alert the implementation chose not to attempt
+    /// is [`NotifyOutcome::NotAttempted`] with a reason. It is never omitted, and never
+    /// reported as delivered on the strength of having been queued.
+    ///
+    /// A **default implementation** delivers them one at a time under the same total budget,
+    /// so a fake World needs nothing; `RealWorld` overrides it to run them concurrently.
+    fn notify_local_batch(&self, command: &str, payloads: &[String]) -> DeliveryReport {
+        crate::deliver::sequentially(payloads, crate::deliver::REQUEST_BUDGET, |payload| {
+            self.notify_local(command, payload)
+        })
+    }
+
+    /// Deliver a whole run's notifications through the remote endpoint.
+    ///
+    /// The same contract as [`World::notify_local_batch`], and the channel it matters most
+    /// for: a remote request is allowed ten seconds, and a dead endpoint used to cost that
+    /// once per alert.
+    fn notify_remote_batch(&self, url: &str, payloads: &[String]) -> DeliveryReport {
+        crate::deliver::sequentially(payloads, crate::deliver::REQUEST_BUDGET, |payload| {
+            self.notify_remote(url, payload)
+        })
     }
 }
 
@@ -545,4 +581,39 @@ pub enum NotifyOutcome {
     NoChannelConfigured,
     /// The channel is configured but delivery failed. Carries the reason.
     Failed(String),
+    /// The channel is configured and this alert was never sent to it at all. Carries why.
+    ///
+    /// Deliberately not [`NotifyOutcome::Failed`]. A failure is a channel that answered
+    /// badly — a non-zero exit, a 5xx, a command that would not finish — and says something
+    /// about the channel's health. This says something about the run instead: the alerting
+    /// step ran out of the time it is allowed, and these alerts were not offered to a channel
+    /// that may be perfectly healthy. Both are re-announced next run; only one is evidence
+    /// the channel is broken, and a reader deciding whether their notifier still works needs
+    /// to be able to tell them apart.
+    NotAttempted(String),
+}
+
+impl NotifyOutcome {
+    /// Whether this outcome means the alert arrived. The only shape that may retire an alert.
+    pub fn delivered(&self) -> bool {
+        matches!(self, NotifyOutcome::Delivered)
+    }
+
+    /// Whether the channel was asked and answered badly.
+    pub fn failed(&self) -> bool {
+        matches!(self, NotifyOutcome::Failed(_))
+    }
+
+    /// Whether the channel was never asked about this alert.
+    pub fn not_attempted(&self) -> bool {
+        matches!(self, NotifyOutcome::NotAttempted(_))
+    }
+
+    /// Why the alert did not arrive, when there is a stated reason.
+    pub fn why(&self) -> Option<&str> {
+        match self {
+            NotifyOutcome::Failed(why) | NotifyOutcome::NotAttempted(why) => Some(why),
+            NotifyOutcome::Delivered | NotifyOutcome::NoChannelConfigured => None,
+        }
+    }
 }

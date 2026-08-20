@@ -1308,9 +1308,8 @@ fn a_failed_delivery_says_which_channel_failed_and_that_it_will_be_retried() {
             },
             notable: 2,
             local_delivered: 2,
-            local_failed: 0,
-            remote_delivered: 0,
             remote_failed: 2,
+            ..acmon::collect::NotifyHealth::none()
         }),
         wide(),
     );
@@ -1327,6 +1326,102 @@ fn a_failed_delivery_says_which_channel_failed_and_that_it_will_be_retried() {
     assert!(
         !text.contains("local: "),
         "the healthy channel is not a failure and must not be listed as one; got:\n{text}"
+    );
+}
+
+#[test]
+fn alerts_that_were_never_sent_are_stated_with_the_reason_rather_than_dropped() {
+    // Ticket #20. Delivery is bounded now, so a run can finish with alerts it never offered to
+    // a channel. That is a cap, and a silent cap in an alerting path reads as "nothing to
+    // report" — which is precisely the class of defect this project exists to remove.
+    let text = rendered(
+        &snapshot_with_health(acmon::collect::NotifyHealth {
+            config: acmon::world::NotifyConfig {
+                local_command: None,
+                remote_url: Some("https://example.invalid/hook".to_string()),
+                unusable: None,
+            },
+            notable: 14,
+            remote_delivered: 8,
+            remote_not_attempted: 6,
+            not_attempted_reason: Some(
+                "this run's alerting budget of 10s for the channel was spent before this alert \
+                 was dispatched"
+                    .to_string(),
+            ),
+            ..acmon::collect::NotifyHealth::none()
+        }),
+        wide(),
+    );
+
+    assert!(
+        text.contains("NOT SENT") && text.contains("6"),
+        "six alerts nobody was told about must be stated, and counted; got:\n{text}"
+    );
+    assert!(
+        text.contains("budget"),
+        "with the reason they were not sent — a bare count is a cap wearing a number; \
+         got:\n{text}"
+    );
+    assert!(
+        text.contains("re-announced"),
+        "and the reader has to know they are not lost; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_run_that_sent_everything_it_had_says_nothing_about_alerts_it_did_not_send() {
+    // The counterweight to the test above. Fourteen notable states, fourteen delivered, and a
+    // line about unsent alerts would be a lie — and a warning on a healthy run trains a reader
+    // to ignore the warning that matters.
+    let text = rendered(
+        &snapshot_with_health(acmon::collect::NotifyHealth {
+            config: acmon::world::NotifyConfig {
+                local_command: Some("terminal-notifier".to_string()),
+                remote_url: None,
+                unusable: None,
+            },
+            notable: 14,
+            local_delivered: 14,
+            ..acmon::collect::NotifyHealth::none()
+        }),
+        wide(),
+    );
+
+    assert!(
+        !text.contains("WARNING"),
+        "a run that delivered every alert it decided on has nothing to warn about; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_failed_delivery_and_an_unsent_alert_are_reported_as_the_two_different_things_they_are() {
+    // A channel that answered badly is evidence about the channel. A run that never reached
+    // the rest of its alerts is evidence about the run. Folding them into one tally would make
+    // a healthy notifier that ran out of time look broken, and hide how much went unsent.
+    let text = rendered(
+        &snapshot_with_health(acmon::collect::NotifyHealth {
+            config: acmon::world::NotifyConfig {
+                local_command: Some("terminal-notifier".to_string()),
+                remote_url: None,
+                unusable: None,
+            },
+            notable: 10,
+            local_failed: 4,
+            local_not_attempted: 6,
+            not_attempted_reason: Some("the budget was spent".to_string()),
+            ..acmon::collect::NotifyHealth::none()
+        }),
+        wide(),
+    );
+
+    assert!(
+        text.contains("failures") && text.contains("local: 4 failed"),
+        "the four the channel refused are delivery failures; got:\n{text}"
+    );
+    assert!(
+        text.contains("NOT SENT") && text.contains("local: 6"),
+        "the six it was never given are not; got:\n{text}"
     );
 }
 
