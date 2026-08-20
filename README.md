@@ -88,8 +88,11 @@ Where a claim could not be verified, it says so.
 ## Status
 
 v1 in progress. `agtop` runs and is worth running: it prints a session table and an
-at-risk workspace panel. `amon` exists as a verb surface only — every verb it advertises
-reports that it is not built yet rather than exiting zero having done nothing.
+at-risk workspace panel. `amon` is a verb surface plus its single-writer lock: `amon watch`
+takes an exclusive lock in the state directory, publishes which pid holds the writer role,
+and refuses to start when another instance already holds it — naming that pid. The tiered
+collection loop it would guard is not built, so every verb, `watch` included, still reports
+what is missing and exits non-zero rather than exiting zero having done nothing.
 
 The one assumption still unverified is whether an interactive session emits a direct
 "blocked waiting on a human" signal.

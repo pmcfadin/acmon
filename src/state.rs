@@ -35,6 +35,23 @@ pub enum Tier {
     Slow,
 }
 
+/// The state file every reader looks for, and the only one `amon watch` publishes facts in.
+///
+/// Named here rather than spelled out at each call site so the monitor and the display cannot
+/// disagree about which file they mean.
+pub const STATE_FILE: &str = "state.json";
+
+/// The environment variable that relocates the state **directory**.
+///
+/// Distinct from `ACMON_STATE`, which names the pre-split memory *file*. Its job is to let a
+/// test drive the real acquire-write-release path — lock included — against a temporary
+/// directory. A test that had to use the developer's own `~/.local/state/acmon/` would either
+/// destroy real history or be skipped, and a skipped test of a lock is how two writers ship.
+pub const STATE_DIR_VARIABLE: &str = "ACMON_STATE_DIR";
+
+/// The environment variable that relocates the config directory.
+pub const CONFIG_DIR_VARIABLE: &str = "ACMON_CONFIG_DIR";
+
 /// Path resolution: config vs. state split.
 ///
 /// Keeps config (`~/.config/acmon/`) and mutable state (`~/.local/state/acmon/`) separate,
@@ -61,6 +78,51 @@ impl Paths {
             config: base.join("config"),
             state: base.join("state"),
         }
+    }
+
+    /// Where this machine keeps them, honouring the two overrides.
+    ///
+    /// Fails rather than guessing. A stand-in path chosen because it is certain to be empty
+    /// would make a monitor that cannot find its own state look like a monitor with nothing
+    /// to report.
+    pub fn from_environment() -> Result<Self, String> {
+        Paths::from_values(
+            std::env::var(CONFIG_DIR_VARIABLE).ok().as_deref(),
+            std::env::var(STATE_DIR_VARIABLE).ok().as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        )
+    }
+
+    /// The resolution itself, with the environment passed in.
+    ///
+    /// Separated so it can be tested without mutating the process environment, which every
+    /// other test in the same binary shares.
+    pub fn from_values(
+        config_dir: Option<&str>,
+        state_dir: Option<&str>,
+        home: Option<&str>,
+    ) -> Result<Self, String> {
+        let home = home.map(str::trim).filter(|value| !value.is_empty());
+
+        let resolve = |explicit: Option<&str>, variable: &str, under_home: &[&str]| match explicit
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(path) => Ok(PathBuf::from(path)),
+            None => match home {
+                Some(home) => Ok(under_home
+                    .iter()
+                    .fold(PathBuf::from(home), |path, segment| path.join(segment))),
+                None => Err(format!(
+                    "HOME is not readable, so {variable} must name the directory explicitly"
+                )),
+            },
+        };
+
+        Ok(Paths {
+            config: resolve(config_dir, CONFIG_DIR_VARIABLE, &[".config", "acmon"])?,
+            state: resolve(state_dir, STATE_DIR_VARIABLE, &[".local", "state", "acmon"])?,
+        })
     }
 
     /// Where config files live: `detectors.toml`, `notify.toml`.

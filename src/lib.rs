@@ -6,6 +6,7 @@ pub mod deliver;
 pub mod detect;
 mod isotime;
 pub mod liveness;
+pub mod lock;
 pub mod machtime;
 pub mod memory;
 pub mod notify;
@@ -13,6 +14,7 @@ pub mod real_world;
 pub mod render;
 pub mod state;
 pub mod vcs;
+pub mod watch;
 pub mod workspace;
 pub mod world;
 

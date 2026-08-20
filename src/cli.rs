@@ -27,7 +27,17 @@ pub enum AmonVerb {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerbState {
     Available,
-    Planned { tracked_as: &'static str },
+    Planned {
+        tracked_as: &'static str,
+    },
+    /// Some of the verb is built and the rest is not, so an invocation does real work and
+    /// still cannot do the job. `watch` is here: it takes and releases the lock (#26) around a
+    /// collection loop that does not exist yet (#27). A caller must treat it exactly as it
+    /// treats [`VerbState::Planned`] — the verb does not work — and the exit code says so.
+    Partial {
+        built: &'static str,
+        tracked_as: &'static str,
+    },
 }
 
 impl AmonVerb {
@@ -74,7 +84,10 @@ impl AmonVerb {
 
     pub fn state(&self) -> VerbState {
         match self {
-            AmonVerb::Watch => VerbState::Planned { tracked_as: "#27" },
+            AmonVerb::Watch => VerbState::Partial {
+                built: "the single-writer lock, #26",
+                tracked_as: "#27",
+            },
             AmonVerb::Install | AmonVerb::Uninstall | AmonVerb::Status => {
                 VerbState::Planned { tracked_as: "#11" }
             }
@@ -90,12 +103,22 @@ impl AmonVerb {
     }
 }
 
+/// The flag that runs the monitor in this terminal.
+///
+/// It exists for debugging and it is **still subject to the lock** (F19). Two writers is two
+/// writers regardless of intent, so this changes where the monitor's noise goes and nothing
+/// else.
+pub const FOREGROUND_FLAG: &str = "--foreground";
+
 /// A parsed `amon` invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AmonRequest {
     /// Help was asked for. That is a job done, and exits zero.
     Help,
-    Verb(AmonVerb),
+    Verb {
+        verb: AmonVerb,
+        foreground: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +127,14 @@ pub enum CliError {
     /// nothing must not report success.
     NoVerb,
     UnknownVerb(String),
+    /// A flag this verb does not take. Refused rather than ignored: someone who passed
+    /// `--foreground` to a verb that has no foreground would otherwise be told nothing and
+    /// conclude it had been honoured.
+    FlagNotValidFor {
+        flag: String,
+        verb: AmonVerb,
+    },
+    UnexpectedArgument(String),
 }
 
 impl fmt::Display for CliError {
@@ -111,6 +142,12 @@ impl fmt::Display for CliError {
         match self {
             CliError::NoVerb => write!(formatter, "no verb given"),
             CliError::UnknownVerb(name) => write!(formatter, "unknown verb `{name}`"),
+            CliError::FlagNotValidFor { flag, verb } => {
+                write!(formatter, "`{flag}` is not a flag `{}` takes", verb.name())
+            }
+            CliError::UnexpectedArgument(argument) => {
+                write!(formatter, "unexpected argument `{argument}`")
+            }
         }
     }
 }
@@ -132,10 +169,25 @@ where
         return Ok(AmonRequest::Help);
     }
 
-    match AmonVerb::from_name(&first) {
-        Some(verb) => Ok(AmonRequest::Verb(verb)),
-        None => Err(CliError::UnknownVerb(first)),
+    let Some(verb) = AmonVerb::from_name(&first) else {
+        return Err(CliError::UnknownVerb(first));
+    };
+
+    let mut foreground = false;
+    for argument in arguments {
+        match argument.as_str() {
+            FOREGROUND_FLAG if verb == AmonVerb::Watch => foreground = true,
+            FOREGROUND_FLAG => {
+                return Err(CliError::FlagNotValidFor {
+                    flag: argument,
+                    verb,
+                })
+            }
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
     }
+
+    Ok(AmonRequest::Verb { verb, foreground })
 }
 
 /// `amon`'s help text, generated from [`AmonVerb::all`].
@@ -160,6 +212,9 @@ pub fn amon_usage() -> String {
         let marker = match verb.state() {
             VerbState::Available => String::new(),
             VerbState::Planned { tracked_as } => format!("  (not built yet — {tracked_as})"),
+            VerbState::Partial { built, tracked_as } => {
+                format!("  (has {built}; still not usable — {tracked_as})")
+            }
         };
         text.push_str(&format!(
             "    {:width$}  {}{}\n",
@@ -172,6 +227,13 @@ pub fn amon_usage() -> String {
 
     text.push_str(
         "\n\
+         FLAGS\n\
+         \x20   --foreground  Run `watch` in this terminal rather than under launchd, for\n\
+         \x20                 debugging. Still subject to the single-writer lock: two writers\n\
+         \x20                 is two writers regardless of intent, so a second `amon watch`\n\
+         \x20                 is refused here too. `amon status` and the log are how you\n\
+         \x20                 watch the resident one work.\n\
+         \n\
          The display is a separate binary, `agtop`. If it measures, it is amon; if it draws,\n\
          it is agtop.\n",
     );

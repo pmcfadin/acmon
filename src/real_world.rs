@@ -325,7 +325,11 @@ fn read_cwd(pid: i32) -> Result<String, PathUnavailable> {
 ///
 /// Signal 0 performs the permission and existence checks without delivering
 /// anything, so this observes without disturbing.
-fn process_exists(pid: i32) -> bool {
+///
+/// Public because the single-writer lock needs the same question answered about the pid a dead
+/// monitor left in its lock file, and two copies of a `kill(pid, 0)` would be two places for
+/// the "the tool observes, it never acts" rule to be got wrong.
+pub fn process_exists(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 || *libc::__error() == libc::EPERM }
 }
 

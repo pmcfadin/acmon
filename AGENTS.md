@@ -7,9 +7,11 @@ and how much of that cost is the machine's fault rather than the work's. See
 **Status:** v1 implementation in progress. The crate now builds **two binaries** — `amon`,
 the monitor, and `agtop`, the display. **If it measures, it is `amon`; if it draws, it is
 `agtop`.** `agtop` runs and is worth running: it prints a session table and an at-risk
-workspace panel in about 2.5 s. `amon` is a verb surface only so far; every verb it
-advertises fails loudly rather than exiting zero having done nothing, and `amon --help`
-names the ticket that will deliver each one.
+workspace panel in about 2.5 s. `amon` is a verb surface plus the single-writer lock:
+`amon watch` takes an exclusive `flock` in the state directory, publishes the writer pid,
+and a second instance is refused by name. Every verb still fails loudly rather than exiting
+zero having done nothing — `watch` included, because the collection loop the lock exists to
+guard is #27 — and `amon --help` names the ticket that will deliver each one.
 
 **Ask GitHub which tickets are open and unblocked** — that is authoritative, and any list
 written here goes stale. Two carried-forward notes that GitHub would not tell you: #13

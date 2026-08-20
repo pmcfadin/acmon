@@ -64,6 +64,51 @@ fn config_and_state_directories_are_distinct() {
 }
 
 #[test]
+fn each_directory_can_be_relocated_independently_of_the_other() {
+    // The override is what lets a test drive the real write path — lock included — without
+    // touching the developer's own state. Independently, because relocating state for a test
+    // must not silently relocate config with it.
+    use acmon::state::Paths;
+
+    let paths = Paths::from_values(None, Some("/tmp/acmon-state"), Some("/Users/test"))
+        .expect("HOME covers the directory that was not named");
+
+    assert_eq!(paths.state_dir(), PathBuf::from("/tmp/acmon-state"));
+    assert_eq!(
+        paths.config_dir(),
+        PathBuf::from("/Users/test/.config/acmon"),
+        "config must still fall to its usual place under HOME"
+    );
+
+    let both = Paths::from_values(Some("/tmp/acmon-config"), Some("/tmp/acmon-state"), None)
+        .expect("nothing is left for HOME to answer");
+    assert_eq!(both.config_dir(), PathBuf::from("/tmp/acmon-config"));
+    assert_eq!(both.state_dir(), PathBuf::from("/tmp/acmon-state"));
+}
+
+#[test]
+fn a_directory_that_cannot_be_resolved_is_an_error_naming_the_variable_to_set() {
+    // Fail loud. A stand-in path chosen because it is certain to be empty would make a monitor
+    // that cannot find its own state indistinguishable from one with nothing to report.
+    use acmon::state::Paths;
+
+    let error = Paths::from_values(None, None, None).expect_err("no HOME, no overrides");
+
+    assert!(
+        error.contains("HOME"),
+        "the error must say what was missing; got {error:?}"
+    );
+    assert!(
+        error.contains("ACMON_CONFIG_DIR") || error.contains("ACMON_STATE_DIR"),
+        "and it must name the variable that would answer it; got {error:?}"
+    );
+
+    // A blank value is not an answer either, and must not read as one.
+    let blank = Paths::from_values(Some("  "), Some("  "), None).expect_err("blank is not a path");
+    assert!(!blank.trim().is_empty());
+}
+
+#[test]
 fn deleting_the_state_directory_loses_history_and_nothing_else() {
     // Acceptance criterion: deleting the state directory loses history and nothing else —
     // the next run recreates it and works.

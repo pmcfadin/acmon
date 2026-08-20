@@ -46,7 +46,13 @@ fn a_known_verb_parses_to_that_verb() {
     let parsed = parse_amon(vec!["watch".to_string()]);
 
     assert!(
-        matches!(parsed, Ok(AmonRequest::Verb(AmonVerb::Watch))),
+        matches!(
+            parsed,
+            Ok(AmonRequest::Verb {
+                verb: AmonVerb::Watch,
+                foreground: false
+            })
+        ),
         "`watch` should parse to the Watch verb, got {parsed:?}"
     );
 }
@@ -70,7 +76,7 @@ fn every_advertised_verb_is_one_the_parser_accepts() {
     for verb in AmonVerb::all() {
         let parsed = parse_amon(vec![verb.name().to_string()]);
         assert!(
-            matches!(parsed, Ok(AmonRequest::Verb(v)) if v == *verb),
+            matches!(parsed, Ok(AmonRequest::Verb { verb: parsed_verb, .. }) if parsed_verb == *verb),
             "help advertises `{}`, so the parser must accept it; got {parsed:?}",
             verb.name()
         );
@@ -98,29 +104,107 @@ fn the_usage_text_lists_every_verb_with_a_summary() {
 }
 
 #[test]
-fn a_planned_verb_states_what_will_deliver_it() {
+fn a_verb_that_cannot_do_its_job_states_what_will_deliver_it() {
     // A verb that is recognised but not built says so, and says where the work is tracked.
     // "not implemented" alone leaves a reader unable to tell abandoned from forthcoming.
-    let planned: Vec<_> = AmonVerb::all()
+    //
+    // `watch` is the awkward case and the reason Partial exists: it holds the single-writer
+    // lock (#26) around a collection loop that is not built (#27), so it does real work and
+    // still cannot monitor. Both halves have to be named, or a reader seeing the lock work
+    // would conclude the verb works.
+    let unbuilt: Vec<_> = AmonVerb::all()
         .iter()
-        .filter(|v| matches!(v.state(), VerbState::Planned { .. }))
+        .filter(|verb| !matches!(verb.state(), VerbState::Available))
         .collect();
 
     assert!(
-        !planned.is_empty(),
+        !unbuilt.is_empty(),
         "this seam is meaningless once every verb is available; delete it then"
     );
 
-    for verb in planned {
+    for verb in unbuilt {
         match verb.state() {
             VerbState::Planned { tracked_as } => assert!(
                 !tracked_as.is_empty(),
                 "planned verb `{}` should name the work that delivers it",
                 verb.name()
             ),
+            VerbState::Partial { built, tracked_as } => {
+                assert!(
+                    !built.is_empty(),
+                    "partly built verb `{}` should name what it already has",
+                    verb.name()
+                );
+                assert!(
+                    !tracked_as.is_empty(),
+                    "partly built verb `{}` should name the work that finishes it",
+                    verb.name()
+                );
+            }
             VerbState::Available => unreachable!(),
         }
     }
+}
+
+#[test]
+fn the_foreground_flag_is_only_a_flag_for_watch() {
+    // `--foreground` is `watch`'s alone. Accepted silently elsewhere, it would read as
+    // honoured — and the reader would believe they had asked for something they had not.
+    let parsed = parse_amon(vec!["watch".to_string(), "--foreground".to_string()]);
+    assert!(
+        matches!(
+            parsed,
+            Ok(AmonRequest::Verb {
+                verb: AmonVerb::Watch,
+                foreground: true
+            })
+        ),
+        "`watch --foreground` should parse as watch in the foreground, got {parsed:?}"
+    );
+
+    for verb in AmonVerb::all() {
+        if *verb == AmonVerb::Watch {
+            continue;
+        }
+        let parsed = parse_amon(vec![verb.name().to_string(), "--foreground".to_string()]);
+        match parsed {
+            Err(CliError::FlagNotValidFor { flag, verb: named }) => {
+                assert_eq!(flag, "--foreground");
+                assert_eq!(named, *verb);
+            }
+            other => panic!(
+                "`{} --foreground` should be refused rather than ignored, got {other:?}",
+                verb.name()
+            ),
+        }
+    }
+}
+
+#[test]
+fn an_argument_the_parser_does_not_understand_is_refused_rather_than_ignored() {
+    let parsed = parse_amon(vec!["watch".to_string(), "--daemonize".to_string()]);
+
+    match parsed {
+        Err(CliError::UnexpectedArgument(argument)) => assert_eq!(argument, "--daemonize"),
+        other => panic!("expected UnexpectedArgument(\"--daemonize\"), got {other:?}"),
+    }
+}
+
+#[test]
+fn the_usage_text_says_the_foreground_flag_is_still_subject_to_the_lock() {
+    // The misreading this heads off: `--foreground` as a way to run a second monitor "just to
+    // look". Two writers is two writers regardless of intent, and help has to say so where the
+    // flag is discovered rather than in a ticket.
+    let usage = acmon::cli::amon_usage();
+
+    assert!(
+        usage.contains("--foreground"),
+        "help must document the flag:\n{usage}"
+    );
+    assert!(
+        usage.contains("lock"),
+        "help must say the flag is still subject to the lock:\n{usage}"
+    );
 }
 
 // --- The binaries themselves ---
@@ -129,9 +213,21 @@ fn a_planned_verb_states_what_will_deliver_it() {
 // the few cases where the exit code *is* the behaviour under test — this repo pays the exec
 // tax it measures, and a spawn per assertion would be us doing the thing we complain about.
 
+/// Run a binary with its state directory relocated.
+///
+/// The relocation matters now that `amon watch` takes a lock and publishes a state file: a
+/// suite that used the developer's own `~/.local/state/acmon/` would write real state as a side
+/// effect of testing an exit code.
+fn scratch_state_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("acmon-seam11-{}-state", std::process::id()))
+}
+
 fn run(binary: &str, args: &[&str]) -> (bool, String, String) {
+    let state_dir = scratch_state_dir();
+
     let output = Command::new(binary)
         .args(args)
+        .env(acmon::state::STATE_DIR_VARIABLE, &state_dir)
         .output()
         .unwrap_or_else(|error| panic!("failed to run {binary} {args:?}: {error}"));
 
@@ -171,11 +267,12 @@ fn amon_with_no_arguments_exits_non_zero() {
 }
 
 #[test]
-fn a_planned_verb_exits_non_zero_rather_than_succeeding_at_nothing() {
+fn a_verb_that_cannot_do_its_job_exits_non_zero_rather_than_succeeding_at_nothing() {
     // The load-bearing case. A LaunchAgent that runs `amon watch` and sees zero will report
-    // a healthy monitor for as long as the verb remains unbuilt.
+    // a healthy monitor for as long as the verb remains unbuilt — and `watch` is the one that
+    // does some of its work, which makes it the one most likely to be read as working.
     for verb in AmonVerb::all() {
-        if !matches!(verb.state(), VerbState::Planned { .. }) {
+        if matches!(verb.state(), VerbState::Available) {
             continue;
         }
 
@@ -196,6 +293,10 @@ fn a_planned_verb_exits_non_zero_rather_than_succeeding_at_nothing() {
             "a refusal belongs on stderr, not stdout; stdout was:\n{stdout}"
         );
     }
+
+    // `amon watch` publishes a state file before it stops, so this test is one of the few that
+    // leaves anything behind.
+    let _ = std::fs::remove_dir_all(scratch_state_dir());
 }
 
 #[test]
