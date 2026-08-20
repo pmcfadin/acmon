@@ -85,12 +85,12 @@ struct TierEntry {
     /// When this tier's data was written.
     #[serde(with = "iso")]
     timestamp: SystemTime,
-    /// The tier's data, as raw bytes.
+    /// The tier's data as JSON.
     ///
-    /// Opaque to this module — the tiered collection loop (#27) owns the schema.
-    /// Serialized as base64 for human readability and compact storage.
-    #[serde(with = "base64_bytes")]
-    data: Vec<u8>,
+    /// The tiered collection loop (#27) owns the schema. Stored as `serde_json::Value`
+    /// rather than opaque bytes because the collection loop will write JSON, and storing
+    /// it as JSON keeps the file human-readable without base64 encoding.
+    data: serde_json::Value,
 }
 
 /// The on-disk format: writer pid + per-tier data and timestamps.
@@ -132,13 +132,13 @@ impl TieredState {
     }
 
     /// Set data for a tier with its timestamp.
-    pub fn set_tier_data(&mut self, tier: Tier, data: Vec<u8>, timestamp: SystemTime) {
+    pub fn set_tier_data(&mut self, tier: Tier, data: serde_json::Value, timestamp: SystemTime) {
         self.tiers.insert(tier, TierEntry { timestamp, data });
     }
 
     /// Get data for a tier.
-    pub fn tier_data(&self, tier: Tier) -> Option<&[u8]> {
-        self.tiers.get(&tier).map(|entry| entry.data.as_slice())
+    pub fn tier_data(&self, tier: Tier) -> Option<&serde_json::Value> {
+        self.tiers.get(&tier).map(|entry| &entry.data)
     }
 
     /// Get the timestamp for a tier.
@@ -239,11 +239,23 @@ impl StateStore {
 
     /// Read state if it exists.
     ///
-    /// Returns `None` if the file doesn't exist, which is not an error — a first run has
-    /// nothing to read. Returns an error if the file exists but cannot be read.
-    pub fn read_state(&self, name: &str) -> Option<Vec<u8>> {
+    /// Returns `Ok(None)` if the file doesn't exist (a first run), `Ok(Some(data))` on
+    /// success, or `Err` if the file exists but cannot be read.
+    ///
+    /// Distinguishes three outcomes to avoid "fail to zero": a file that exists but cannot
+    /// be read — permissions, I/O error, corrupted filesystem — must not be indistinguishable
+    /// from "no file yet", which is what `None` means.
+    pub fn read_state(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
         let path = self.paths.state_dir().join(name);
-        std::fs::read(&path).ok()
+        match std::fs::read(&path) {
+            Ok(data) => Ok(Some(data)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!(
+                "could not read state file {}: {}",
+                path.display(),
+                e
+            )),
+        }
     }
 
     /// Write tiered state atomically.
@@ -260,10 +272,11 @@ impl StateStore {
     /// Read tiered state if it exists.
     ///
     /// Returns `Ok(None)` if the file doesn't exist (a first run), `Ok(Some(state))` on
-    /// success, or `Err` if the file exists but cannot be parsed.
+    /// success, or `Err` if the file exists but cannot be read or parsed.
     pub fn read_tiered_state(&self, name: &str) -> Result<Option<TieredState>, String> {
-        let Some(data) = self.read_state(name) else {
-            return Ok(None);
+        let data = match self.read_state(name)? {
+            Some(data) => data,
+            None => return Ok(None),
         };
 
         let text =
@@ -278,127 +291,23 @@ impl StateStore {
 
 /// Timestamps as ISO 8601, so the state file can be read without a converter.
 ///
-/// Reuses the same logic as memory.rs but kept local to avoid exposing internals.
+/// Shares the time conversion logic from isotime.rs (extracted to avoid duplication with
+/// memory.rs).
 mod iso {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::SystemTime;
 
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    fn unix_seconds(time: SystemTime) -> i64 {
-        match time.duration_since(UNIX_EPOCH) {
-            Ok(since) => since.as_secs() as i64,
-            Err(before) => -(before.duration().as_secs() as i64),
-        }
-    }
-
-    fn time_from_unix_seconds(seconds: i64) -> SystemTime {
-        if seconds >= 0 {
-            UNIX_EPOCH + Duration::from_secs(seconds as u64)
-        } else {
-            UNIX_EPOCH - Duration::from_secs(seconds.unsigned_abs())
-        }
-    }
-
     pub fn serialize<S: Serializer>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error> {
-        crate::isotime::iso8601_from_unix_seconds(unix_seconds(*time)).serialize(serializer)
+        crate::isotime::iso8601_from_unix_seconds(crate::isotime::unix_seconds(*time))
+            .serialize(serializer)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SystemTime, D::Error> {
         let text = String::deserialize(deserializer)?;
         crate::isotime::unix_seconds_from_iso8601(&text)
-            .map(time_from_unix_seconds)
+            .map(crate::isotime::time_from_unix_seconds)
             .map_err(serde::de::Error::custom)
-    }
-}
-
-/// Bytes as base64, for compact and human-readable storage.
-mod base64_bytes {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        // Simple base64 encoding without external dependencies
-        let encoded = base64_encode(data);
-        encoded.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        base64_decode(&text).map_err(serde::de::Error::custom)
-    }
-
-    fn base64_encode(data: &[u8]) -> String {
-        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut result = String::new();
-        let mut i = 0;
-
-        while i + 2 < data.len() {
-            let b1 = data[i];
-            let b2 = data[i + 1];
-            let b3 = data[i + 2];
-
-            result.push(ALPHABET[(b1 >> 2) as usize] as char);
-            result.push(ALPHABET[(((b1 & 0x03) << 4) | (b2 >> 4)) as usize] as char);
-            result.push(ALPHABET[(((b2 & 0x0f) << 2) | (b3 >> 6)) as usize] as char);
-            result.push(ALPHABET[(b3 & 0x3f) as usize] as char);
-            i += 3;
-        }
-
-        if i < data.len() {
-            let b1 = data[i];
-            result.push(ALPHABET[(b1 >> 2) as usize] as char);
-            if i + 1 < data.len() {
-                let b2 = data[i + 1];
-                result.push(ALPHABET[(((b1 & 0x03) << 4) | (b2 >> 4)) as usize] as char);
-                result.push(ALPHABET[((b2 & 0x0f) << 2) as usize] as char);
-                result.push('=');
-            } else {
-                result.push(ALPHABET[((b1 & 0x03) << 4) as usize] as char);
-                result.push_str("==");
-            }
-        }
-
-        result
-    }
-
-    fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
-        let mut lookup = [0u8; 256];
-        for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-            .iter()
-            .enumerate()
-        {
-            lookup[c as usize] = i as u8;
-        }
-
-        let s = s.trim_end_matches('=');
-        let mut result = Vec::new();
-        let bytes = s.as_bytes();
-        let mut i = 0;
-
-        while i + 3 < bytes.len() {
-            let b1 = lookup[bytes[i] as usize];
-            let b2 = lookup[bytes[i + 1] as usize];
-            let b3 = lookup[bytes[i + 2] as usize];
-            let b4 = lookup[bytes[i + 3] as usize];
-
-            result.push((b1 << 2) | (b2 >> 4));
-            result.push((b2 << 4) | (b3 >> 2));
-            result.push((b3 << 6) | b4);
-            i += 4;
-        }
-
-        if i < bytes.len() {
-            let b1 = lookup[bytes[i] as usize];
-            if i + 1 < bytes.len() {
-                let b2 = lookup[bytes[i + 1] as usize];
-                result.push((b1 << 2) | (b2 >> 4));
-                if i + 2 < bytes.len() {
-                    let b3 = lookup[bytes[i + 2] as usize];
-                    result.push((b2 << 4) | (b3 >> 2));
-                }
-            }
-        }
-
-        Ok(result)
     }
 }
 
@@ -410,7 +319,7 @@ mod tests {
     fn tier_entry_round_trips_through_json() {
         let entry = TierEntry {
             timestamp: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_787_000_000),
-            data: vec![1, 2, 3, 4],
+            data: serde_json::json!({"test": "data"}),
         };
 
         let json = serde_json::to_string(&entry).expect("serialize");
@@ -427,7 +336,7 @@ mod tests {
             Tier::Fast,
             TierEntry {
                 timestamp: SystemTime::UNIX_EPOCH,
-                data: b"fast".to_vec(),
+                data: serde_json::json!("fast"),
             },
         );
 

@@ -132,13 +132,17 @@ fn state_writes_are_atomic_so_a_reader_never_sees_a_half_written_file() {
     std::thread::scope(|scope| {
         let reader = scope.spawn(|| {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Some(content) = store.read_state("test.json") {
-                    assert!(
-                        content == small || content == large[..],
-                        "reader observed a torn write: {} bytes",
-                        content.len()
-                    );
-                    reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match store.read_state("test.json") {
+                    Ok(Some(content)) => {
+                        assert!(
+                            content == small || content == large[..],
+                            "reader observed a torn write: {} bytes",
+                            content.len()
+                        );
+                        reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(None) => {} // File doesn't exist yet
+                    Err(e) => panic!("read error: {}", e),
                 }
             }
         });
@@ -192,7 +196,10 @@ fn a_sigkill_mid_write_loses_only_the_pass_in_flight() {
     );
 
     // The actual file is readable
-    let content = store.read_state("test.json").expect("file exists");
+    let content = store
+        .read_state("test.json")
+        .expect("no error")
+        .expect("file exists");
     assert_eq!(content, b"first");
 
     let _ = std::fs::remove_dir_all(state_dir);
@@ -278,17 +285,17 @@ fn every_tier_has_its_own_timestamp() {
     // Update different tiers at different times
     state.set_tier_data(
         Tier::Fast,
-        "fast data".as_bytes().to_vec(),
+        serde_json::json!("fast data"),
         ago(Duration::from_secs(5)),
     );
     state.set_tier_data(
         Tier::Medium,
-        "medium data".as_bytes().to_vec(),
+        serde_json::json!("medium data"),
         ago(Duration::from_secs(30)),
     );
     state.set_tier_data(
         Tier::Slow,
-        "slow data".as_bytes().to_vec(),
+        serde_json::json!("slow data"),
         ago(Duration::from_secs(120)),
     );
 
@@ -353,13 +360,21 @@ fn a_single_file_level_timestamp_is_forbidden() {
     let store = StateStore::new(paths);
 
     let mut state = TieredState::new(1);
-    state.set_tier_data(Tier::Fast, b"fast".to_vec(), ago(Duration::from_secs(5)));
+    state.set_tier_data(
+        Tier::Fast,
+        serde_json::json!("fast"),
+        ago(Duration::from_secs(5)),
+    );
     state.set_tier_data(
         Tier::Medium,
-        b"medium".to_vec(),
+        serde_json::json!("medium"),
         ago(Duration::from_secs(30)),
     );
-    state.set_tier_data(Tier::Slow, b"slow".to_vec(), ago(Duration::from_secs(120)));
+    state.set_tier_data(
+        Tier::Slow,
+        serde_json::json!("slow"),
+        ago(Duration::from_secs(120)),
+    );
 
     store
         .write_tiered_state("test.json", &state)
@@ -396,7 +411,7 @@ fn tier_timestamps_are_readable_as_iso8601_by_a_human() {
     let store = StateStore::new(paths);
 
     let mut state = TieredState::new(1);
-    state.set_tier_data(Tier::Fast, b"test".to_vec(), now());
+    state.set_tier_data(Tier::Fast, serde_json::json!("test"), now());
 
     store
         .write_tiered_state("test.json", &state)
@@ -457,7 +472,11 @@ fn freshness_is_determined_from_per_tier_stamps_not_from_a_process() {
     let store = StateStore::new(paths);
 
     let mut state = TieredState::new(99999); // A pid that doesn't exist
-    state.set_tier_data(Tier::Fast, b"data".to_vec(), ago(Duration::from_secs(300)));
+    state.set_tier_data(
+        Tier::Fast,
+        serde_json::json!("data"),
+        ago(Duration::from_secs(300)),
+    );
 
     store
         .write_tiered_state("test.json", &state)
@@ -497,17 +516,17 @@ fn facts_are_organized_by_tier() {
     // Different data for different tiers
     state.set_tier_data(
         Tier::Fast,
-        b"fast facts".to_vec(),
+        serde_json::json!("fast facts"),
         ago(Duration::from_secs(1)),
     );
     state.set_tier_data(
         Tier::Medium,
-        b"medium facts".to_vec(),
+        serde_json::json!("medium facts"),
         ago(Duration::from_secs(10)),
     );
     state.set_tier_data(
         Tier::Slow,
-        b"slow facts".to_vec(),
+        serde_json::json!("slow facts"),
         ago(Duration::from_secs(60)),
     );
 
@@ -523,15 +542,15 @@ fn facts_are_organized_by_tier() {
     // Each tier's data is retrievable with its timestamp
     assert_eq!(
         read_back.tier_data(Tier::Fast).expect("fast data"),
-        b"fast facts"
+        &serde_json::json!("fast facts")
     );
     assert_eq!(
         read_back.tier_data(Tier::Medium).expect("medium data"),
-        b"medium facts"
+        &serde_json::json!("medium facts")
     );
     assert_eq!(
         read_back.tier_data(Tier::Slow).expect("slow data"),
-        b"slow facts"
+        &serde_json::json!("slow facts")
     );
 
     // And each has its own timestamp
@@ -540,4 +559,170 @@ fn facts_are_organized_by_tier() {
     assert!(read_back.tier_timestamp(Tier::Slow).is_some());
 
     let _ = std::fs::remove_dir_all(store.paths().state_dir());
+}
+
+// --- Negative paths: fail loud, never fail to zero ---
+
+#[test]
+fn a_state_file_that_exists_but_cannot_be_read_produces_a_loud_error() {
+    // The defect from AGENTS.md: a calm answer where an error should be. A file that exists
+    // but cannot be read — permissions, I/O error, corrupted filesystem — must not read as
+    // "no file yet", which is what None means.
+    use acmon::state::{Paths, StateStore};
+
+    let base = scratch("unreadable");
+    let paths = Paths::with_base(&base);
+    let store = StateStore::new(paths);
+
+    // Write a file
+    store
+        .write_state("test.json", b"some state", 1)
+        .expect("write");
+
+    let path = store.paths().state_dir().join("test.json");
+
+    // Make it unreadable (chmod 0000)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+
+        // If running as root, chmod has no effect. Skip the assertion if that's the case.
+        if std::fs::read(&path).is_ok() {
+            eprintln!(
+                "SKIP: running as root, chmod has no effect; cannot test unreadable file behavior"
+            );
+            let _ = std::fs::remove_dir_all(store.paths().state_dir());
+            return;
+        }
+    }
+
+    // Attempt to read it
+    let result = store.read_state("test.json");
+
+    // It must NOT return Ok(None) (which reads as "no file yet")
+    assert!(
+        result.is_err(),
+        "a file that exists but cannot be read must produce an error, not None; got {:?}",
+        result
+    );
+
+    // The error must name a reason
+    let error = result.unwrap_err();
+    assert!(
+        !error.trim().is_empty(),
+        "the error must state a reason, not be blank; got {:?}",
+        error
+    );
+    assert!(
+        error.contains("test.json") || error.contains("state"),
+        "the error should name the file or directory; got {:?}",
+        error
+    );
+
+    // Restore permissions for cleanup
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path)
+            .unwrap_or_else(|_| {
+                // If we can't get metadata, try to remove the whole directory
+                let _ = std::fs::remove_dir_all(store.paths().state_dir());
+                panic!("Could not restore permissions for cleanup");
+            })
+            .permissions();
+        perms.set_mode(0o644);
+        let _ = std::fs::set_permissions(&path, perms);
+    }
+
+    let _ = std::fs::remove_dir_all(store.paths().state_dir());
+}
+
+#[test]
+fn a_truncated_or_corrupt_state_file_errors_rather_than_parsing_to_something_plausible() {
+    // The other half of fail-to-zero: corruption that produces plausible-looking data is
+    // worse than corruption that fails, because it reads as healthy.
+    use acmon::state::{Paths, StateStore, Tier, TieredState};
+
+    let base = scratch("corrupt");
+    let paths = Paths::with_base(&base);
+    let store = StateStore::new(paths.clone());
+
+    // Write a valid file first
+    let mut state = TieredState::new(1);
+    state.set_tier_data(Tier::Fast, serde_json::json!({"test": "data"}), now());
+    store
+        .write_tiered_state("test.json", &state)
+        .expect("write");
+
+    // Corrupt it by truncating mid-JSON
+    let path = paths.state_dir().join("test.json");
+    let original = std::fs::read_to_string(&path).expect("read original");
+    let truncated = &original[..original.len() / 2]; // Cut it in half
+    std::fs::write(&path, truncated).expect("write truncated");
+
+    // Attempt to read it
+    let result = store.read_tiered_state("test.json");
+
+    assert!(
+        result.is_err(),
+        "a truncated file must produce an error, not plausible-looking data; got {:?}",
+        result
+    );
+
+    let error = result.unwrap_err();
+    assert!(
+        !error.trim().is_empty()
+            && (error.contains("parse") || error.contains("JSON") || error.contains("UTF-8")),
+        "the error must state what went wrong; got {:?}",
+        error
+    );
+
+    let _ = std::fs::remove_dir_all(paths.state_dir());
+}
+
+#[test]
+fn an_unknown_schema_version_errors_and_names_both_versions() {
+    // Future-proofing. A file from a newer acmon is refused rather than parsed into a subset
+    // of itself, which would silently destroy state the newer build relies on.
+    use acmon::state::{Paths, StateStore};
+
+    let base = scratch("future-version");
+    let paths = Paths::with_base(&base);
+    let store = StateStore::new(paths.clone());
+
+    // Write a file claiming to be from version 999
+    let future_file = r#"{
+        "version": 999,
+        "writer_pid": 12345,
+        "tiers": {}
+    }"#;
+
+    std::fs::create_dir_all(paths.state_dir()).expect("create dir");
+    std::fs::write(paths.state_dir().join("test.json"), future_file).expect("write");
+
+    // Attempt to read it
+    let result = store.read_tiered_state("test.json");
+
+    assert!(
+        result.is_err(),
+        "a future schema version must be refused; got {:?}",
+        result
+    );
+
+    let error = result.unwrap_err();
+    assert!(
+        error.contains("999") && error.contains("version"),
+        "the error must name the version found; got {:?}",
+        error
+    );
+    assert!(
+        error.contains("1") || error.contains("understood"),
+        "the error must also name the version understood; got {:?}",
+        error
+    );
+
+    let _ = std::fs::remove_dir_all(paths.state_dir());
 }
