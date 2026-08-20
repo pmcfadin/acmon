@@ -256,10 +256,16 @@ launchd demoted to a babysitter.
 ### v1 — Liveness, resources, and the split
 
 Discovery, registry, detectors, both state machines, resources, the `amon` loop with
-its lock and install verbs, `agtop` with freshness classification, notify.
+its lock and install verbs, `agtop` with freshness classification and its layout
+(sorting, the meter row, a screen too short), notify.
 
-The split is **in v1**, not after it. It reshapes work already open (#10, #11, #14), so
-deferring it means building those twice.
+The split is **in v1**, not after it. It reshaped work already open (#10, #11, #14), so
+deferring it would have meant building those twice.
+
+`htop`'s lessons were weighed in #14 and are now settled: sorting and the meter row are
+in v1 (decisions 36, 37), column hide/reflow is v2 (decision 35). The layout work lives
+in its own ticket rather than in the display's, so "the display works" and "the display
+is laid out well" fail separately.
 
 Resource metrics are **in** v1 (decided). They need no new subsystem — the same
 process enumeration that finds sessions also reads its ledger, at microsecond cost
@@ -282,6 +288,13 @@ baseline.
 ---
 
 ## 8. Functional requirements
+
+**Requirement ids are append-only from F53 and NF16 onward.** A new requirement takes the
+next free number and is filed in the section it belongs to, even when that puts it out of
+numeric order within the section. The two-binary split renumbered F18–F38 once; doing it
+again would silently rot every reference in a ticket, a commit message or a code comment
+written before the change. Grouping is what the sections are for; the number is only an
+identifier.
 
 ### Discovery (v1)
 
@@ -391,6 +404,26 @@ baseline.
   screen), plus `agtop --once` which emits the same content as plain lines. The
   one-shot mode is not a fallback: it is what keeps the renderer testable against a
   fixed buffer instead of a live terminal, and what keeps the output pipeable.
+- **F54** A terminal too **short** for the whole screen drops session rows,
+  **cheapest first**, and states how many are hidden. The at-risk panel is never
+  truncated, and no number inside a row is ever shortened. Stated because the opposite
+  axis was specified and this one was not: too *narrow* has refused to draw since the
+  first table, while too *short* was simply assumed away — `required_height` computes
+  what it needs and trusts that it gets it. With ten sessions and eleven at-risk
+  workspaces that is roughly thirty rows, so a twenty-four-row pane is the common case
+  rather than the edge. Refusing the whole screen there would be §2.2 aimed at our own
+  display; a silent cut would be worse. The rule forbids *silent* truncation, and a
+  stated count is not silent.
+- **F55** Session rows are ordered by **child CPU, descending** — fixed, with no sort
+  keybindings. Ordering by pid, as the first implementation did, carries no
+  information; child CPU is the quantity §2.3's thesis rests on, so the default order
+  is the answer to the question the tool exists to ask. The absence of keybindings is a
+  requirement rather than an omission: interactive sorting places the display inside
+  `htop`'s interaction model, and a reader who feels they are in `htop` reaches for F9
+  — which N1 forbids this tool from ever honouring. The order must be deterministic
+  including ties, because the existing collection sort exists for stable test output.
+  A session whose child CPU is unmeasurable sorts to a stated position and is never
+  treated as zero (NF10).
 
 ### Notification (v1)
 
@@ -537,6 +570,10 @@ baseline.
 | 32 | The split is a deployment boundary; both binaries link the same collection library |
 | 33 | Apache-2.0 (already in `LICENSE` and `Cargo.toml`) |
 | 34 | Git outcomes stay in **v3**. They are retrospective, so deferring loses nothing but a wait — at the stated cost that Codex has no outcome data until then |
+| 35 | Column hide/reflow deferred to **v2**. v1 keeps refusing to draw below the minimum width rather than truncating a number — the only one of `htop`'s three lessons where doing nothing is defensible rather than a defect |
+| 36 | Rows sorted by **child CPU, fixed** (F55). No sort keybindings, deliberately: interactive sorting buys flexibility and buys `htop`'s interaction model with it, and F9 is the one thing this tool must never do |
+| 37 | A **meter row** above the table in v1, carrying `amon`'s duty cycle and collection overhead (F33). Chosen over a line of text so v2's machine-tax gauges move into it rather than forcing a redesign of the top of the screen |
+| 38 | A too-short screen **truncates the session table with a stated count** (F54), never the at-risk panel. Refusing the whole screen would fire in the common case, not the edge |
 
 ---
 
