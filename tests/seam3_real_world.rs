@@ -771,7 +771,8 @@ fn repository_root_of_this_crates_directory_is_this_crate() {
     let expected_linked_worktree = dot_git_metadata.is_file();
 
     assert_eq!(
-        linked_worktree, expected_linked_worktree,
+        linked_worktree,
+        expected_linked_worktree,
         "`linked_worktree` must be derived from whether {} is a file (linked worktree) \
          or a directory (primary checkout)",
         dot_git.display()
