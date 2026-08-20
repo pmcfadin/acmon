@@ -3,8 +3,18 @@
 Measuring what AI coding agents actually cost on a managed macOS developer machine —
 and how much of that cost is the machine's fault rather than the work's.
 
-This repository currently contains **research and a specification**, not an
-implementation.
+It installs **two binaries**, and one rule tells you which you want:
+
+**If it measures, it is `amon`. If it draws, it is `agtop`.**
+
+| | |
+| --- | --- |
+| **`amon`** | The monitor. Resident. Owns every collection tier, is the only writer of state, and is the only thing that notifies. |
+| **`agtop`** | The display. Read-only. Renders what `amon` recorded — and collects once for itself, saying so, when no monitor is running. |
+
+Two names, one crate, one Homebrew formula. The split exists because notifications must
+fire when no terminal is open, and a display wanting a one-second refresh cannot also be
+running a git sweep that costs 2.7 s.
 
 ## Why
 
@@ -77,8 +87,11 @@ Where a claim could not be verified, it says so.
 
 ## Status
 
-Research and specification complete for a first version. No code yet. The one
-assumption still unverified is whether an interactive session emits a direct
+v1 in progress. `agtop` runs and is worth running: it prints a session table and an
+at-risk workspace panel. `amon` exists as a verb surface only — every verb it advertises
+reports that it is not built yet rather than exiting zero having done nothing.
+
+The one assumption still unverified is whether an interactive session emits a direct
 "blocked waiting on a human" signal.
 
 ## License
