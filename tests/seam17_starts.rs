@@ -586,6 +586,39 @@ fn a_line_the_reader_cannot_understand_makes_the_history_unreadable_rather_than_
 }
 
 #[test]
+fn a_record_written_by_a_build_this_one_does_not_understand_is_refused_not_reinterpreted() {
+    // The version is on each line because the file is append-only, so an upgrade puts new lines
+    // beside old ones. A newer record read as if it were this version would yield a downtime and a
+    // crash-loop verdict computed from fields that mean something else — figures indistinguishable
+    // from measurements.
+    let directory = scratch("newer-version");
+    let store = store_in(&directory);
+    std::fs::create_dir_all(&directory).expect("create the state directory");
+
+    let mut line = serde_json::to_value(starts::decide(
+        an_instant(),
+        4242,
+        &LastStateWrite::Never,
+        None,
+        None,
+        &History::NothingRecorded,
+    ))
+    .expect("a record serialises");
+    line["version"] = serde_json::json!(u32::from(u8::MAX));
+    std::fs::write(directory.join(STARTS_FILE), format!("{line}\n")).expect("write the record");
+
+    match starts::history(&store) {
+        History::Unreadable(why) => assert!(
+            why.contains("version 255") && why.contains("line 1"),
+            "the reason says which line and which version: {why}"
+        ),
+        other => panic!("a record from the future is unreadable, not readable: {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
 fn an_absent_record_file_is_nothing_recorded_and_not_a_failure_to_read_one() {
     let directory = scratch("absent");
     let store = store_in(&directory);

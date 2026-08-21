@@ -401,6 +401,19 @@ pub fn history(store: &StateStore) -> History {
             continue;
         }
         match serde_json::from_str::<StartRecord>(line) {
+            // A line whose fields happen to fit but whose version this build does not know is
+            // refused, the same way `state.rs` refuses an unknown state version. A newer record
+            // read as if it were this one would be a downtime and a verdict computed from fields
+            // that mean something else — figures that look exactly like measurements.
+            Ok(record) if record.version != RECORD_VERSION => {
+                return History::Unreadable(format!(
+                    "line {} of {} is a launch record of version {} and this build understands \
+                     version {RECORD_VERSION}",
+                    number + 1,
+                    path.display(),
+                    record.version
+                ))
+            }
             Ok(record) => {
                 launches += 1;
                 records.push(record);
