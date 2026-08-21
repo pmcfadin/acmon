@@ -871,6 +871,21 @@ pub struct FastPayload {
     pub sessions: Vec<SessionRow>,
     /// What the monitor costs, measured by the monitor (F25, G7).
     pub monitor: SelfReport,
+    /// This launch: its downtime, whether the run before it exited cleanly, and how many launches
+    /// are on record here (F23).
+    ///
+    /// Run-scoped rather than pass-scoped, like `monitor` beside it, and republished unchanged on
+    /// every fast pass. It is here rather than in a file of its own because a display reading
+    /// `state.json` must be able to see that the monitor it is drawing has been cycling — a crash
+    /// loop nobody looks up is the silent gap this field exists to close.
+    pub launch: crate::starts::StartRecord,
+    /// Why this launch could not be appended to `starts.jsonl`, when it could not.
+    ///
+    /// The facts above are decided before the append is attempted, so they survive a state
+    /// directory that has gone read-only. What does not survive is the *durable* history, and that
+    /// loss is said out loud here rather than showing up later as a record with a launch missing
+    /// from it.
+    pub launch_not_recorded: Option<String>,
     /// How many notifications this pass decided were worth making, and what became of them.
     pub notify: NotifyRow,
     /// Which tier the silence behind each session's state was read by.
@@ -952,6 +967,7 @@ pub fn fast_payload(
     sequence: u64,
     observed: &Observed,
     monitor: SelfReport,
+    launch: &crate::starts::Launch,
 ) -> FastPayload {
     let snapshot = pass.snapshot.as_ref();
     FastPayload {
@@ -960,6 +976,8 @@ pub fn fast_payload(
             .map(|snapshot| snapshot.sessions.iter().map(session_row).collect())
             .unwrap_or_default(),
         monitor,
+        launch: launch.record.clone(),
+        launch_not_recorded: launch.not_recorded.clone(),
         notify: snapshot.map(notify_row).unwrap_or(NotifyRow {
             notable: 0,
             delivered: 0,

@@ -42,6 +42,7 @@ use crate::liveness::Thresholds;
 use crate::lock::{LockRefusal, WatchLock};
 use crate::meter::{self, Meter, SelfReport};
 use crate::schedule::{Budgets, Pace, Schedule, Tier, TIERS};
+use crate::starts::{self, Launch};
 use crate::state::{Paths, StateStore, TieredState, STATE_FILE};
 use crate::tiers::{self, Observed, Pass};
 use crate::RealWorld;
@@ -245,6 +246,13 @@ pub fn watch(options: &WatchOptions, notice: &mut dyn FnMut(&str)) -> WatchStopp
     ));
 
     let store = StateStore::new(options.paths.clone());
+
+    // Before the first state write, and it has to be: the downtime is the gap to the *previous*
+    // monitor's last write, and writing first would collapse every downtime this record exists to
+    // publish (F23). The lock's account of its predecessor is the evidence for whether that run
+    // ended on purpose, so this is also the earliest moment the question is answerable.
+    let launch = record_launch(&store, &lock, notice);
+
     let mut state = TieredState::new(lock.holder_pid());
 
     // Published before the first pass, so a reader can see who holds the writer role — and see,
@@ -268,7 +276,7 @@ pub fn watch(options: &WatchOptions, notice: &mut dyn FnMut(&str)) -> WatchStopp
     STOP_REQUESTED.store(false, Ordering::SeqCst);
 
     let world = RealWorld::with_state_dir(&state_dir);
-    let outcome = run_loop(options, &world, &store, &mut state, notice);
+    let outcome = run_loop(options, &world, &store, &mut state, &launch, notice);
 
     if let Err(reason) = lock.release() {
         return WatchStopped::LockNotReleased(reason);
@@ -280,6 +288,58 @@ pub fn watch(options: &WatchOptions, notice: &mut dyn FnMut(&str)) -> WatchStopp
     }
 }
 
+/// Append this launch to `starts.jsonl` and say what it came to, out loud, at the moment it happens.
+///
+/// A launch that cannot be recorded does not stop the monitor. Refusing to start over a diary would
+/// leave the machine unmonitored on the strength of a file — the same argument that makes a stale
+/// lock a takeover rather than a refusal — so the failure is said here, published in every fast
+/// pass, and the loop runs.
+fn record_launch(store: &StateStore, lock: &WatchLock, notice: &mut dyn FnMut(&str)) -> Launch {
+    let launch = starts::record(
+        store,
+        SystemTime::now(),
+        lock.holder_pid(),
+        lock.took_over_from(),
+        lock.unreadable_record(),
+    );
+
+    notice(&format!(
+        "launch {} recorded in {}: {}. {}",
+        match launch.record.launches.value {
+            Some(number) => number.to_string(),
+            None => "of unknown number".to_string(),
+        },
+        starts::path(store).display(),
+        launch.record.downtime_secs.value.map_or_else(
+            || format!(
+                "the downtime is not a figure: {}",
+                launch
+                    .record
+                    .downtime_secs
+                    .unavailable
+                    .clone()
+                    .unwrap_or_else(|| "and no reason was given, which is a bug".to_string())
+            ),
+            |seconds| format!("{seconds:.1}s of downtime since the last state write")
+        ),
+        launch.record.previous_exit_why,
+    ));
+
+    if let Some(cycling) = &launch.record.cycling {
+        notice(&format!("this monitor is cycling: {cycling}"));
+    }
+
+    if let Some(why) = &launch.not_recorded {
+        notice(&format!(
+            "this launch could not be appended to {}, so the durable record now has a launch \
+             missing from it: {why}",
+            starts::path(store).display()
+        ));
+    }
+
+    launch
+}
+
 /// The loop: what is due, what it cost, what to publish, when to sleep.
 ///
 /// Split from [`watch`] so that the lifecycle around it — lock, publish, release — is readable
@@ -289,6 +349,7 @@ fn run_loop(
     world: &RealWorld,
     store: &StateStore,
     state: &mut TieredState,
+    launch: &Launch,
     notice: &mut dyn FnMut(&str),
 ) -> Result<Finished, String> {
     let began = Instant::now();
@@ -381,6 +442,7 @@ fn run_loop(
                         state,
                         store,
                         &options.budgets,
+                        launch,
                         notice,
                     )?;
                     continue;
@@ -456,6 +518,7 @@ fn run_loop(
                     state,
                     store,
                     &options.budgets,
+                    launch,
                     notice,
                 )?;
             }
@@ -480,6 +543,7 @@ fn run_loop(
                 state,
                 store,
                 &options.budgets,
+                launch,
                 notice,
             )?;
         }
@@ -519,6 +583,7 @@ fn publish(
     state: &mut TieredState,
     store: &StateStore,
     budgets: &Budgets,
+    launch: &Launch,
     notice: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
     let tier = pass.tier;
@@ -559,6 +624,7 @@ fn publish(
                 sequence_number,
                 observed,
                 report,
+                launch,
             ))
         }
         Tier::Medium => {

@@ -29,6 +29,16 @@ interval, idling down when no session is live and rising on the first one seen. 
 duty cycle over the trailing minute, and per-tier pass durations, published with everything
 else it measures. `SIGTERM` and `SIGINT` stop it cleanly and release the lock.
 
+**Every launch is on the record.** `amon watch` appends one line to `starts.jsonl` before its
+first state write, saying how long nothing was being recorded (measured from the previous
+monitor's last `state.json` write, never from a shutdown record a killed monitor would never
+have written), whether the run before it exited cleanly (from the lock's pid record, which a
+clean release clears), and how long that run lasted. Three short runs in the last five launches
+publishes a **cycling** verdict. The same record is republished in the fast tier's payload as
+`launch`, so a display can show the restart count without reading `starts.jsonl`, and
+`amon status` reports it — launchd's own run count is now reported *only* where the durable
+record cannot answer. A first launch reports its previous exit as `absent`, never `clean`.
+
 **`amon install`/`uninstall`/`status` are built** — one per-user LaunchAgent at
 `~/Library/LaunchAgents/io.github.pmcfadin.acmon.plist`, which is the only file this tool
 writes outside `~/.config/acmon/` and `~/.local/state/acmon/`; the load is verified with

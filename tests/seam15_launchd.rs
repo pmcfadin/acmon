@@ -34,6 +34,8 @@ use acmon::launchd::{
     JobQuery, LastWrite, Launchctl, ProcessAnswer, Uninstalled, JOB_PATH, LABEL, LOG_FILE,
     THROTTLE_SECONDS,
 };
+use acmon::lock::Predecessor;
+use acmon::starts::{self, History, LastStateWrite};
 use acmon::state::{Paths, StateStore, TieredState, STATE_FILE};
 
 // --- Scratch machinery ---
@@ -1131,11 +1133,85 @@ fn status_that_could_not_ask_launchd_says_so_instead_of_reporting_the_job_absent
 }
 
 #[test]
-fn status_reports_launchds_own_restart_count_until_the_launch_record_lands() {
-    // A `KeepAlive` restart must not be silent. #28 owns the durable record — downtime, and
-    // whether the last exit was clean — and until it lands launchd's own run count and last
-    // exit code are what make a cycling monitor visible rather than nothing at all.
+fn status_reports_the_durable_launch_record_rather_than_launchds_own_run_count() {
+    // A `KeepAlive` restart must not be silent, and the answer is the record seam 17 appends, not
+    // launchd's own count: that count resets whenever the job is reloaded, knows nothing about how
+    // long the machine went unmonitored, and cannot separate a clean stop from a `SIGKILL`. Where
+    // the record answers, launchd's count is left out — two counts of the same thing would leave
+    // the reader reconciling them.
     let root = scratch("status-restarts");
+    let request = request_in(&root);
+    let store = store_in(&root);
+
+    // Two launches on record, the second following a monitor that died holding the lock.
+    let first = starts::decide(
+        SystemTime::now() - Duration::from_secs(600),
+        4242,
+        &LastStateWrite::Never,
+        None,
+        None,
+        &History::NothingRecorded,
+    );
+    starts::append(&store, &first).expect("append the first launch");
+    let second = starts::decide(
+        SystemTime::now() - Duration::from_secs(60),
+        4243,
+        &LastStateWrite::At(SystemTime::now() - Duration::from_secs(90)),
+        Some(&Predecessor {
+            pid: 4242,
+            still_running: false,
+        }),
+        None,
+        &starts::history(&store),
+    );
+    starts::append(&store, &second).expect("append the second launch");
+
+    let launchd = FakeLaunchd::answering(vec![JobQuery::Loaded(JobFacts {
+        running: Some(false),
+        pid: None,
+        runs: Some(37),
+        last_exit: Some("1".to_string()),
+    })]);
+
+    let report = status(&request, &launchd, &store, SystemTime::now(), &|_| false);
+    let lines = report.lines().join("\n");
+
+    assert!(
+        lines.contains("launches: 2"),
+        "the durable count is the answer to how many times the monitor has started:\n{lines}"
+    );
+    assert!(
+        lines.contains("30s of downtime"),
+        "and it carries the downtime, which launchd's count cannot:\n{lines}"
+    );
+    assert!(
+        lines.contains("did not exit cleanly") && lines.contains("4242"),
+        "and it names the monitor that died, which launchd's exit code cannot:\n{lines}"
+    );
+    assert!(
+        !lines.contains("37"),
+        "launchd's own run count must give way to the record rather than sit beside it as a \
+         second answer:\n{lines}"
+    );
+    assert!(
+        matches!(report.process, ProcessAnswer::NotRunning { .. }),
+        "loaded and not running is a determinate answer: {:?}",
+        report.process
+    );
+    assert!(
+        report.complete(),
+        "every question was answered, including the launch record's:\n{:#?}",
+        report.unanswered()
+    );
+}
+
+#[test]
+fn status_falls_back_to_launchds_own_run_count_only_where_no_launch_record_exists() {
+    // The complement, and the reason the fallback stays: a state directory with no record at all —
+    // a machine whose monitor has never run under a build that keeps one — still has launchd's
+    // count, and reporting nothing would be worse than reporting the weaker fact. It has to say
+    // which fact it is.
+    let root = scratch("status-restarts-fallback");
     let request = request_in(&root);
     let store = store_in(&root);
     let launchd = FakeLaunchd::answering(vec![JobQuery::Loaded(JobFacts {
@@ -1149,18 +1225,56 @@ fn status_reports_launchds_own_restart_count_until_the_launch_record_lands() {
     let lines = report.lines().join("\n");
 
     assert!(
-        lines.contains("37"),
-        "a monitor launchd has started 37 times is cycling, and the count says so:\n{lines}"
+        lines.contains("37") && lines.contains("all launchd itself can say"),
+        "with no record, launchd's count is the only evidence and is labelled as such:\n{lines}"
     );
     assert!(
-        lines.contains("#28"),
-        "and the reader is told where the record that outlives launchd's own count lives:\n\
-         {lines}"
+        lines.contains("launches: none recorded"),
+        "and the absence of the durable record is stated rather than left to be inferred from a \
+         missing line:\n{lines}"
     );
     assert!(
-        matches!(report.process, ProcessAnswer::NotRunning { .. }),
-        "loaded and not running is a determinate answer: {:?}",
-        report.process
+        report.complete(),
+        "\"nothing has ever launched here\" is an answer, not a failure to get one:\n{:#?}",
+        report.unanswered()
+    );
+}
+
+#[test]
+fn status_will_not_report_a_launch_record_it_cannot_read_as_a_machine_nothing_has_run_on() {
+    // The fail-loud rule on the one file that says whether the monitor has been cycling. A record
+    // that cannot be parsed reported as "none recorded" would say a crash-looping monitor has never
+    // started, which is the calm, plausible, wrong answer.
+    let root = scratch("status-restarts-unreadable");
+    let request = request_in(&root);
+    let store = store_in(&root);
+    std::fs::create_dir_all(store.paths().state_dir()).expect("create the state directory");
+    std::fs::write(starts::path(&store), "the monitor was here\n").expect("write a bad record");
+
+    let report = status(
+        &request,
+        &launchd_that_answers_nothing(),
+        &store,
+        SystemTime::now(),
+        &|_| false,
+    );
+    let lines = report.lines().join("\n");
+
+    assert!(
+        lines.contains("launches: UNDETERMINED"),
+        "an unreadable record is undetermined, never none:\n{lines}"
+    );
+    assert!(
+        !report.complete(),
+        "and status fails rather than letting it read as a negative answer:\n{lines}"
+    );
+    assert!(
+        report
+            .unanswered()
+            .iter()
+            .any(|missing| missing.contains("how many times the monitor has launched")),
+        "and it says which question went unanswered: {:#?}",
+        report.unanswered()
     );
 }
 

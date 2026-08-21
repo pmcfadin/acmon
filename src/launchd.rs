@@ -32,9 +32,11 @@
 //! `KeepAlive` is the entire supervision story (decision 31, N7). There is deliberately no
 //! watchdog for the watchdog: a second job watching the first can die exactly as quietly, and
 //! then there are two silent failures instead of one. So exactly one job is installed, and gaps
-//! are made *visible* instead — launchd's own run count and last exit code are reported by
-//! `amon status` today, and the durable record that outlives them, with downtime and whether the
-//! last exit was clean, is #28.
+//! are made *visible* instead — by [`crate::starts`], the durable launch record `amon status`
+//! reports: how many times a monitor has launched here, how long the machine went unmonitored
+//! before each one, and whether the run before it exited cleanly. launchd's own run count and last
+//! exit code are reported only where that record cannot answer, because they are the same question
+//! answered worse: the count resets on a reload, and neither figure knows about downtime.
 //!
 //! Nothing here signals, restarts or kills anything. `KeepAlive` restarting `amon` is launchd
 //! supervising the monitor; `bootout` during `uninstall` is a person asking for the job they
@@ -70,7 +72,7 @@ pub const LOG_FILE: &str = "amon.log";
 ///
 /// Stated rather than inherited even though it is launchd's default, because it is the *period
 /// of a crash loop*: a monitor that cannot stay up produces one launch record every
-/// `THROTTLE_SECONDS`, and #28 reads that cadence.
+/// `THROTTLE_SECONDS`, and [`crate::starts`] reads that cadence.
 pub const THROTTLE_SECONDS: u32 = 10;
 
 /// The `PATH` the job is given.
@@ -863,7 +865,7 @@ pub fn install(
         JobQuery::Loaded(facts) => {
             notice(&format!(
                 "launchd has the job {LABEL}: {}",
-                describe_facts(&facts)
+                describe_facts(&facts, true)
             ));
             Installed::Loaded { plist, facts }
         }
@@ -1047,7 +1049,7 @@ pub fn uninstall(
         JobQuery::Loaded(facts) => {
             notice(&format!(
                 "launchd has the job {LABEL}: {}",
-                describe_facts(&facts)
+                describe_facts(&facts, true)
             ));
             true
         }
@@ -1071,8 +1073,11 @@ pub fn uninstall(
             JobQuery::Loaded(facts) => {
                 return Uninstalled::StillLoaded {
                     plist,
-                    reason: format!("it is still there — {}", describe_facts(&facts)),
-                }
+                    // Everything launchd will say, including its run count: this message is about
+                    // a job that would not unload, and the durable launch record has nothing to
+                    // contribute to that.
+                    reason: format!("it is still there — {}", describe_facts(&facts, true)),
+                };
             }
             JobQuery::Undetermined(reason) => {
                 return Uninstalled::StillLoaded {
@@ -1229,27 +1234,18 @@ impl LastWrite {
     /// The mtime of `state.json` rather than a tier's timestamp: this is the age of the *write*,
     /// which is what says whether a monitor is still working. The age of each *fact* is per-tier
     /// and belongs to the display's freshness classification (#30).
+    ///
+    /// The reading itself comes from [`crate::starts::last_state_write`], which is also what the
+    /// launch record subtracts a downtime from. One reader, two views: an age here, an instant
+    /// there. Two readers would be two answers to "when did the monitor last write", free to drift.
     pub fn of(store: &StateStore, now: SystemTime) -> LastWrite {
         let path = store.paths().state_dir().join(STATE_FILE);
 
-        let modified = match std::fs::metadata(&path) {
-            Ok(metadata) => match metadata.modified() {
-                Ok(modified) => modified,
-                Err(error) => {
-                    return LastWrite::Unreadable {
-                        path,
-                        reason: format!("its modification time could not be read: {error}"),
-                    }
-                }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return LastWrite::Absent { path }
-            }
-            Err(error) => {
-                return LastWrite::Unreadable {
-                    path,
-                    reason: error.to_string(),
-                }
+        let modified = match crate::starts::last_state_write(store) {
+            crate::starts::LastStateWrite::At(modified) => modified,
+            crate::starts::LastStateWrite::Never => return LastWrite::Absent { path },
+            crate::starts::LastStateWrite::Unreadable(reason) => {
+                return LastWrite::Unreadable { path, reason }
             }
         };
 
@@ -1295,6 +1291,16 @@ pub struct Status {
     pub job: JobQuery,
     pub process: ProcessAnswer,
     pub last_write: LastWrite,
+    /// The durable launch record (F23): how many launches this state directory has seen, the
+    /// downtime of the last one, and whether the run before it exited cleanly.
+    ///
+    /// This is the answer to "has the monitor been cycling", and it outlives launchd's own run
+    /// count — which resets whenever the job is reloaded, says nothing about downtime, and cannot
+    /// distinguish a clean stop from a `SIGKILL`. Where this record answers, that count is not
+    /// reported at all: two counts of the same thing invite the reader to reconcile them.
+    pub launches: crate::starts::History,
+    /// The path the record lives at, so a message can name the file a reader would go and look at.
+    pub launch_record: PathBuf,
     /// The stand-in for launchd, when one is in use.
     pub launchctl_override: Option<PathBuf>,
 }
@@ -1307,6 +1313,7 @@ impl Status {
         !matches!(self.job, JobQuery::Undetermined(_))
             && !matches!(self.process, ProcessAnswer::Undetermined(_))
             && self.last_write.determined()
+            && self.launches.determined()
             && self.plist_present.is_ok()
     }
 
@@ -1330,6 +1337,12 @@ impl Status {
                 describe_duration(*ahead)
             )),
             LastWrite::Age { .. } | LastWrite::Absent { .. } => {}
+        }
+        if let crate::starts::History::Unreadable(reason) = &self.launches {
+            missing.push(format!(
+                "how many times the monitor has launched: {} could not be read ({reason})",
+                self.launch_record.display()
+            ));
         }
         if let Err(reason) = &self.plist_present {
             missing.push(format!(
@@ -1361,9 +1374,17 @@ impl Status {
             ),
         });
 
+        // Whether the durable record can answer the restart question. When it can, launchd's own
+        // run count and last exit code are left out of the job line below: they answer the same
+        // question worse, and printing both would leave the reader reconciling two numbers.
+        let record_answered = matches!(self.launches, crate::starts::History::Recorded { .. });
+
         lines.push(match &self.job {
             JobQuery::Loaded(facts) => {
-                format!("job {LABEL}: loaded — {}", describe_facts(facts))
+                format!(
+                    "job {LABEL}: loaded — {}",
+                    describe_facts(facts, !record_answered)
+                )
             }
             JobQuery::NotLoaded => format!(
                 "job {LABEL}: NOT loaded — launchd has no such job, so nothing is being \
@@ -1419,7 +1440,60 @@ impl Status {
             ),
         });
 
+        lines.push(self.launches_line());
+
         lines
+    }
+
+    /// The launch record as one line: the restart count, the last downtime, and the last exit.
+    ///
+    /// The count is here rather than left to launchd because launchd's own is reset by a reload and
+    /// says nothing about either. A crash loop is the pattern this line has to make visible, so
+    /// when the record reads as one it says so in the same breath as the count.
+    fn launches_line(&self) -> String {
+        let path = self.launch_record.display();
+        match &self.launches {
+            crate::starts::History::NothingRecorded => format!(
+                "launches: none recorded — nothing in {path}, so no monitor has ever launched \
+                 against this state directory"
+            ),
+            crate::starts::History::Unreadable(reason) => {
+                format!("launches: UNDETERMINED — {path} could not be read: {reason}")
+            }
+            crate::starts::History::Recorded { launches, .. } => {
+                let mut line = format!(
+                    "launches: {launches} recorded in {path}{}",
+                    match self.launches.last() {
+                        Some(last) => format!(
+                            "; the last began {} — {}, and {}",
+                            last.started_at,
+                            match (
+                                last.downtime_secs.value,
+                                last.downtime_secs.unavailable.as_deref()
+                            ) {
+                                (Some(seconds), _) =>
+                                    format!("{seconds:.0}s of downtime before it"),
+                                (None, Some(why)) => format!("its downtime is not a figure: {why}"),
+                                (None, None) => "its downtime is neither a figure nor a reason, \
+                                                 which is a bug in the launch record"
+                                    .to_string(),
+                            },
+                            last.previous_exit_why
+                        ),
+                        // Unreachable: `Recorded` is only built with at least one record in it.
+                        None => String::new(),
+                    }
+                );
+                if let Some(cycling) = self
+                    .launches
+                    .last()
+                    .and_then(|last| last.cycling.as_deref())
+                {
+                    line.push_str(&format!(". CYCLING — {cycling}"));
+                }
+                line
+            }
+        }
     }
 }
 
@@ -1442,16 +1516,19 @@ pub fn status(
         job,
         process,
         last_write,
+        launches: crate::starts::history(store),
+        launch_record: crate::starts::path(store),
         launchctl_override: request.launchctl_override.clone(),
     }
 }
 
 /// launchd's facts about a job as one clause.
 ///
-/// The run count and last exit code are in here on purpose: a `KeepAlive` restart must not be
-/// silent, and until #28's launch record lands these are the only evidence that a monitor has
-/// been cycling rather than sitting still.
-fn describe_facts(facts: &JobFacts) -> String {
+/// The run count and last exit code are reported only when the durable launch record could not
+/// answer for itself. They are a weaker form of the same fact — launchd's count resets on a reload,
+/// knows nothing about downtime, and cannot separate a clean stop from a `SIGKILL` — so where the
+/// record exists it is the answer, and where it does not these are all there is.
+fn describe_facts(facts: &JobFacts, with_launchds_own_count: bool) -> String {
     let mut parts = Vec::new();
     parts.push(match (facts.running, facts.pid) {
         (Some(true), Some(pid)) => format!("running as pid {pid}"),
@@ -1460,10 +1537,14 @@ fn describe_facts(facts: &JobFacts) -> String {
         (None, Some(pid)) => format!("pid {pid}, and launchd reported no state"),
         (None, None) => "launchd reported neither a pid nor a state".to_string(),
     });
+    if !with_launchds_own_count {
+        return parts.join("; ");
+    }
     if let Some(runs) = facts.runs {
         parts.push(format!(
-            "started {runs} time{} by launchd (a durable launch record, with downtime and \
-             whether each exit was clean, is #28)",
+            "started {runs} time{} by launchd since this job was loaded, which is all launchd \
+             itself can say — the durable record below is the one that carries downtime and \
+             whether each exit was clean",
             if runs == 1 { "" } else { "s" }
         ));
     }

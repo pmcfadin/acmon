@@ -50,15 +50,18 @@ the job is loaded, whether a process is running, and how old the last state writ
 | Path | What it holds |
 | --- | --- |
 | `~/.config/acmon/` | Config: `detectors.toml`, `notify.toml`. Yours to keep in dotfiles. |
-| `~/.local/state/acmon/` | Mutable state: `state.json`, `notified.json`, `amon.log`. Deleting it loses history and nothing else. |
+| `~/.local/state/acmon/` | Mutable state: `state.json`, `notified.json`, `starts.jsonl`, `amon.log`. Deleting it loses history and nothing else. |
 | `~/Library/LaunchAgents/io.github.pmcfadin.acmon.plist` | The LaunchAgent. |
 
 **That plist is the only file this tool writes outside those two directories**, and `amon
 install` is the only thing that writes it. launchd's `KeepAlive` is the whole supervision
 story — there is deliberately no second process watching the first, because a watchdog can
 die just as quietly and then there are two silent failures instead of one. Gaps are made
-visible instead: `amon status` reports launchd's own run count and last exit code, so a
-monitor that keeps restarting is readable rather than invisible.
+visible instead: every launch appends a line to `starts.jsonl` saying how long nothing was
+being recorded and whether the run before it exited cleanly — a `SIGKILL`ed monitor's
+successor says so by name — and `amon status` reports the count, the last downtime and a
+crash-loop verdict from it. So a monitor that has been dying and restarting all night reads
+as one, rather than as `state.json` full of plausible figures.
 
 ## Documents
 

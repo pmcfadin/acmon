@@ -983,6 +983,7 @@ fn what_the_monitor_publishes_is_what_the_reader_decodes() {
                 1,
                 &observed,
                 meter.report(WINDOW, "active", &Budgets::DEFAULT),
+                &a_first_launch(),
             )),
             Tier::Medium => serde_json::to_value(tiers::medium_payload(completed, 1, &observed)),
             Tier::Slow => serde_json::to_value(tiers::slow_payload(completed, 1, &observed)),
@@ -1099,6 +1100,7 @@ fn a_warming_up_pass_writes_nothing_and_says_that_is_why_it_announced_nothing() 
         1,
         &observed,
         Meter::default().report(Duration::ZERO, "active", &Budgets::DEFAULT),
+        &a_first_launch(),
     );
 
     assert!(
@@ -1523,11 +1525,21 @@ fn payload_for(completed: &tiers::Pass, sequence: u64, observed: &Observed) -> s
             sequence,
             observed,
             Meter::default().report(Duration::ZERO, "active", &Budgets::DEFAULT),
+            &a_first_launch(),
         )),
         Tier::Medium => serde_json::to_value(tiers::medium_payload(completed, sequence, observed)),
         Tier::Slow => serde_json::to_value(tiers::slow_payload(completed, sequence, observed)),
     }
     .expect("a payload is serialisable")
+}
+
+/// The launch a fast payload assembled outside a monitored run has to name.
+///
+/// Not a stand-in: it is what `acmon::starts` decides for a state directory nothing has ever
+/// written in, which is what these payload tests are assembling one for. Seam 17 owns the launch
+/// record itself.
+fn a_first_launch() -> acmon::starts::Launch {
+    acmon::starts::first_launch(SystemTime::now(), std::process::id())
 }
 
 fn decode_fast(state: &TieredState) -> acmon::tiers::FastPayload {
