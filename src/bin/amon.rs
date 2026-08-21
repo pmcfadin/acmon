@@ -4,12 +4,12 @@
 //! exercised without spawning a process, and so the monitor and the display can never disagree
 //! about what it did.
 //!
-//! Every verb it advertises either does its job or **fails**. A LaunchAgent that ran
-//! `amon watch` and saw a zero would report a healthy monitor for as long as the collection
-//! loop stayed unbuilt, which is the calm, plausible, wrong answer this project exists to
-//! eliminate, arriving through an exit code. `watch` today takes the single-writer lock (#26)
-//! and publishes which pid holds it; the loop that would give that lock something to protect is
-//! #27, so the run still ends non-zero.
+//! Every verb it advertises either does its job or **fails**. A LaunchAgent that ran a verb and
+//! saw a zero would report a healthy monitor for as long as that verb stayed unbuilt, which is
+//! the calm, plausible, wrong answer this project exists to eliminate, arriving through an exit
+//! code. `watch` is built: it takes the single-writer lock (#26) and drives every tier from one
+//! loop (#27), so it is the one verb that can exit zero — and it only does so having actually
+//! monitored, reporting how many passes each tier completed and what the run cost.
 
 use std::process::ExitCode;
 use std::time::SystemTime;
@@ -117,13 +117,41 @@ fn run_watch(foreground: bool) -> ExitCode {
             );
             ExitCode::FAILURE
         }
-        WatchStopped::LoopNotBuilt { tracked_as } => {
+        // The one arm that exits zero, and it says what the run came to. A monitor that stopped
+        // having collected nothing would exit zero here too if the count were not reported, so
+        // the counts go on stderr where a LaunchAgent's log will keep them.
+        WatchStopped::Finished(finished) => {
+            let passes: Vec<String> = finished
+                .passes
+                .iter()
+                .map(|(tier, count)| format!("{count} {tier}"))
+                .collect();
             eprintln!(
-                "amon: `watch` took the single-writer lock and released it cleanly, but the \
-                 tiered collection loop is not built yet ({tracked_as}). No tier was collected \
-                 and nothing was notified, so this is a failure rather than a monitor."
+                "amon: watch: ran {:.1}s and stopped because {}. Passes: {}.",
+                finished.ran_for.as_secs_f64(),
+                finished.because,
+                passes.join(", ")
             );
-            ExitCode::FAILURE
+            match (
+                finished.monitor.duty_cycle.value,
+                finished.monitor.duty_cycle.unavailable.as_deref(),
+            ) {
+                (Some(duty), _) => eprintln!(
+                    "amon: watch: measured duty cycle {:.3}% of one core over the trailing {}s \
+                     (budget {:.1}%).",
+                    duty * 100.0,
+                    finished.monitor.window_secs,
+                    finished.monitor.budget * 100.0
+                ),
+                (None, Some(why)) => {
+                    eprintln!("amon: watch: the duty cycle was not measurable: {why}")
+                }
+                (None, None) => eprintln!(
+                    "amon: watch: the duty cycle is neither a figure nor a reason, which is a bug \
+                     in the monitor's own metering"
+                ),
+            }
+            ExitCode::SUCCESS
         }
     }
 }

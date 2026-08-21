@@ -758,10 +758,29 @@ Measured under load; treat as upper bounds.
 | Operation | Cost | Tier |
 | --- | --- | --- |
 | Read `proc_pid_rusage` for one pid | microseconds, no subprocess | fast |
+| Whole-machine process enumeration with exe + cwd | 12.7 ms for 1048 processes | fast |
+| List recorded transcript namespace **names** | 0.9 ms for 91 | fast |
+| Walk ancestors for a `.git` entry | 7.7 ms for 671 paths | fast |
+| **Transcript activity: listing + `stat` per namespace** | **60.3 ms for 91 namespaces** | medium |
+| Resolve a namespace onto an existing directory | 12.1 ms for 30 (~0.4 ms each) | medium |
 | `lsof -d cwd` full snapshot | one subprocess | medium |
 | Codex `session_meta` per session | ~20 ms | slow |
 | `git status --porcelain --no-optional-locks` per workspace | median 59 ms, max 455 ms | slow |
 | Full sweep of 34 workspaces | **2.7 s** | slow |
+
+The transcript activity read is the one that moved. It looks like a fast signal — no
+subprocess, just modification times — and it is **69% of everything else the fast tier does
+put together**, because it is one directory listing plus a `stat` per transcript, per
+namespace, and there are 91 namespaces. Measured, not assumed: it was in the fast tier
+first, and the fast pass cost 87 ms with it and ~49 ms without. Its cost to accuracy is a
+silence measurement up to one medium interval old against a ten-minute quiet threshold.
+
+Whole-pass costs of `amon watch`'s three tiers, release build, load ~5, on the same machine:
+fast ~49 ms, medium ~207 ms, slow bounded to ≤300 ms by budget (it reads a slice of
+workspaces per pass rather than all of them). Divided by their intervals that is a measured
+**0.37–0.47% of one core** over the trailing minute. A figure taken from a run shorter than
+the slow interval is inflated by the once-only first round of every tier and is not a
+steady-state measurement — a 26-second run of the same build reports ~1%.
 
 Use `--no-optional-locks`: plain `git status` may write the index and contend with
 the very agent being observed.

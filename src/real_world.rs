@@ -780,6 +780,35 @@ impl World for RealWorld {
         most_recent.ok_or(ActivityUnavailable::NoTranscripts)
     }
 
+    fn load_average(&self) -> Result<crate::world::LoadAverage, String> {
+        // `getloadavg` is the whole read: three doubles from the kernel, no subprocess, no
+        // parsing of `uptime`'s prose. It returns how many of the three it filled, so a short
+        // answer is reported rather than padded with zeros — a zero here would describe an idle
+        // machine, which is the one reading that must never be invented.
+        let mut samples = [0f64; 3];
+        let filled = unsafe { libc::getloadavg(samples.as_mut_ptr(), 3) };
+        if filled != 3 {
+            return Err(format!(
+                "getloadavg reported {filled} of the 3 load figures, so this machine's load is \
+                 not known"
+            ));
+        }
+
+        // The core count the load has to be read against. `available_parallelism` is the count
+        // this process may actually use, which is the honest denominator for "how loaded is
+        // this machine for me".
+        let cpus = std::thread::available_parallelism()
+            .map_err(|error| format!("the core count could not be read: {error}"))?
+            .get();
+
+        Ok(crate::world::LoadAverage {
+            one_minute: samples[0],
+            five_minute: samples[1],
+            fifteen_minute: samples[2],
+            cpus,
+        })
+    }
+
     fn output_width(&self) -> u16 {
         // The width used when stdout is not a terminal.
         //

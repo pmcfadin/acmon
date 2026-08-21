@@ -120,15 +120,23 @@ for everything drops session rows from the cheap end and states how many are not
 session whose child CPU could not be measured is listed first rather than last, because an
 absent cost is not a small one. It is read-only in fact: it writes no state and sends no
 notification, and with nothing published it says on screen that nothing is being recorded
-or alerted. `amon` is a verb surface plus its single-writer lock: `amon watch`
-takes an exclusive lock in the state directory, publishes which pid holds the writer role,
-and refuses to start when another instance already holds it — naming that pid. Its three
-LaunchAgent verbs work: `amon install` writes and loads the plist and verifies the load with
-launchd, `amon uninstall` unloads and removes it, and `amon status` answers the three
-questions above or says which one it could not. The tiered collection loop the job would run
-is not built, so `amon watch` still reports what is missing and exits non-zero rather than
-exiting zero having done nothing — and `amon install` says so before you install a job that
-launchd will restart every ten seconds.
+or alerted.
+
+`amon watch` is a monitor. It takes an exclusive lock in the state directory — a second
+instance is refused, naming the pid that holds it — and then drives all three tiers from one
+loop: near-free process signals often, the filesystem searches less often, and `git` plus
+Codex least often, reading a budgeted slice of workspaces per pass rather than sweeping every
+one. It idles down when no session is live and rises on the first one it sees. It publishes
+`state.json` with a timestamp per tier, and it meters itself into that file: its own CPU, its
+duty cycle over the trailing minute, and what each tier's last pass cost. Measured on the
+machine it was built for, that duty cycle is **0.35–0.47% of one core** with sessions live.
+`SIGTERM` and `SIGINT` stop it cleanly.
+
+Its three LaunchAgent verbs work too: `amon install` writes and loads the plist and verifies
+the load with launchd, `amon uninstall` unloads and removes it, and `amon status` answers the
+three questions above or says which one it could not. The v2 verbs are not built, and each
+says which work will deliver it and exits non-zero rather than exiting zero having done
+nothing.
 
 The one assumption still unverified is whether an interactive session emits a direct
 "blocked waiting on a human" signal.

@@ -31,9 +31,14 @@ pub enum VerbState {
         tracked_as: &'static str,
     },
     /// Some of the verb is built and the rest is not, so an invocation does real work and
-    /// still cannot do the job. `watch` is here: it takes and releases the lock (#26) around a
-    /// collection loop that does not exist yet (#27). A caller must treat it exactly as it
-    /// treats [`VerbState::Planned`] — the verb does not work — and the exit code says so.
+    /// still cannot do the job. A caller must treat it exactly as it treats
+    /// [`VerbState::Planned`] — the verb does not work — and the exit code says so.
+    ///
+    /// Nothing is here today. `watch` was, while it held the lock (#26) around a collection loop
+    /// that did not exist (#27); the loop landed and it became [`VerbState::Available`]. Kept
+    /// because the next half-built verb will need it, and because the distinction it draws — real
+    /// work done, job still not doable — is the one a reader most needs and the one "not
+    /// implemented" cannot make.
     Partial {
         built: &'static str,
         tracked_as: &'static str,
@@ -84,10 +89,7 @@ impl AmonVerb {
 
     pub fn state(&self) -> VerbState {
         match self {
-            AmonVerb::Watch => VerbState::Partial {
-                built: "the single-writer lock, #26",
-                tracked_as: "#27",
-            },
+            AmonVerb::Watch => VerbState::Available,
             AmonVerb::Install | AmonVerb::Uninstall | AmonVerb::Status => VerbState::Available,
             AmonVerb::Probe | AmonVerb::Report => VerbState::Planned { tracked_as: "v2" },
         }

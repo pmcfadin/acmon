@@ -250,6 +250,35 @@ pub struct Sweep {
     pub directories_visited: usize,
 }
 
+/// What the kernel says the machine as a whole is carrying.
+///
+/// Recorded with every collection, because a timing taken at load 26 is meaningless and a
+/// reader looking at an old sample has to be able to tell whether it was taken on a busy
+/// machine. During the work behind `docs/observability-mechanics.md` the load average ranged
+/// from 6 to 26, and measurements taken at the top of that range had to be thrown away.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LoadAverage {
+    pub one_minute: f64,
+    pub five_minute: f64,
+    pub fifteen_minute: f64,
+    /// How many logical cores that load is spread across.
+    ///
+    /// Carried with the figures rather than left to the reader: a load of 8 is idle on a
+    /// 16-core machine and desperate on a 2-core one, and a load average published without
+    /// the core count is a number nobody can act on.
+    pub cpus: usize,
+}
+
+impl LoadAverage {
+    /// The one-minute load as a fraction of this machine's cores.
+    pub fn per_cpu(&self) -> f64 {
+        if self.cpus == 0 {
+            return f64::NAN;
+        }
+        self.one_minute / self.cpus as f64
+    }
+}
+
 /// What was found where the state left by earlier runs is kept.
 ///
 /// Three outcomes, and they are deliberately distinct. "No file yet" is an answer — the
@@ -332,6 +361,20 @@ pub trait World {
     /// Implementations read the **first record only** of each transcript, which is
     /// metadata. Conversation content is never read, stored, or displayed.
     fn codex_sessions(&self) -> Result<Vec<CodexSession>, WorldError>;
+
+    /// What the machine as a whole is carrying, right now.
+    ///
+    /// Read once per collection and recorded with it, so a sample taken under heavy load is
+    /// identifiable afterwards rather than being quietly compared against one taken on an idle
+    /// machine.
+    ///
+    /// The **default refuses**, stating that this World cannot read the machine's load. A
+    /// fixture-driven fake has no machine, and a plausible zero here would describe an idle
+    /// machine — the one reading that would make every other figure in the sample look
+    /// trustworthy.
+    fn load_average(&self) -> Result<LoadAverage, String> {
+        Err("this World does not read the machine's load average".to_string())
+    }
 
     /// The width available for output, in columns.
     ///

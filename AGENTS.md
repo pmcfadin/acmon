@@ -20,25 +20,44 @@ the table is what a short terminal drops. A terminal too short drops session row
 end and states how many are hidden; the at-risk panel and every warning under it are not
 candidates, and where the terminal cannot hold even those, the top line says the bottom is
 cut. One function decides what fits — `render::fit` — and the drawing obeys it.
-`amon` is the single-writer lock plus the LaunchAgent lifecycle:
-`amon watch` takes an exclusive `flock` in the state directory, publishes the writer pid,
-and a second instance is refused by name. `amon install`/`uninstall`/`status` are built —
-one per-user LaunchAgent at
+
+**`amon watch` is a real monitor.** It takes an exclusive `flock` in the state directory (a
+second instance is refused by name), then drives all three tiers from **one loop** — fast
+signals through `libproc`, the filesystem searches, and `git` plus Codex — each on its own
+interval, idling down when no session is live and rising on the first one seen. It publishes
+`state.json` per tier, each tier with its own timestamp, and it **meters itself**: own CPU,
+duty cycle over the trailing minute, and per-tier pass durations, published with everything
+else it measures. `SIGTERM` and `SIGINT` stop it cleanly and release the lock.
+
+**`amon install`/`uninstall`/`status` are built** — one per-user LaunchAgent at
 `~/Library/LaunchAgents/io.github.pmcfadin.acmon.plist`, which is the only file this tool
 writes outside `~/.config/acmon/` and `~/.local/state/acmon/`; the load is verified with
 launchd rather than assumed, and an install that could not be confirmed removes its own
 plist. **No test may write to the real `~/Library/LaunchAgents` or register a job with a
 real login session** — `ACMON_LAUNCH_AGENTS_DIR` relocates the directory and
 `ACMON_LAUNCHCTL` replaces `launchctl`, and any verb using the latter says so in its own
-output. `watch` still fails loudly rather than exiting zero having done nothing, because
-the collection loop the lock exists to guard is #27, and `amon --help` names the ticket
-that will deliver each unbuilt verb.
+output. The v2 verbs still fail loudly rather than exiting zero having done nothing, and
+`amon --help` names the ticket that will deliver each one.
 
 **Ask GitHub which tickets are open and unblocked** — that is authoritative, and any list
-written here goes stale. Two carried-forward notes that GitHub would not tell you: #13
-records a #2 criterion met in effect rather than in letter, and the whole collection
-currently takes ~2.5 s against a one-second fast-tier budget, which the tiering tickets own
-rather than being a defect in what exists.
+written here goes stale. Carried-forward notes GitHub would not tell you:
+
+- #13 records a #2 criterion met in effect rather than in letter.
+- The collection's ~2.5 s against a one-second budget **is fixed**, by tiering rather than by
+  making anything faster: `amon watch` now measures its own cost at **0.37–0.47% of one core**
+  over the trailing minute, inside NF9's 1%. A fast pass is ~49 ms, a medium pass ~207 ms, and
+  the slow tier reads a budgeted slice of workspaces per pass rather than sweeping all of them.
+  Three consequences to know before reading a figure off disk. A session row is up to one fast
+  interval old, and its liveness rests on transcript activity read by the **medium** tier, so
+  that evidence ages against the medium stamp rather than the fast one. Each workspace in the
+  at-risk panel carries **its own** age, and because `git status` costs ~59 ms a full refresh of
+  ~70 repositories takes 20–30 minutes inside the budget — workspaces not yet read are counted
+  and published, never reported as clean. And a duty cycle read from a run shorter than the slow
+  interval is inflated by the once-only first round, so a short run is not a steady-state
+  measurement.
+- `agtop`'s **own** collection (F28, nothing published) is still one untiered pass and still
+  costs seconds. Tiering is a property of the monitor's loop; there is nothing to tier in a
+  single one-shot read.
 
 ## Orientation
 
@@ -61,6 +80,14 @@ rule, and each produced a calm, plausible, wrong answer instead of an error.
 **Never assert absolute timings in a test.** Measurements on this class of machine
 vary by roughly 2x between runs; only *ratios* and *invariants* reproduce. A test
 asserting "cold exec takes 79 ms" fails for reasons unrelated to correctness.
+
+**A cost budget is not an exception to that rule.** NF9's 1%-of-a-core budget has to be
+measured against something, and the suite oversubscribes 16 cores, so the same monitor
+measures 0.4% alone and over 1% while the suite runs. `tests/seam16_tiering.rs` shows the
+shape that works: assert the ratio unconditionally, and judge the absolute figure only when
+the recorded load average says the machine was not oversubscribed — printing what it saw
+either way. Every sample carries the load it was taken under precisely so this decision can
+be made afterwards rather than guessed.
 
 **Run the suite with `cargo suite`, not `cargo test`.** `cargo test` stops at the first
 failing test binary, so one red seam silently skips every later one — that hid 80 of 203

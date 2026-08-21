@@ -549,6 +549,7 @@ fn at_risk_panel_content(snapshot: &Snapshot, width: u16) -> (String, Vec<String
     let mut clean_count = 0;
     let mut not_version_controlled_count = 0;
     let mut path_gone_count = 0;
+    let mut not_yet_read_count = 0;
 
     for workspace in &snapshot.workspaces {
         match &workspace.state {
@@ -561,6 +562,10 @@ fn at_risk_panel_content(snapshot: &Snapshot, width: u16) -> (String, Vec<String
                 not_version_controlled_count += 1
             }
             WorkspaceState::Unknown(Unreadable::PathGone) => path_gone_count += 1,
+            // Not at-risk, and not reassuring either. The slow tier reads a slice of workspaces
+            // per pass (#27), so a freshly discovered workspace waits its turn; until it has
+            // been read, this panel has not checked it and must not be read as having done so.
+            WorkspaceState::Unknown(Unreadable::NotYetRead) => not_yet_read_count += 1,
         }
     }
 
@@ -614,6 +619,16 @@ fn at_risk_panel_content(snapshot: &Snapshot, width: u16) -> (String, Vec<String
         } else {
             summary.push("No workspaces at risk — all checked workspaces are clean.".to_string());
         }
+    }
+
+    // Said before anything reassuring below it. "0 at risk" is information only when everything
+    // was checked; with workspaces still waiting for their first read it is a partial result, and
+    // a partial result presented as a clear one is the failure this panel exists to prevent.
+    if not_yet_read_count > 0 {
+        summary.push(format!(
+            "{not_yet_read_count} workspace(s) have not been read yet, so this panel is NOT \
+             exhaustive — the slow tier reads a slice per pass and has not reached them."
+        ));
     }
 
     // Account for what was not listed
@@ -866,12 +881,7 @@ fn draw_body(frame: &mut Frame, snapshot: &Snapshot, fit: &Fit, area: ratatui::l
 /// columns. The two cannot co-occur: an inferred verdict is always WAITING, and a structural
 /// limit is always UNKNOWN.
 fn state_cell(session: &Session) -> String {
-    let state = match session.liveness.state {
-        crate::liveness::State::Active => "ACTIVE",
-        crate::liveness::State::Waiting => "WAITING",
-        crate::liveness::State::Stalled => "STALLED",
-        crate::liveness::State::Unknown => "UNKNOWN",
-    };
+    let state = session.liveness.state.label();
     if session.liveness.method.is_inferred() {
         format!("{state}?")
     } else if session

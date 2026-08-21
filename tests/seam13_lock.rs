@@ -47,28 +47,38 @@ fn store_for(state_dir: &Path) -> StateStore {
     StateStore::new(paths)
 }
 
-/// Spawn `amon` with its state directory relocated and, optionally, a lock-holding window.
+/// Spawn `amon` with its state directory relocated and, optionally, a bounded run window.
 ///
-/// The hold window is the only way to have two real processes contend: with the collection
-/// loop still unbuilt (#27) an unheld `amon watch` acquires and releases in microseconds, and
-/// a stub that pretends to hold a lock proves nothing about `flock`.
-fn amon(state_dir: &Path, arguments: &[&str], hold_ms: Option<&str>) -> Child {
+/// The run window is what lets two real processes contend. `amon watch` is a resident monitor
+/// now, so without one it does not exit at all; with one it monitors for the stated time and
+/// stops cleanly. It is also what keeps these tests from having to signal anything — see the
+/// rule in `AGENTS.md`.
+fn amon(state_dir: &Path, arguments: &[&str], run_ms: Option<&str>) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_amon"));
     command
         .args(arguments)
         .env(acmon::state::STATE_DIR_VARIABLE, state_dir)
+        // The pre-split memory file is not inside the state directory yet — it is still
+        // `~/.acmon/state.json` — so relocating the state directory alone would leave a running
+        // monitor writing the developer's own memory. Redirected here for the same reason the
+        // `agtop` case below does it, and it comes out of the list there when that file moves.
+        .env("ACMON_STATE", state_dir.join("legacy-memory.json"))
+        .env("ACMON_NOTIFY_CONFIG", state_dir.join("no-such-notify.toml"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(hold) = hold_ms {
-        command.env(acmon::watch::HOLD_VARIABLE, hold);
+    if let Some(run) = run_ms {
+        command.env(acmon::watch::RUN_VARIABLE, run);
     }
     command.spawn().expect("amon is built and runnable")
 }
 
 /// Run `amon` to completion: (succeeded, stdout, stderr).
+///
+/// A `watch` reached through here runs for a single short window. Zero would be a run that never
+/// entered its loop, which is a different thing and is not what any test below is about.
 fn amon_run(state_dir: &Path, arguments: &[&str]) -> (bool, String, String) {
-    let child = amon(state_dir, arguments, None);
+    let child = amon(state_dir, arguments, Some("400"));
     let output = child.wait_with_output().expect("amon terminates");
     (
         output.status.success(),
@@ -361,8 +371,6 @@ fn a_second_amon_watch_refuses_to_start_naming_the_pid_that_holds_the_lock() {
         "the writer pid in {STATE_FILE} must be the process that holds the lock"
     );
 
-    let before = entries(&state_dir);
-
     let second = amon(&state_dir, &["watch"], None);
     let second_pid = second.id();
     let output = second
@@ -383,12 +391,21 @@ fn a_second_amon_watch_refuses_to_start_naming_the_pid_that_holds_the_lock() {
         "a refusal belongs on stderr"
     );
 
-    // The lock precedes the first write: a refused instance leaves the directory exactly as
-    // it found it, because it never got as far as writing anything.
-    assert_eq!(
-        entries(&state_dir),
-        before,
-        "the refused instance must not have written into the state directory"
+    // The lock precedes the first write: a refused instance writes nothing at all, because it
+    // never got as far as writing anything.
+    //
+    // Asserted by pid rather than by comparing the whole directory listing before and after. The
+    // holder is a running monitor now, publishing on its own cadence, so the listing legitimately
+    // changes while the second instance is being refused — and every file this tool writes goes
+    // through one atomic rename whose temporary is named after the writer's pid, so a write by
+    // the refused instance would appear here by name.
+    let named_after_the_refused: Vec<String> = entries(&state_dir)
+        .into_iter()
+        .filter(|name| name.contains(&second_pid.to_string()))
+        .collect();
+    assert!(
+        named_after_the_refused.is_empty(),
+        "the refused instance wrote {named_after_the_refused:?} into the state directory"
     );
 
     let store = store_for(&state_dir);
@@ -408,14 +425,20 @@ fn a_second_amon_watch_refuses_to_start_naming_the_pid_that_holds_the_lock() {
          wrote:\n{raw}"
     );
 
-    // The holder ends its own run: it exits non-zero because the collection loop is not
-    // built, having held the lock for its whole lifetime.
+    // The holder ends its own run, having held the lock for its whole lifetime and actually
+    // monitored: a `watch` that stopped cleanly exits zero and says how many passes each tier
+    // completed.
     let first_output = first.wait_with_output().expect("the holder exits");
     let first_stderr = String::from_utf8_lossy(&first_output.stderr).into_owned();
     assert!(
-        !first_output.status.success(),
-        "`amon watch` cannot monitor yet, so it must not report success; stderr was:\n\
-         {first_stderr}"
+        first_output.status.success(),
+        "`amon watch` monitored for its whole run window and stopped cleanly, so it must report \
+         success; stderr was:\n{first_stderr}"
+    );
+    assert!(
+        first_stderr.contains("Passes:"),
+        "and it must say what it collected, or a monitor that collected nothing would exit zero \
+         indistinguishably; stderr was:\n{first_stderr}"
     );
 
     // And a restart is not blocked by its own predecessor, which is what a clean release is
@@ -499,8 +522,8 @@ fn a_monitor_that_was_killed_is_taken_over_by_name_rather_than_in_silence() {
          stderr was:\n{stderr}"
     );
     assert!(
-        !success,
-        "the successor still cannot monitor — the loop is #27 — so it still exits non-zero"
+        success,
+        "the successor took a lock nobody held and monitored, so it exits zero"
     );
 
     let store = store_for(&state_dir);

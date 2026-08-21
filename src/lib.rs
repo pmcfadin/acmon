@@ -11,10 +11,13 @@ pub mod liveness;
 pub mod lock;
 pub mod machtime;
 pub mod memory;
+pub mod meter;
 pub mod notify;
 pub mod real_world;
 pub mod render;
+pub mod schedule;
 pub mod state;
+pub mod tiers;
 pub mod vcs;
 pub mod watch;
 pub mod workspace;
@@ -29,6 +32,6 @@ pub use detect::Detector;
 pub use memory::Memory;
 pub use real_world::RealWorld;
 pub use world::{
-    NotifyConfig, NotifyOutcome, PathUnavailable, ProcessRecord, ProcessSnapshot, StateRead, World,
-    WorldError,
+    LoadAverage, NotifyConfig, NotifyOutcome, PathUnavailable, ProcessRecord, ProcessSnapshot,
+    StateRead, World, WorldError,
 };

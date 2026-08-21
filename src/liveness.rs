@@ -39,6 +39,21 @@ pub enum State {
     Unknown,
 }
 
+impl State {
+    /// The word this state is reported under, on screen and on disk.
+    ///
+    /// One function so the two cannot drift. A state file saying `ACTIVE` where the display says
+    /// something else would make a reader comparing the two doubt both.
+    pub fn label(&self) -> &'static str {
+        match self {
+            State::Active => "ACTIVE",
+            State::Waiting => "WAITING",
+            State::Stalled => "STALLED",
+            State::Unknown => "UNKNOWN",
+        }
+    }
+}
+
 /// How a verdict was reached.
 ///
 /// Asserted verdicts rest on direct observations — the transcript changed, or it did not.

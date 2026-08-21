@@ -151,13 +151,13 @@ pub fn read_state_file(store: &StateStore) -> StateReading {
             StateReading::Unrenderable {
                 writer_pid: state.writer_pid(),
                 why: if tiers == NO_TIERS {
-                    "it holds the writer role and has published no tier yet — the collection \
-                     loop that fills them is #27"
+                    "it holds the writer role and has completed no pass yet, so it has published \
+                     no tier to draw from"
                         .to_string()
                 } else {
                     format!(
                         "it published {tiers} tier(s) this display has no reader for — the tier \
-                         payloads are #27 and their ages are #30"
+                         payloads are `acmon::tiers` and reading them is #30"
                     )
                 },
             }
@@ -246,8 +246,14 @@ pub fn sessions_without_a_cost(sessions: &[Session]) -> usize {
 pub enum Unmetered {
     /// Nothing has published here, so there is no monitor whose cost could be stated (F28).
     NoMonitor,
-    /// A monitor published, and not this figure. Names the work that will.
-    NotPublished { tracked_as: &'static str },
+    /// A monitor published this figure, and the display cannot read it yet. Names the work
+    /// that will.
+    ///
+    /// Not "the monitor published nothing": since #27 the monitor meters itself on every pass
+    /// and publishes it. What is missing is on this side of the file — the tier payloads
+    /// (`acmon::tiers`) need a reader here. Saying it the other way round sent a reader to the
+    /// wrong ticket, and blamed a figure's absence on the one component that had produced it.
+    NotRead { tracked_as: &'static str },
     /// A monitor published something that could not be believed, so nothing was taken from it.
     Unreadable,
 }
@@ -259,9 +265,10 @@ impl std::fmt::Display for Unmetered {
                 formatter,
                 "no monitor is recording, so there is none to meter"
             ),
-            Unmetered::NotPublished { tracked_as } => write!(
+            Unmetered::NotRead { tracked_as } => write!(
                 formatter,
-                "the monitor published no self-metering ({tracked_as})"
+                "the monitor published it, but this display cannot read its tier payloads yet \
+                 ({tracked_as})"
             ),
             Unmetered::Unreadable => write!(
                 formatter,
@@ -304,7 +311,7 @@ impl Meters {
             overhead: Ok(overhead),
             duty_cycle: Err(match reading {
                 StateReading::Absent => Unmetered::NoMonitor,
-                StateReading::Unrenderable { .. } => Unmetered::NotPublished { tracked_as: "#27" },
+                StateReading::Unrenderable { .. } => Unmetered::NotRead { tracked_as: "#30" },
                 StateReading::Unusable(_) => Unmetered::Unreadable,
             }),
             taken_at,

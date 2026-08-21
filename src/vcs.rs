@@ -58,6 +58,22 @@ pub enum Unreadable {
     /// The workspace might hold uncommitted work and we cannot tell, so this is treated
     /// as at-risk.
     TimedOut,
+    /// The slow tier has not read this workspace yet, so nothing has been asked of version
+    /// control at all.
+    ///
+    /// **This is a statement about the monitor, not about the workspace.** The slow tier reads
+    /// a bounded slice of workspaces per pass (#27) — a full git sweep costs seconds of CPU and
+    /// the whole loop is budgeted as a duty cycle — so a workspace that has just been
+    /// discovered waits its turn, stalest first. Until then its state is genuinely unknown.
+    ///
+    /// Deliberately **not at-risk**, and this is the one arm where that needs arguing.
+    /// [`Unreadable::QueryFailed`] is precautionary because git *was* asked and would not
+    /// answer, which is evidence. Here git has not been asked, so treating it as at-risk would
+    /// alert about every workspace on the machine every time the monitor started, and an alerting
+    /// path that cries wolf on startup is one a reader learns to ignore. It is not silent either:
+    /// the slow tier publishes how many workspaces are still pending its first read, so "not
+    /// looked at yet" is a visible count rather than an absence.
+    NotYetRead,
 }
 
 /// What version control reported about one workspace. Facts only, no verdict.
@@ -158,7 +174,8 @@ impl WorkspaceState {
             WorkspaceState::Clean
             | WorkspaceState::DirtyDriven
             | WorkspaceState::Unknown(Unreadable::NotVersionControlled)
-            | WorkspaceState::Unknown(Unreadable::PathGone) => false,
+            | WorkspaceState::Unknown(Unreadable::PathGone)
+            | WorkspaceState::Unknown(Unreadable::NotYetRead) => false,
         }
     }
 }
@@ -181,6 +198,7 @@ impl std::fmt::Display for Unreadable {
             Unreadable::PathGone => write!(f, "path gone"),
             Unreadable::QueryFailed(_) => write!(f, "query failed"),
             Unreadable::TimedOut => write!(f, "timed out"),
+            Unreadable::NotYetRead => write!(f, "not read yet"),
         }
     }
 }

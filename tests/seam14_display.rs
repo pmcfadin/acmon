@@ -598,10 +598,11 @@ fn no_state_file_at_all_reads_as_absent_rather_than_as_a_failure() {
 }
 
 #[test]
-fn a_state_file_with_no_tiers_names_its_writer_and_the_work_that_will_fill_them() {
-    // Exactly what `amon watch` publishes today: the writer pid, and no tier, because the
-    // collection loop is #27. A display that drew that as an empty table would be reporting a
-    // machine with no agents on it.
+fn a_state_file_with_no_tiers_names_its_writer_and_says_it_has_collected_nothing() {
+    // What `amon watch` publishes in the moment between taking the lock and completing its first
+    // pass: the writer pid, and no tier. A display that drew that as an empty table would be
+    // reporting a machine with no agents on it — and it is a state that still exists now that the
+    // loop is built, because the writer is published before anything is collected.
     let directory = scratch("tierless");
     let store = store_in(&directory);
     store
@@ -612,8 +613,9 @@ fn a_state_file_with_no_tiers_names_its_writer_and_the_work_that_will_fill_them(
         StateReading::Unrenderable { writer_pid, why } => {
             assert_eq!(writer_pid, 31_337, "the writer has to be named");
             assert!(
-                why.contains("#27"),
-                "and a reader has to be told what will fill the tiers; got {why}"
+                why.contains("no pass"),
+                "and a reader has to be told that nothing has been collected rather than that \
+                 nothing is there; got {why}"
             );
         }
         other => panic!("expected an unrenderable state file, got {other:?}"),
@@ -624,8 +626,9 @@ fn a_state_file_with_no_tiers_names_its_writer_and_the_work_that_will_fill_them(
 
 #[test]
 fn a_state_file_with_tiers_this_display_cannot_read_says_so_rather_than_drawing_nothing() {
-    // The forward-looking half of the same rule: once #27 publishes tier payloads, a display
-    // with no reader for them must say that, not report a quiet machine.
+    // The other half of the same rule: the monitor publishes tier payloads (`acmon::tiers`), and a
+    // display with no reader for them must say that rather than report a quiet machine. Reading
+    // them is #30's, so this is the state the display is in until then.
     let directory = scratch("unknown-tiers");
     let store = store_in(&directory);
     let mut state = TieredState::new(31_337);
@@ -807,7 +810,7 @@ fn a_gauge_with_no_figure_is_never_drawn_as_an_empty_bar() {
     // gauge's figure column is eight columns wide.
     let meters = Meters {
         overhead: Ok(Duration::from_millis(400)),
-        duty_cycle: Err(Unmetered::NotPublished { tracked_as: "#27" }),
+        duty_cycle: Err(Unmetered::NotRead { tracked_as: "#30" }),
         taken_at: fixture_now(),
     };
     let text = meters_as_text(&meters);
@@ -826,7 +829,7 @@ fn a_gauge_with_no_figure_is_never_drawn_as_an_empty_bar() {
         "and must not draw any of the fill a measured figure draws; got:\n{row}"
     );
     assert!(
-        text.contains("published no self-metering") && text.contains("#27"),
+        text.contains("cannot read its tier payloads yet") && text.contains("#30"),
         "the reason is stated in full rather than squeezed into the cell; got:\n{text}"
     );
 }
@@ -932,8 +935,10 @@ fn no_line_of_the_meter_row_runs_off_the_side_of_any_terminal() {
 
 #[test]
 fn which_reason_a_missing_duty_cycle_carries_depends_on_what_the_state_file_was() {
-    // Three silences that need three different responses: start a monitor, wait for #27, or go
-    // and look at a file that is damaged.
+    // Three silences that need three different responses: start a monitor, wait for the reader
+    // #30 will add, or go and look at a file that is damaged. The middle one is not "the monitor
+    // published nothing" — since #27 it publishes its own duty cycle on every pass, and what is
+    // missing is the reader on this side of the file.
     for (reading, expected) in [
         (StateReading::Absent, "no monitor is recording"),
         (
@@ -941,7 +946,7 @@ fn which_reason_a_missing_duty_cycle_carries_depends_on_what_the_state_file_was(
                 writer_pid: 1,
                 why: "no tier yet".to_string(),
             },
-            "published no self-metering",
+            "cannot read its tier payloads yet",
         ),
         (
             StateReading::Unusable("torn".to_string()),
