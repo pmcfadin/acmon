@@ -520,14 +520,22 @@ fn a_monitor_that_was_killed_is_taken_over_by_name_rather_than_in_silence() {
 // --- Nothing but the monitor writes state ---
 
 #[test]
-fn agtop_takes_no_lock_and_writes_nothing_into_the_state_directory() {
+fn agtop_takes_no_lock_and_writes_only_what_10_has_still_to_retire() {
     // F18 and F26 from the other side: the display is read-only. A second writer would undo
     // the lock, and a notification from a foreground UI is redundant with looking at it.
     //
-    // Scoped to the state directory this ticket introduces. `agtop` still persists the
-    // pre-split memory file (`ACMON_STATE`) and can still deliver a notification through
-    // `collect`; retiring both belongs to #10, where `agtop` becomes a poller of what the
-    // monitor wrote. Redirected here so this test cannot touch the developer's real files.
+    // The name of this test used to say `agtop` writes *nothing* here, which was true when
+    // #26 wrote it and stopped being true one ticket later: #29 moved the dedupe record into
+    // this directory, and `agtop` reaches it through `collect` like everything else. The
+    // assertions never covered the claim, so nothing went red — a test whose name outruns
+    // what it checks is the failure this project exists to remove, pointed at ourselves.
+    //
+    // So the guarantee is stated as what it actually is: the display never takes the lock and
+    // never writes the monitor's state file, and every other file it leaves here must be one
+    // this repo has knowingly not retired yet. #10 makes `agtop` a poller of what the monitor
+    // wrote, at which point that list empties and this test tightens by itself rather than
+    // needing to be remembered. `ACMON_STATE` is redirected in here too, so the pre-split
+    // memory file cannot touch the developer's real files.
     let state_dir = scratch("agtop-readonly");
     std::fs::create_dir_all(&state_dir).expect("create state directory");
 
@@ -551,6 +559,24 @@ fn agtop_takes_no_lock_and_writes_nothing_into_the_state_directory() {
     assert!(
         !state_dir.join(STATE_FILE).exists(),
         "the display must not write the monitor's state file"
+    );
+
+    // Everything else it left behind has to be on the list, by name. A new artefact appearing
+    // here fails this test rather than quietly joining the display's write set.
+    let not_yet_retired = [
+        acmon::state::NOTIFIED_FILE, // #29's dedupe record, reached through `collect` — #10
+        "legacy-memory.json",        // the pre-split memory file, redirected in above — #10
+    ];
+    let left_behind: Vec<String> = entries(&state_dir)
+        .into_iter()
+        .filter(|name| !not_yet_retired.contains(&name.as_str()))
+        .collect();
+
+    assert!(
+        left_behind.is_empty(),
+        "the display wrote {left_behind:?} into the monitor's state directory; either it \
+         should not, or the list this test keeps has to say why not yet, naming the ticket \
+         that retires it"
     );
 
     let _ = std::fs::remove_dir_all(&state_dir);
