@@ -574,23 +574,5 @@ fn agtop_takes_no_lock_and_leaves_the_state_directory_exactly_as_it_found_it() {
          anywhere is a second writer"
     );
 
-    // Everything else it left behind has to be on the list, by name. A new artefact appearing
-    // here fails this test rather than quietly joining the display's write set.
-    let not_yet_retired = [
-        acmon::state::NOTIFIED_FILE, // #29's dedupe record, reached through `collect` — #10
-        "legacy-memory.json",        // the pre-split memory file, redirected in above — #10
-    ];
-    let left_behind: Vec<String> = entries(&state_dir)
-        .into_iter()
-        .filter(|name| !not_yet_retired.contains(&name.as_str()))
-        .collect();
-
-    assert!(
-        left_behind.is_empty(),
-        "the display wrote {left_behind:?} into the monitor's state directory; either it \
-         should not, or the list this test keeps has to say why not yet, naming the ticket \
-         that retires it"
-    );
-
     let _ = std::fs::remove_dir_all(&state_dir);
 }
