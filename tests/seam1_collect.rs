@@ -315,11 +315,14 @@ fn captured_process_table() -> Vec<ProcessRecord> {
         rec(62507, "/Users/pmcfadin/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"),
         rec(63202, "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/Contents/MacOS/Cursor Helper"),
         rec(21023, "/Users/pmcfadin/.local/share/cursor-agent/versions/2026.05.01-eea359f/node"),
-        // --- Agent SDK's bundled Claude CLI — a distinct build from the versioned one
-        // FIXME(pids): 89000/89001 are placeholders, not observations. Replace
-        // when an Agent SDK process is running. The PATHS below are genuine.
-        rec(89000, "/Users/pmcfadin/.claude/security/agent-sdk-venv/lib/python3.14/site-packages/claude_agent_sdk/_bundled/claude"),
-        rec(89001, "/Users/pmcfadin/.claude/security/agent-sdk-venv/lib/python3.14/site-packages/claude_agent_sdk/_bundled/claude"),
+        // --- Agent SDK's bundled Claude CLI — a distinct build from the versioned one.
+        // It reports 2.1.191 where the versioned build above reports 2.1.233, which is
+        // why one machine runs both. Two were started as `claude mcp serve` purely to be
+        // looked at; both were live together when `agtop` listed them as claude sessions
+        // through `RealWorld::process_snapshot`, and `lsof -p` showed each one's text
+        // segment was this exact file and its cwd the directory `rec` records.
+        rec(53349, "/Users/pmcfadin/.claude/security/agent-sdk-venv/lib/python3.14/site-packages/claude_agent_sdk/_bundled/claude"),
+        rec(53351, "/Users/pmcfadin/.claude/security/agent-sdk-venv/lib/python3.14/site-packages/claude_agent_sdk/_bundled/claude"),
         // --- the observing process itself, captured from a real test run
         rec(88429, "/Users/pmcfadin/projects/agentic_coding_monitor/target/debug/deps/seam1_collect-de79cf24515e8113"),
     ]
