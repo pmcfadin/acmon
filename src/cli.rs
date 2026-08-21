@@ -241,17 +241,64 @@ pub fn amon_usage() -> String {
     text
 }
 
+/// The flag that prints one pass as plain lines instead of taking the screen.
+///
+/// Not a fallback. It is what keeps the renderer testable against a fixed buffer instead of a
+/// live terminal, and what keeps the output pipeable (F34).
+pub const ONCE_FLAG: &str = "--once";
+
+/// A parsed `agtop` invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgtopRequest {
+    Help,
+    /// Full-screen, refreshing while open. The default, because it is what the tool is for.
+    Live,
+    /// One pass, as plain lines, then exit.
+    Once,
+}
+
+/// Parse `agtop`'s arguments, excluding argv[0].
+///
+/// Deliberately strict about verbs. `agtop watch` reading as a successful monitor start would
+/// undo the whole point of there being two names.
+pub fn parse_agtop<I>(arguments: I) -> Result<AgtopRequest, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut request = AgtopRequest::Live;
+
+    for argument in arguments {
+        match argument.as_str() {
+            "--help" | "-h" => return Ok(AgtopRequest::Help),
+            ONCE_FLAG => request = AgtopRequest::Once,
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+
+    Ok(request)
+}
+
 /// `agtop`'s help text.
 pub fn agtop_usage() -> String {
     String::from(
         "agtop — the display. Draws; it never measures, records or notifies.\n\
          \n\
          USAGE\n\
-         \x20   agtop\n\
+         \x20   agtop           Full screen, refreshing while it is open.\n\
+         \x20   agtop --once    One pass as plain lines, then exit. Pipeable.\n\
          \x20   agtop --help\n\
          \n\
-         Renders what `amon` recorded. With no monitor running it collects once for itself\n\
-         and says that nothing is being recorded.\n\
+         Polls the state file `amon` writes and renders it. It is read-only: it writes no\n\
+         state and sends no notification, because a notification from a foreground UI is\n\
+         redundant with looking at it, and a second writer would undo the single-writer\n\
+         guarantee the split rests on.\n\
+         \n\
+         With nothing published it collects once for itself and says, on screen, that\n\
+         nothing is being recorded or alerted.\n\
+         \n\
+         There are no keybindings but the ones that leave — q, Esc, Ctrl-C. Sorting is\n\
+         fixed: an interactive display invites the keystroke that kills a process, and this\n\
+         tool never signals an agent.\n\
          \n\
          The monitor is a separate binary, `amon`. If it measures, it is amon; if it draws,\n\
          it is agtop.\n",

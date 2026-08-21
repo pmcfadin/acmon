@@ -19,7 +19,7 @@ use acmon::world::{
     ActivityUnavailable, CodexSession, NotifyConfig, NotifyOutcome, ProcessRecord, ProcessSnapshot,
     ResourceSource, Resources, ResourcesUnavailable, StateRead, Sweep, World, WorldError,
 };
-use acmon::{collect, Identity};
+use acmon::{collect, Identity, Persistence};
 
 fn now() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_787_000_000)
@@ -615,12 +615,11 @@ fn restarting_the_monitor_with_conditions_unchanged_fires_no_notification() {
     );
     // Assert the write succeeded before believing anything about the run after it: a test that
     // silently never stored the record would prove only that the fake forgets things.
-    before
-        .remembered
-        .notified
-        .persisted
-        .as_ref()
-        .expect("the record has to have been stored for the restart to mean anything");
+    assert_eq!(
+        before.remembered.notified.persisted,
+        Persistence::Stored,
+        "the record has to have been stored for the restart to mean anything"
+    );
 
     // The restart. A brand-new world sharing nothing with the one above but the directory — which
     // is precisely what a restart leaves behind.
@@ -667,12 +666,11 @@ fn a_workspace_that_stranded_while_the_monitor_was_down_still_alerts_on_the_next
         before.remembered.notify_health.notable, 0,
         "a clean workspace is not notable, so the record it leaves holds nothing about it"
     );
-    before
-        .remembered
-        .notified
-        .persisted
-        .as_ref()
-        .expect("the empty record still has to be stored");
+    assert_eq!(
+        before.remembered.notified.persisted,
+        Persistence::Stored,
+        "the empty record still has to be stored"
+    );
 
     // The monitor is down. Somebody leaves five uncommitted files behind and walks away.
     let after_it_started = FakeWorld::quiet()
@@ -959,12 +957,13 @@ fn a_run_that_could_not_store_its_dedupe_record_says_so_rather_than_reporting_a_
         1,
         "the alert was delivered, which is what makes the unstored record worth reporting"
     );
-    let why = snapshot
-        .remembered
-        .notified
-        .persisted
-        .as_ref()
-        .expect_err("a world with no state store must not report having stored anything");
+    let why = match &snapshot.remembered.notified.persisted {
+        Persistence::Failed(why) => why,
+        stored_or_skipped => panic!(
+            "a world with no state store must not report having stored anything, nor report \
+             not having tried; got {stored_or_skipped:?}"
+        ),
+    };
     assert!(
         !why.trim().is_empty(),
         "and must say why, not merely fail; got {why:?}"

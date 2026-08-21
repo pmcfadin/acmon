@@ -6,8 +6,14 @@ and how much of that cost is the machine's fault rather than the work's. See
 
 **Status:** v1 implementation in progress. The crate now builds **two binaries** — `amon`,
 the monitor, and `agtop`, the display. **If it measures, it is `amon`; if it draws, it is
-`agtop`.** `agtop` runs and is worth running: it prints a session table and an at-risk
-workspace panel in about 2.5 s. `amon` is a verb surface plus the single-writer lock:
+`agtop`.** `agtop` runs and is worth running, and is now the live display: full screen on
+the alternate screen by default, refreshing while open by polling `state.json` once a
+second and re-reading only on an mtime change, plus `agtop --once` for one pass as plain
+lines. It is read-only **in fact** — `collect` takes a role, and a display's collection
+writes no state and asks no notification channel anything. With nothing published it makes
+its own single collection (F28), states on screen that the figures are its own and that
+nothing is being recorded or alerted, and prints its collection overhead beside them.
+`amon` is a verb surface plus the single-writer lock:
 `amon watch` takes an exclusive `flock` in the state directory, publishes the writer pid,
 and a second instance is refused by name. Every verb still fails loudly rather than exiting
 zero having done nothing — `watch` included, because the collection loop the lock exists to

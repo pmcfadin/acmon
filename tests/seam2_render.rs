@@ -7,7 +7,7 @@ use acmon::render::{minimum_width, render_to_lines, required_height};
 use acmon::vcs::{Unreadable, WorkspaceState};
 use acmon::workspace::{NamespaceResolution, NamespaceUnmatched, Workspace, WorkspaceUnknown};
 use acmon::world::{ResourceSource, Resources, ResourcesUnavailable, Unmeasured};
-use acmon::{Identity, Remembered, Session, Snapshot, WorkspaceReport};
+use acmon::{Identity, Persistence, Remembered, Session, Snapshot, WorkspaceReport};
 
 /// A width that fits the whole table with room to spare. The narrow cases have their
 /// own tests.
@@ -1229,7 +1229,7 @@ fn a_failure_to_store_state_is_reported_because_the_next_run_pays_for_it() {
     let text = rendered(
         &Snapshot {
             remembered: Remembered {
-                persisted: Err(
+                persisted: Persistence::Failed(
                     "could not store state in /Users/pmcfadin/.acmon/state.json: \
                                 Read-only file system"
                         .to_string(),
@@ -1578,7 +1578,7 @@ fn a_failed_delivery_and_an_unsent_alert_are_reported_as_the_two_different_thing
 fn snapshot_after_announcing(
     announced: usize,
     rebuilt: Option<acmon::notify::Rebuilt>,
-    persisted: Result<(), String>,
+    persisted: Persistence,
 ) -> Snapshot {
     Snapshot {
         remembered: Remembered {
@@ -1616,7 +1616,11 @@ fn snapshot_after_announcing(
 #[test]
 fn a_missing_dedupe_record_explains_the_conditions_it_caused_to_be_re_announced() {
     let text = rendered(
-        &snapshot_after_announcing(14, Some(acmon::notify::Rebuilt::NothingRecorded), Ok(())),
+        &snapshot_after_announcing(
+            14,
+            Some(acmon::notify::Rebuilt::NothingRecorded),
+            Persistence::Stored,
+        ),
         wide(),
     );
 
@@ -1645,7 +1649,7 @@ fn a_dedupe_record_that_exists_and_could_not_be_used_is_a_warning_rather_than_a_
             Some(acmon::notify::Rebuilt::Unparsable(
                 "EOF while parsing an object at line 9 column 0".to_string(),
             )),
-            Ok(()),
+            Persistence::Stored,
         ),
         wide(),
     );
@@ -1672,7 +1676,7 @@ fn a_damaged_dedupe_record_is_reported_even_on_a_run_that_announced_nothing() {
             Some(acmon::notify::Rebuilt::Unreadable(
                 "Permission denied".to_string(),
             )),
-            Ok(()),
+            Persistence::Stored,
         ),
         wide(),
     );
@@ -1689,7 +1693,11 @@ fn a_run_with_nothing_to_announce_says_nothing_about_its_missing_dedupe_record()
     // The counterweight. A first run on a quiet machine has no storm to explain, and a line on
     // every such run is how a reader learns to skip the line that matters.
     let text = rendered(
-        &snapshot_after_announcing(0, Some(acmon::notify::Rebuilt::NothingRecorded), Ok(())),
+        &snapshot_after_announcing(
+            0,
+            Some(acmon::notify::Rebuilt::NothingRecorded),
+            Persistence::Stored,
+        ),
         wide(),
     );
 
@@ -1705,7 +1713,7 @@ fn a_dedupe_record_that_could_not_be_stored_is_reported_because_the_next_run_re_
         &snapshot_after_announcing(
             2,
             None,
-            Err(
+            Persistence::Failed(
                 "could not create state directory /Users/pmcfadin/.local/state/acmon: \
                  Read-only file system"
                     .to_string(),

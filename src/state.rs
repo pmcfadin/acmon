@@ -222,6 +222,15 @@ impl TieredState {
         self.writer_pid
     }
 
+    /// How many tiers this state carries.
+    ///
+    /// A reader needs this to tell a monitor that has published facts from one that holds the
+    /// writer role and has collected nothing — which are the same file with the same pid in it,
+    /// and which mean opposite things on a screen.
+    pub fn tier_count(&self) -> usize {
+        self.tiers.len()
+    }
+
     /// Serialize to the on-disk format.
     fn to_state_file(&self) -> StateFile {
         StateFile {

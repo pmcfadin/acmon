@@ -12,7 +12,9 @@
 
 use std::process::Command;
 
-use acmon::cli::{parse_amon, AmonRequest, AmonVerb, CliError, VerbState};
+use acmon::cli::{
+    parse_agtop, parse_amon, AgtopRequest, AmonRequest, AmonVerb, CliError, VerbState, ONCE_FLAG,
+};
 
 // --- Parsing: the verb surface ---
 
@@ -207,6 +209,68 @@ fn the_usage_text_says_the_foreground_flag_is_still_subject_to_the_lock() {
     );
 }
 
+// --- Parsing: the display's surface ---
+
+#[test]
+fn a_bare_agtop_is_the_full_screen_because_that_is_what_the_tool_is_for() {
+    // The opposite of `amon`, deliberately. A bare `amon` has asked for nothing, while a bare
+    // `agtop` has asked for the thing the binary exists to do.
+    assert_eq!(
+        parse_agtop(Vec::<String>::new()),
+        Ok(AgtopRequest::Live),
+        "a bare `agtop` should take the screen"
+    );
+}
+
+#[test]
+fn the_one_shot_flag_asks_for_lines_instead_of_a_screen() {
+    assert_eq!(
+        parse_agtop(vec![ONCE_FLAG.to_string()]),
+        Ok(AgtopRequest::Once)
+    );
+}
+
+#[test]
+fn agtop_asked_for_help_is_not_an_error() {
+    for flag in ["--help", "-h"] {
+        assert_eq!(
+            parse_agtop(vec![flag.to_string()]),
+            Ok(AgtopRequest::Help),
+            "{flag} should parse as Help"
+        );
+    }
+}
+
+#[test]
+fn agtop_refuses_an_argument_it_does_not_understand_rather_than_ignoring_it() {
+    // Including the monitor's verbs. `agtop watch` reading as a successful monitor start would
+    // undo the whole point of there being two names.
+    for argument in ["watch", "--follow", "-x"] {
+        match parse_agtop(vec![argument.to_string()]) {
+            Err(CliError::UnexpectedArgument(named)) => assert_eq!(named, argument),
+            other => panic!("`agtop {argument}` should be refused, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn agtops_usage_text_documents_both_modes_and_the_absence_of_keybindings() {
+    let usage = acmon::cli::agtop_usage();
+
+    assert!(
+        usage.contains(ONCE_FLAG),
+        "the pipeable mode has to be discoverable:\n{usage}"
+    );
+    assert!(
+        usage.contains("read-only"),
+        "the display's central promise belongs where the display is discovered:\n{usage}"
+    );
+    assert!(
+        usage.contains("keybindings"),
+        "the absence of keybindings is a requirement, not an omission, so help says so:\n{usage}"
+    );
+}
+
 // --- The binaries themselves ---
 //
 // These spawn the built binaries, which is the only way to assert on an exit code. Kept to
@@ -316,7 +380,11 @@ fn agtop_never_exits_zero_having_printed_nothing() {
     // these is true: a rendering on stdout with success, or a stated reason on stderr with
     // failure. Silence-and-success is the outcome that must be impossible, because it is
     // indistinguishable from a machine with no agents running.
-    let (success, stdout, stderr) = run(env!("CARGO_BIN_EXE_agtop"), &[]);
+    //
+    // Asserted through `--once`, which is the mode that prints lines. A bare `agtop` takes the
+    // screen, and there is no screen to take from a test harness — its refusal to draw into a
+    // pipe is asserted in seam 14, alongside the rest of the display's behaviour.
+    let (success, stdout, stderr) = run(env!("CARGO_BIN_EXE_agtop"), &[ONCE_FLAG]);
 
     if success {
         assert!(

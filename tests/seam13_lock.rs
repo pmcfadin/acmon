@@ -520,22 +520,21 @@ fn a_monitor_that_was_killed_is_taken_over_by_name_rather_than_in_silence() {
 // --- Nothing but the monitor writes state ---
 
 #[test]
-fn agtop_takes_no_lock_and_writes_only_what_10_has_still_to_retire() {
+fn agtop_takes_no_lock_and_leaves_the_state_directory_exactly_as_it_found_it() {
     // F18 and F26 from the other side: the display is read-only. A second writer would undo
     // the lock, and a notification from a foreground UI is redundant with looking at it.
     //
-    // The name of this test used to say `agtop` writes *nothing* here, which was true when
-    // #26 wrote it and stopped being true one ticket later: #29 moved the dedupe record into
-    // this directory, and `agtop` reaches it through `collect` like everything else. The
-    // assertions never covered the claim, so nothing went red — a test whose name outruns
-    // what it checks is the failure this project exists to remove, pointed at ourselves.
+    // Asserted as an empty directory rather than as a list of files that must be absent. When
+    // this seam landed, the display still persisted the pre-split memory file and could still
+    // deliver through `collect`, so the assertion had to name the two files it did cover — and
+    // a named list is a list that a new state artefact is not on. That is not hypothetical: #29
+    // put `notified.json` in this directory, `agtop` reached it through `collect`, and this test
+    // stayed green while its own name said the display writes nothing. #10 made the display a
+    // reader, so the guarantee is now the strong one: nothing at all.
     //
-    // So the guarantee is stated as what it actually is: the display never takes the lock and
-    // never writes the monitor's state file, and every other file it leaves here must be one
-    // this repo has knowingly not retired yet. #10 makes `agtop` a poller of what the monitor
-    // wrote, at which point that list empties and this test tightens by itself rather than
-    // needing to be remembered. `ACMON_STATE` is redirected in here too, so the pre-split
-    // memory file cannot touch the developer's real files.
+    // Run through `--once`, deliberately. A bare `agtop` takes the screen and refuses when
+    // there is no terminal, which is every test harness — it would never reach a collection,
+    // and this test would pass by never having done anything.
     let state_dir = scratch("agtop-readonly");
     std::fs::create_dir_all(&state_dir).expect("create state directory");
 
@@ -543,6 +542,7 @@ fn agtop_takes_no_lock_and_writes_only_what_10_has_still_to_retire() {
     let absent_notify = state_dir.join("no-such-notify.toml");
 
     let output = Command::new(env!("CARGO_BIN_EXE_agtop"))
+        .arg("--once")
         .env(acmon::state::STATE_DIR_VARIABLE, &state_dir)
         .env("ACMON_STATE", &legacy)
         .env("ACMON_NOTIFY_CONFIG", &absent_notify)
@@ -550,15 +550,28 @@ fn agtop_takes_no_lock_and_writes_only_what_10_has_still_to_retire() {
         .output()
         .expect("agtop is built and runnable");
 
+    let left_behind: Vec<String> = std::fs::read_dir(&state_dir)
+        .expect("the state directory is still there")
+        .map(|entry| {
+            entry
+                .expect("a readable entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+
     // Whatever agtop decided, it decided it without becoming a writer of this directory.
     assert!(
-        !state_dir.join("watch.lock").exists(),
-        "the display must not take the monitor's lock (exit was {:?})",
+        left_behind.is_empty(),
+        "the display left {left_behind:?} in the monitor's state directory; it is read-only \
+         (exit was {:?})",
         output.status
     );
     assert!(
-        !state_dir.join(STATE_FILE).exists(),
-        "the display must not write the monitor's state file"
+        !legacy.exists(),
+        "the display must not write the pre-split memory file either — a reader that writes \
+         anywhere is a second writer"
     );
 
     // Everything else it left behind has to be on the list, by name. A new artefact appearing

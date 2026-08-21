@@ -19,7 +19,7 @@ use acmon::world::{
     ActivityUnavailable, CodexSession, ResourceSource, Resources, ResourcesUnavailable, StateRead,
     Sweep, Unmeasured,
 };
-use acmon::{collect, Identity, ProcessRecord, ProcessSnapshot, World, WorldError};
+use acmon::{collect, Identity, Persistence, ProcessRecord, ProcessSnapshot, World, WorldError};
 
 /// A fixed instant every test reasons from, so that "a week ago" is a computable thing rather
 /// than something that depends on when the suite ran.
@@ -847,7 +847,7 @@ fn a_machine_with_no_state_file_starts_empty_and_says_nothing_about_it() {
         "a first run has nothing to remember, which is an answer and not a degradation — \
          warning about it would put a scary line on every new machine"
     );
-    assert!(snapshot.remembered.persisted.is_ok());
+    assert_eq!(snapshot.remembered.persisted, Persistence::Stored);
 }
 
 #[test]
@@ -974,9 +974,10 @@ fn a_run_that_could_not_store_its_state_says_so() {
         .expect("failing to store state must not fail the collection");
 
     assert!(
-        snapshot.remembered.persisted.is_err(),
+        matches!(snapshot.remembered.persisted, Persistence::Failed(_)),
         "a run that collected perfectly and stored nothing looks identical to one that \
-         worked, right up until the next run starts blind"
+         worked, right up until the next run starts blind; got {:?}",
+        snapshot.remembered.persisted
     );
 }
 

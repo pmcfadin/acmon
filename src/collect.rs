@@ -213,6 +213,52 @@ pub struct WorkspaceReport {
     pub uncommitted_entries: Option<usize>,
 }
 
+/// Who a collection was made for, and therefore what it is allowed to do.
+///
+/// The distinction is the whole two-binary split (PRD §1.1). Both binaries link this library
+/// because the display must be able to collect for itself when no monitor is publishing (F28)
+/// — but a collection made *for a display* must write nothing and announce nothing (F26).
+/// Passing that as an argument rather than trusting each caller to remember is deliberate:
+/// `agtop` called this function for a year while persisting state and delivering
+/// notifications, and nothing in the code said it should not.
+///
+/// **Every durable write and every delivery in [`collect_as`] is gated on this, and a new one
+/// must be too.** There is exactly one enforcement of that rule that does not rely on someone
+/// reading this paragraph: `agtop_takes_no_lock_and_leaves_the_state_directory_exactly_as_it_found_it`
+/// in `tests/seam13_lock.rs` asserts the state directory is *empty* after a display run, so an
+/// ungated write fails as an unexpected file rather than as a missing assertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// The monitor. Writes what it learned and announces what is notable.
+    Monitor,
+    /// A reader. Writes nothing, announces nothing, and says so in what it returns.
+    Display,
+}
+
+/// Why the display never writes and never announces, in the words the output uses.
+///
+/// One string, used by both the persistence and the notification account, so a reader is
+/// given the same reason for both silences.
+pub const DISPLAY_IS_READ_ONLY: &str =
+    "this collection was made by the display, which is read-only — it never writes state and \
+     never notifies";
+
+/// What became of this run's attempt to carry its state to the next run.
+///
+/// Three outcomes, not two. A run that never tried to write is not a run that failed to
+/// write, and it is certainly not a run that succeeded: a display collecting for itself
+/// stores nothing by design, and reporting that as either would be a wrong answer in one
+/// direction or a missing warning in the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Persistence {
+    /// Written. The next run starts from it.
+    Stored,
+    /// The write was attempted and failed. The next run starts blind, and that has to be said.
+    Failed(String),
+    /// No write was attempted, and why.
+    NotAttempted { because: &'static str },
+}
+
 /// What this run remembered from earlier ones, and what it did with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Remembered {
@@ -226,10 +272,10 @@ pub struct Remembered {
     pub unusable: Option<Degraded>,
     /// Whether this run's state was stored for the next one.
     ///
-    /// An `Err` has to be surfaced. A run that collects perfectly and fails to persist looks
+    /// A failure has to be surfaced. A run that collects perfectly and fails to persist looks
     /// identical to one that succeeded, right up until the next run starts blind and reports
     /// a shorter at-risk list.
-    pub persisted: Result<(), String>,
+    pub persisted: Persistence,
     /// Workspaces dropped from memory this run because they had been settled past the
     /// retention period.
     pub forgotten: Vec<Forgotten>,
@@ -250,7 +296,7 @@ impl Remembered {
         Remembered {
             memory: Memory::empty(),
             unusable: None,
-            persisted: Ok(()),
+            persisted: Persistence::Stored,
             forgotten: Vec::new(),
             retention: crate::memory::DEFAULT_FORGET,
             notify_health: NotifyHealth::none(),
@@ -282,19 +328,31 @@ pub struct Notified {
     pub rebuilt: Option<crate::notify::Rebuilt>,
     /// Whether the record was stored for the next run.
     ///
-    /// An `Err` has to be surfaced. The failure is in the safe direction — an unrecorded alert is
-    /// re-announced rather than lost — but a run that keeps re-announcing the same condition with
-    /// nothing to explain why is indistinguishable from a broken dedupe rule.
-    pub persisted: Result<(), String>,
+    /// A [`Persistence::Failed`] has to be surfaced. The failure is in the safe direction — an
+    /// unrecorded alert is re-announced rather than lost — but a run that keeps re-announcing the
+    /// same condition with nothing to explain why is indistinguishable from a broken dedupe rule.
+    ///
+    /// [`Persistence::NotAttempted`] is the display: it neither wrote the record nor failed to,
+    /// and reporting that as a failure would put a warning about the *monitor's* next run on a
+    /// screen that has no monitor behind it. The same three-way distinction as the state write,
+    /// for the same reason — the two-way `Result` this used to be could only lie in one direction
+    /// or the other.
+    pub persisted: Persistence,
 }
 
 impl Notified {
     /// A run that neither read nor wrote a dedupe record. What a fixture starts from.
+    ///
+    /// `NotAttempted` rather than a successful write: this constructor's whole point is a run
+    /// that wrote nothing, and while `persisted` was a `Result` the only way to say that was
+    /// `Ok(())` — a stored record that does not exist.
     pub fn none() -> Self {
         Notified {
             record: crate::notify::AnnouncementRecord::empty(),
             rebuilt: None,
-            persisted: Ok(()),
+            persisted: Persistence::NotAttempted {
+                because: "this run neither read nor wrote a dedupe record",
+            },
         }
     }
 }
@@ -343,6 +401,14 @@ pub struct NotifyHealth {
     /// able to name it rather than absorb it into the total. `ZERO` when nothing was
     /// attempted, which is the honest measurement of a run that asked no channel anything.
     pub delivery_cost: Duration,
+    /// Why no channel was asked anything at all, when asking was never this run's job.
+    ///
+    /// Distinct from every counter above, all of which describe a run that tried. A display
+    /// collecting for itself (F26) decides what *would* be notable — so the screen can say so
+    /// — and delivers none of it. With this absent, such a run is indistinguishable from a
+    /// monitor whose channels are configured and quiet, which is the one reading a reader must
+    /// never be given: it says alerts are being sent when nothing is sending them.
+    pub read_only: Option<&'static str>,
 }
 
 impl NotifyHealth {
@@ -359,6 +425,7 @@ impl NotifyHealth {
             remote_not_attempted: 0,
             not_attempted_reason: None,
             delivery_cost: Duration::ZERO,
+            read_only: None,
         }
     }
 
@@ -843,10 +910,30 @@ fn transcript_derived_sessions(
 ///
 /// `now` is injected rather than read from a clock here, so that a liveness verdict is
 /// deterministic under test rather than depending on when the test happened to run.
+/// Collect as the monitor: write what was learned, announce what is notable.
+///
+/// Kept as its own name — rather than a default argument — so that every existing caller and
+/// test states the monitor's role by using it, and a reader that must not write has to say so
+/// by calling [`collect_as`].
 pub fn collect(
     world: &dyn World,
     now: SystemTime,
     thresholds: &Thresholds,
+) -> Result<Snapshot, CollectError> {
+    collect_as(world, now, thresholds, Role::Monitor)
+}
+
+/// Collect in a stated role.
+///
+/// Everything observed is observed identically in both roles — the split is a deployment
+/// boundary, not a code boundary (PRD §1.1), and the display must be able to see exactly what
+/// the monitor sees. What the role changes is the two things that leave a mark on the machine:
+/// the state write, and the notification.
+pub fn collect_as(
+    world: &dyn World,
+    now: SystemTime,
+    thresholds: &Thresholds,
+    role: Role,
 ) -> Result<Snapshot, CollectError> {
     let observation = world.process_snapshot().map_err(CollectError::World)?;
 
@@ -1199,15 +1286,20 @@ pub fn collect(
 
     // Nothing notable means no channel is asked anything at all, so neither the local command
     // nor the remote endpoint is touched on a quiet machine.
+    //
+    // A display asks no channel anything either, whatever is configured and however notable
+    // the run was (F26). The decision above still ran, because the count of what *would* be
+    // announced is worth showing on a screen; what must not happen is the delivery.
+    let notifying = matches!(role, Role::Monitor);
     let local_report = config
         .local_command
         .as_ref()
-        .filter(|_| !payloads.is_empty())
+        .filter(|_| notifying && !payloads.is_empty())
         .map(|command| world.notify_local_batch(command, &payloads));
     let remote_report = config
         .remote_url
         .as_ref()
-        .filter(|_| !payloads.is_empty())
+        .filter(|_| notifying && !payloads.is_empty())
         .map(|url| world.notify_remote_batch(url, &payloads));
 
     let mut local_delivered = 0;
@@ -1221,7 +1313,11 @@ pub fn collect(
     // Track which announcements were actually delivered, so only those update the record.
     let mut successfully_announced = updated_announcements.clone();
 
-    for (index, announcement) in announcements.iter().enumerate() {
+    // Skipped entirely for a reader. With no delivery attempted, every announcement would fall
+    // through the "neither channel delivered" arm below and be struck from the record — leaving
+    // a display's snapshot claiming that conditions the monitor announced hours ago have never
+    // been announced.
+    for (index, announcement) in announcements.iter().enumerate().filter(|_| notifying) {
         let mut delivered_somewhere = false;
 
         // Local channel
@@ -1291,9 +1387,34 @@ pub fn collect(
     // even when nothing was announced: a record that still names a condition which has since
     // cleared would suppress the alert when that condition returns, so retiring entries is as
     // much a part of the write as adding them.
-    let notified_persisted = world.write_notified(&notify::serialise(&successfully_announced));
+    //
+    // Gated on the role for the same reasons the state write below is. A display that retired
+    // the monitor's dedupe entries would make the monitor re-announce conditions it had already
+    // announced — the alert storm #29 exists to prevent, caused by the binary that is supposed
+    // to write nothing.
+    let notified_persisted = match role {
+        Role::Monitor => match world.write_notified(&notify::serialise(&successfully_announced)) {
+            Ok(()) => Persistence::Stored,
+            Err(why) => Persistence::Failed(why),
+        },
+        Role::Display => Persistence::NotAttempted {
+            because: DISPLAY_IS_READ_ONLY,
+        },
+    };
 
-    let persisted = world.write_state(&memory::serialise(&memory_after_forgetting));
+    // The only other write in a collection, and the display never reaches it (F26). Skipped by
+    // role rather than by handing the display a World that refuses: a refusal would arrive as a
+    // failed write, and the screen would carry a warning about a next run starting blind
+    // because of a write nobody ever wanted.
+    let persisted = match role {
+        Role::Monitor => match world.write_state(&memory::serialise(&memory_after_forgetting)) {
+            Ok(()) => Persistence::Stored,
+            Err(why) => Persistence::Failed(why),
+        },
+        Role::Display => Persistence::NotAttempted {
+            because: DISPLAY_IS_READ_ONLY,
+        },
+    };
 
     Ok(Snapshot {
         taken_at: now,
@@ -1321,6 +1442,10 @@ pub fn collect(
                 // other, so the run really did wait for both.
                 delivery_cost: local_report.as_ref().map(|r| r.cost).unwrap_or_default()
                     + remote_report.as_ref().map(|r| r.cost).unwrap_or_default(),
+                read_only: match role {
+                    Role::Monitor => None,
+                    Role::Display => Some(DISPLAY_IS_READ_ONLY),
+                },
             },
             detector_config,
             notified: Notified {

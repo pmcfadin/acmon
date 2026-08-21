@@ -87,8 +87,12 @@ Where a claim could not be verified, it says so.
 
 ## Status
 
-v1 in progress. `agtop` runs and is worth running: it prints a session table and an
-at-risk workspace panel. `amon` is a verb surface plus its single-writer lock: `amon watch`
+v1 in progress. `agtop` runs and is worth running: full screen by default, refreshing
+while it is open by polling the state file once a second, with `agtop --once` for one
+pass as plain lines. It draws a session table, an always-visible at-risk workspace panel,
+and its own collection overhead beside the figures. It is read-only in fact: it writes no
+state and sends no notification, and with nothing published it says on screen that nothing
+is being recorded or alerted. `amon` is a verb surface plus its single-writer lock: `amon watch`
 takes an exclusive lock in the state directory, publishes which pid holds the writer role,
 and refuses to start when another instance already holds it — naming that pid. The tiered
 collection loop it would guard is not built, so every verb, `watch` included, still reports

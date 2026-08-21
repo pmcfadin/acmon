@@ -1,13 +1,13 @@
 //! Turning a snapshot into terminal output.
 //!
-//! The drawing code is shared between production and tests. Tests drive it through
-//! [`render_to_lines`], which renders into an in-memory buffer, so rendering is
-//! verifiable without a terminal.
+//! The drawing code is shared between production and tests. Both go through
+//! [`draw_screen`]: the full-screen display draws it into a real `crossterm` terminal on the
+//! alternate screen, and `agtop --once` and every test draw it into an in-memory buffer via
+//! [`screen_to_lines`]. One drawing pass, so a rendering that has never been looked at by a
+//! human is still the rendering that was asserted on.
 //!
-//! NOTE: Production currently renders through `TestBackend`, which is architecturally
-//! wrong but pragmatic for one-shot output. The live TUI (ticket #10) will use a real
-//! terminal backend. Similarly, `crossterm` is intentionally absent from dependencies
-//! until the TUI is needed.
+//! What is decided elsewhere: everything about *what* to draw, in [`crate::display`]. What is
+//! decided here is only how it is said.
 
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
 
-use crate::collect::{Identity, LivenessUnknown, Session, Snapshot, WorkspaceReport};
+use crate::collect::{Identity, LivenessUnknown, Persistence, Session, Snapshot, WorkspaceReport};
 use crate::notify::Rebuilt;
 use crate::vcs::{Unreadable, WorkspaceState};
 use crate::workspace::NamespaceResolution;
@@ -276,11 +276,18 @@ fn memory_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
         ));
     }
 
-    if let Err(why) = &remembered.persisted {
-        lines.extend(wrap_words(
+    match &remembered.persisted {
+        Persistence::Stored => {}
+        Persistence::Failed(why) => lines.extend(wrap_words(
             &format!("WARNING: {why} — the next run will start with no history."),
             width,
-        ));
+        )),
+        // Not a warning. A run that was never going to write did not fail to write, and
+        // dressing it as a failure would train a reader to ignore the line that means one.
+        Persistence::NotAttempted { because } => lines.extend(wrap_words(
+            &format!("Nothing was written: {because}."),
+            width,
+        )),
     }
 
     if !remembered.forgotten.is_empty() {
@@ -361,7 +368,7 @@ fn memory_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
     // unrecorded alert is announced again rather than dropped — but a monitor that re-announces
     // the same stranding every run with nothing to explain why is how a reader learns that its
     // alerts mean nothing.
-    if let Err(why) = &notified.persisted {
+    if let Persistence::Failed(why) = &notified.persisted {
         if health.notable > 0 || !notified.record.is_empty() {
             lines.extend(wrap_words(
                 &format!(
@@ -371,6 +378,21 @@ fn memory_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
                 width,
             ));
         }
+    }
+
+    // A run that never notifies says so once, and nothing below applies to it. Every warning
+    // after this point is about a channel that was asked something, and a reader given
+    // "no channels configured" by a display would go and configure one that was already there.
+    if let Some(because) = health.read_only {
+        lines.extend(wrap_words(
+            &format!(
+                "Nothing was announced: {because}. {} condition(s) on this screen would be \
+                 announced by a running monitor.",
+                health.notable
+            ),
+            width,
+        ));
+        return lines;
     }
 
     // A configuration that could not be understood is reported **unconditionally**, and
@@ -697,8 +719,14 @@ fn too_narrow_message(width: u16) -> String {
 
 /// Draw a snapshot into a frame. The single source of truth for layout.
 pub fn draw(frame: &mut Frame, snapshot: &Snapshot) {
-    let area = frame.area();
+    draw_in(frame, snapshot, frame.area());
+}
 
+/// Draw a snapshot into part of a frame.
+///
+/// Separated from [`draw`] so the whole screen — meters, notices, then this — is one drawing
+/// pass rather than two that could disagree about how much room they have.
+pub fn draw_in(frame: &mut Frame, snapshot: &Snapshot, area: ratatui::layout::Rect) {
     if area.width < minimum_width() {
         let message = wrap_words(&too_narrow_message(area.width), area.width).join("\n");
         frame.render_widget(Paragraph::new(message), area);
@@ -975,6 +1003,93 @@ fn wrap_words(text: &str, width: u16) -> Vec<String> {
     lines
 }
 
+// --- The whole screen: what it cost, what is wrong with it, and then the figures ---
+
+/// The meters, as one line.
+///
+/// A line rather than a row of gauges, and at the top rather than tucked under the table: the
+/// figures are first-class (F33), and turning them into `htop`'s header meters is #34's work.
+///
+/// A missing figure prints its reason where the number would be. Never `0%`, which is a monitor
+/// that is running and idle — the one thing a reader would most like to know and the one thing
+/// an absent duty cycle never means.
+pub fn meter_line(meters: &crate::display::Meters) -> String {
+    let overhead = match &meters.overhead {
+        Ok(cost) => format_cpu(cost),
+        Err(why) => why.to_string(),
+    };
+    let duty = match &meters.duty_cycle {
+        Ok(fraction) => format!("{:.1}%", fraction * 100.0),
+        Err(why) => why.to_string(),
+    };
+    format!("METERS  collection overhead: {overhead}  ·  amon duty cycle: {duty}")
+}
+
+/// Everything above the figures: the meters, then whatever has to be said about them.
+fn screen_header(screen: &crate::display::Screen, width: u16) -> Vec<String> {
+    let mut lines = wrap_words(&meter_line(&screen.meters), width);
+    for notice in &screen.notices {
+        lines.extend(wrap_words(notice, width));
+    }
+    lines
+}
+
+/// What is printed in place of the figures when there are none.
+fn no_facts_message(reason: &str) -> String {
+    format!(
+        "NO FIGURES: {reason}. Nothing is drawn in their place — an empty table is \
+         indistinguishable from a machine with no agents running on it, and that is the \
+         plausible wrong answer this tool exists to remove."
+    )
+}
+
+/// How tall the whole screen needs to be to hold everything it has to say.
+pub fn screen_height(screen: &crate::display::Screen, width: u16) -> u16 {
+    let header = screen_header(screen, width).len() as u16;
+    let body = match &screen.facts {
+        Ok(snapshot) => required_height(snapshot, width),
+        Err(reason) => wrap_words(&no_facts_message(reason), width).len() as u16,
+    };
+    header + body
+}
+
+/// Draw the whole screen: the meters, the notices, and then the figures or the reason there
+/// are none.
+///
+/// The one drawing entry point `agtop` uses, full-screen and one-shot alike. Two of them would
+/// be two screens that drift apart, and the one-shot output exists precisely so that what the
+/// full screen shows can be asserted on without a terminal.
+pub fn draw_screen(frame: &mut Frame, screen: &crate::display::Screen) {
+    let area = frame.area();
+    let header = screen_header(screen, area.width);
+
+    let [header_area, body_area] =
+        Layout::vertical([Constraint::Length(header.len() as u16), Constraint::Min(0)]).areas(area);
+
+    frame.render_widget(Paragraph::new(header.join("\n")), header_area);
+
+    match &screen.facts {
+        Ok(snapshot) => draw_in(frame, snapshot, body_area),
+        Err(reason) => frame.render_widget(
+            Paragraph::new(wrap_words(&no_facts_message(reason), body_area.width).join("\n")),
+            body_area,
+        ),
+    }
+}
+
+/// Render a whole screen into an in-memory buffer and return it as text lines.
+///
+/// What `agtop --once` prints, and what the tests assert on. The one-shot mode is not a
+/// fallback: it is what keeps the renderer testable against a fixed buffer instead of a live
+/// terminal, and what keeps the output pipeable.
+pub fn screen_to_lines(screen: &crate::display::Screen, width: u16, height: u16) -> Vec<String> {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("in-memory terminal");
+    terminal
+        .draw(|frame| draw_screen(frame, screen))
+        .expect("drawing into an in-memory buffer cannot fail");
+    lines_of(terminal.backend().buffer().clone())
+}
+
 /// Render a snapshot into an in-memory buffer and return it as text lines.
 ///
 /// Used by tests, and by anything that wants the output without a terminal.
@@ -983,8 +1098,11 @@ pub fn render_to_lines(snapshot: &Snapshot, width: u16, height: u16) -> Vec<Stri
     terminal
         .draw(|frame| draw(frame, snapshot))
         .expect("drawing into an in-memory buffer cannot fail");
+    lines_of(terminal.backend().buffer().clone())
+}
 
-    let buffer = terminal.backend().buffer().clone();
+/// One buffer's worth of cells, as trimmed lines.
+fn lines_of(buffer: ratatui::buffer::Buffer) -> Vec<String> {
     (0..buffer.area.height)
         .map(|y| {
             (0..buffer.area.width)

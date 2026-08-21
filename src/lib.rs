@@ -4,6 +4,7 @@ pub mod cli;
 pub mod collect;
 pub mod deliver;
 pub mod detect;
+pub mod display;
 mod isotime;
 pub mod liveness;
 pub mod lock;
@@ -19,8 +20,8 @@ pub mod workspace;
 pub mod world;
 
 pub use collect::{
-    collect, CollectError, Identity, LivenessUnknown, NotifyHealth, Remembered, Session, Snapshot,
-    WorkspaceReport,
+    collect, collect_as, CollectError, Identity, LivenessUnknown, NotifyHealth, Persistence,
+    Remembered, Role, Session, Snapshot, WorkspaceReport,
 };
 pub use deliver::DeliveryReport;
 pub use detect::Detector;
