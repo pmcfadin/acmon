@@ -17,6 +17,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
 
 use crate::collect::{Identity, LivenessUnknown, Session, Snapshot, WorkspaceReport};
+use crate::notify::Rebuilt;
 use crate::vcs::{Unreadable, WorkspaceState};
 use crate::workspace::NamespaceResolution;
 use crate::world::Resources;
@@ -311,6 +312,66 @@ fn memory_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
 
     // Notification channel health
     let health = &remembered.notify_health;
+    let notified = &remembered.notified;
+
+    // Why this run announced conditions that have not changed.
+    //
+    // An absent record is an answer — a first run, or a state directory someone deleted on purpose.
+    // A record that is there and could not be used is a fault. The two have the same consequence
+    // and must not read alike, because only one of them is worth going and looking at the file for.
+    match &notified.rebuilt {
+        // Unconditional, like an unusable notification config and for the same reason: a monitor
+        // that has lost the ability to dedupe at all has lost it on a quiet machine too, and the
+        // run where that first matters is the run that will not say so.
+        Some(
+            rebuilt @ (Rebuilt::Unreadable(_)
+            | Rebuilt::Unparsable(_)
+            | Rebuilt::UnknownVersion { .. }),
+        ) => {
+            lines.extend(wrap_words(
+                &format!(
+                    "WARNING: {rebuilt} — so NOTHING was deduped this run: no condition was \
+                     suppressed as already announced."
+                ),
+                width,
+            ));
+        }
+        // Said only when the missing record actually cost a re-announcement, measured by what
+        // reached a channel rather than by what was notable: alerts that never arrived are a
+        // different and louder problem, reported below. A line on every quiet first run would
+        // train a reader to skip the line, and this line matters exactly once.
+        Some(rebuilt @ Rebuilt::NothingRecorded) => {
+            let re_announced = notified.record.sessions.len() + notified.record.workspaces.len();
+            if re_announced > 0 {
+                lines.extend(wrap_words(
+                    &format!(
+                        "{rebuilt} — so {re_announced} condition(s) still true were announced \
+                         again rather than deduped. Nothing changed on the machine to cause that."
+                    ),
+                    width,
+                ));
+            }
+        }
+        None => {}
+    }
+
+    // A dedupe record that could not be stored.
+    //
+    // Reported whenever there was anything to lose. The failure is in the safe direction — an
+    // unrecorded alert is announced again rather than dropped — but a monitor that re-announces
+    // the same stranding every run with nothing to explain why is how a reader learns that its
+    // alerts mean nothing.
+    if let Err(why) = &notified.persisted {
+        if health.notable > 0 || !notified.record.is_empty() {
+            lines.extend(wrap_words(
+                &format!(
+                    "WARNING: {why} — the next run will announce every condition still true, \
+                     including the ones announced this run."
+                ),
+                width,
+            ));
+        }
+    }
 
     // A configuration that could not be understood is reported **unconditionally**, and
     // before anything else about the channels. It delivers nothing, exactly like a machine

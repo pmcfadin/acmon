@@ -264,7 +264,6 @@ fn a_workspace_seen_before_is_still_checked_once_its_session_has_gone() {
         .remembering(&Memory {
             workspaces: vec![remembered(STRANDED, ago(7 * DAY), ago(DAY))],
             sessions: Vec::new(),
-            announcements: Default::default(),
         });
 
     let snapshot =
@@ -322,7 +321,6 @@ fn first_seen_is_preserved_across_runs_while_last_seen_moves() {
         .remembering(&Memory {
             workspaces: vec![remembered(STRANDED, first, ago(DAY))],
             sessions: Vec::new(),
-            announcements: Default::default(),
         });
 
     let snapshot =
@@ -380,7 +378,6 @@ fn a_workspace_holding_uncommitted_work_is_never_forgotten_however_long_it_sits(
             settled_since: None,
         }],
         sessions: Vec::new(),
-        announcements: Default::default(),
     };
 
     let (kept, forgotten) = memory::forget(memory, now(), DAY);
@@ -415,7 +412,6 @@ fn a_settled_workspace_is_forgotten_only_once_the_period_has_actually_passed() {
                 settled_since: Some(ago(settled_for)),
             }],
             sessions: Vec::new(),
-            announcements: Default::default(),
         };
 
         let (kept, forgotten) = memory::forget(memory, now(), retention);
@@ -467,7 +463,6 @@ fn going_dirty_again_restarts_the_forgetting_clock() {
             settled_since: Some(ago(6 * DAY)),
         }],
         sessions: Vec::new(),
-        announcements: Default::default(),
     };
 
     let dirty_now = [acmon::memory::Sighting::of(
@@ -500,7 +495,6 @@ fn a_clock_already_running_is_not_restarted_by_a_second_clean_sighting() {
             settled_since: Some(settled_five_days_ago),
         }],
         sessions: Vec::new(),
-        announcements: Default::default(),
     };
 
     let still_clean = [acmon::memory::Sighting::of(
@@ -581,7 +575,6 @@ fn a_remembered_workspace_version_control_refuses_is_kept_and_reported() {
                 settled_since: Some(ago(50 * DAY)),
             }],
             sessions: Vec::new(),
-            announcements: Default::default(),
         });
 
     let snapshot = collect(&world, now(), &Thresholds::default()).expect("collection");
@@ -621,7 +614,6 @@ fn what_was_forgotten_is_reported_rather_than_silently_dropped() {
                 settled_since: Some(ago(90 * DAY)),
             }],
             sessions: Vec::new(),
-            announcements: Default::default(),
         });
 
     let snapshot =
@@ -647,7 +639,6 @@ fn an_unobserved_workspace_is_kept_exactly_as_it_was() {
     let previous = Memory {
         workspaces: vec![remembered(STRANDED, ago(30 * DAY), ago(2 * DAY))],
         sessions: Vec::new(),
-        announcements: Default::default(),
     };
 
     let merged = memory::remember(previous.clone(), &[], &[], now());
@@ -735,7 +726,6 @@ fn a_remembered_reading_never_shadows_a_live_one() {
                     taken_at: ago(DAY),
                 }),
             }],
-            announcements: Default::default(),
         });
 
     let snapshot = collect(&world, now(), &Thresholds::default()).expect("collection");
@@ -780,7 +770,6 @@ fn a_reused_pid_cannot_inherit_another_sessions_totals() {
                     taken_at: ago(DAY),
                 }),
             }],
-            announcements: Default::default(),
         });
 
     let snapshot = collect(&world, now(), &Thresholds::default()).expect("collection");
@@ -812,7 +801,6 @@ fn a_reading_that_could_not_be_taken_carries_the_previous_one_forward_unchanged(
                 taken_at,
             }),
         }],
-        announcements: Default::default(),
     };
 
     let session = acmon::Session {
@@ -1023,7 +1011,6 @@ fn state_survives_a_round_trip_through_the_file_format() {
                 taken_at: ago(Duration::from_secs(3_600)),
             }),
         }],
-        announcements: Default::default(),
     };
 
     let (parsed, degraded) = memory::parse(&memory::serialise(&original));
@@ -1045,7 +1032,6 @@ fn the_state_file_is_readable_by_a_human() {
             settled_since: None,
         }],
         sessions: Vec::new(),
-        announcements: Default::default(),
     });
 
     assert!(
@@ -1089,7 +1075,6 @@ fn a_large_memory(entries: usize) -> Memory {
             })
             .collect(),
         sessions: Vec::new(),
-        announcements: Default::default(),
     }
 }
 

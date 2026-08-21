@@ -1562,6 +1562,169 @@ fn a_failed_delivery_and_an_unsent_alert_are_reported_as_the_two_different_thing
     );
 }
 
+// --- A rebuilt dedupe record has to explain itself (ticket #29) ---
+//
+// Deleting the state directory is a supported recovery step, and one re-announcement of everything
+// currently notable is its cost. What must not happen is a monitor that appears to storm for no
+// reason: a reader who cannot tell "your dedupe record was missing" from "your dedupe rule is
+// broken" learns to ignore the alerts, which is the risk the whole ticket exists to remove.
+
+/// A run that announced and recorded `announced` strandings through a working local channel, with
+/// the dedupe record in whatever state the test cares about.
+///
+/// The record is built to match the delivered count on purpose: what a reader saw arrive is the
+/// only honest measure of what a missing record cost them, and it is not the same number as the
+/// notable count on a run whose channel refused everything.
+fn snapshot_after_announcing(
+    announced: usize,
+    rebuilt: Option<acmon::notify::Rebuilt>,
+    persisted: Result<(), String>,
+) -> Snapshot {
+    Snapshot {
+        remembered: Remembered {
+            notify_health: acmon::collect::NotifyHealth {
+                config: acmon::world::NotifyConfig {
+                    local_command: Some("terminal-notifier".to_string()),
+                    remote_url: None,
+                    unusable: None,
+                },
+                notable: announced,
+                local_delivered: announced,
+                ..acmon::collect::NotifyHealth::none()
+            },
+            notified: acmon::collect::Notified {
+                record: acmon::notify::AnnouncementRecord {
+                    sessions: Vec::new(),
+                    workspaces: (0..announced)
+                        .map(|i| {
+                            (
+                                format!("/Users/pmcfadin/projects/w{i}"),
+                                acmon::notify::AnnouncedWorkspaceState::DirtyStranded,
+                            )
+                        })
+                        .collect(),
+                },
+                rebuilt,
+                persisted,
+            },
+            ..Remembered::none()
+        },
+        ..snapshot_of_sessions(Vec::new())
+    }
+}
+
+#[test]
+fn a_missing_dedupe_record_explains_the_conditions_it_caused_to_be_re_announced() {
+    let text = rendered(
+        &snapshot_after_announcing(14, Some(acmon::notify::Rebuilt::NothingRecorded), Ok(())),
+        wide(),
+    );
+
+    assert!(
+        text.contains("already been announced"),
+        "fourteen alerts arriving at once has to be attributed to the missing record, or it \
+         reads as the tool malfunctioning; got:\n{text}"
+    );
+    assert!(
+        text.contains("14"),
+        "and the count has to be the one the reader just saw in their notifications; got:\n{text}"
+    );
+    assert!(
+        !text.contains("WARNING"),
+        "an absent record is an answer — a first run, or a state directory somebody deleted on \
+         purpose — and warning about it would train the reader to skip the line; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_dedupe_record_that_exists_and_could_not_be_used_is_a_warning_rather_than_a_note() {
+    // The distinction that matters: only one of these is worth going and looking at the file for.
+    let text = rendered(
+        &snapshot_after_announcing(
+            3,
+            Some(acmon::notify::Rebuilt::Unparsable(
+                "EOF while parsing an object at line 9 column 0".to_string(),
+            )),
+            Ok(()),
+        ),
+        wide(),
+    );
+
+    assert!(
+        text.contains("WARNING"),
+        "a record that is there and cannot be read is a fault, not a first run; got:\n{text}"
+    );
+    assert!(
+        text.contains("line 9"),
+        "and the parser's own words must survive, so the file can be inspected rather than only \
+         deleted; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_damaged_dedupe_record_is_reported_even_on_a_run_that_announced_nothing() {
+    // Unconditional, like an unusable notification config and for the same reason: a monitor that
+    // has lost the ability to dedupe has lost it on a quiet machine too, and the run where that
+    // first matters is the run that will not be there to say so.
+    let text = rendered(
+        &snapshot_after_announcing(
+            0,
+            Some(acmon::notify::Rebuilt::Unreadable(
+                "Permission denied".to_string(),
+            )),
+            Ok(()),
+        ),
+        wide(),
+    );
+
+    assert!(
+        text.contains("WARNING") && text.contains("Permission denied"),
+        "a record that cannot be read is a fault whether or not this run had anything to say; \
+         got:\n{text}"
+    );
+}
+
+#[test]
+fn a_run_with_nothing_to_announce_says_nothing_about_its_missing_dedupe_record() {
+    // The counterweight. A first run on a quiet machine has no storm to explain, and a line on
+    // every such run is how a reader learns to skip the line that matters.
+    let text = rendered(
+        &snapshot_after_announcing(0, Some(acmon::notify::Rebuilt::NothingRecorded), Ok(())),
+        wide(),
+    );
+
+    assert!(
+        !text.contains("already been announced"),
+        "nothing was announced, so there is nothing to explain; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_dedupe_record_that_could_not_be_stored_is_reported_because_the_next_run_re_announces() {
+    let text = rendered(
+        &snapshot_after_announcing(
+            2,
+            None,
+            Err(
+                "could not create state directory /Users/pmcfadin/.local/state/acmon: \
+                 Read-only file system"
+                    .to_string(),
+            ),
+        ),
+        wide(),
+    );
+
+    assert!(
+        text.contains("WARNING") && text.contains("next run"),
+        "this run looks perfect and the next one re-announces everything; only saying so \
+         distinguishes them; got:\n{text}"
+    );
+    assert!(
+        text.contains("Read-only file system"),
+        "with the reason it failed; got:\n{text}"
+    );
+}
+
 // --- A CLI id is whatever the user typed (ticket #12) ---
 
 fn snapshot_of_cli(cli: &str) -> Snapshot {

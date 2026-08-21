@@ -411,6 +411,38 @@ pub trait World {
         Err("this World has no state store, so nothing was carried to the next run".to_string())
     }
 
+    /// Read the record of what earlier runs already announced.
+    ///
+    /// Separate from [`World::read_state`] because the two artefacts must be able to fail
+    /// independently. A memory file this build cannot understand costs the remembered workspace
+    /// set; if it also cost the dedupe record, one unreadable file would produce an alert storm.
+    ///
+    /// The **default is a World that has never announced anything**, which is what a
+    /// fixture-driven fake is. It answers [`StateRead::Absent`] because that is true of it — and
+    /// `Absent` is an answer, not a failure: it is what a first run and a deleted state
+    /// directory both look like.
+    fn read_notified(&self) -> StateRead {
+        StateRead::Absent
+    }
+
+    /// Replace the record of what has been announced with `contents`.
+    ///
+    /// Implementations MUST make the replacement atomic from a reader's point of view, for the
+    /// reason given on [`World::write_state`] — with one extra edge here: a half-written dedupe
+    /// record does not fail to parse, it parses as *fewer* announced conditions, which is a
+    /// storm rather than a silence and therefore looks like the tool working hard.
+    ///
+    /// The **default refuses**, rather than reporting a write that did not happen. A run whose
+    /// record was not stored will re-announce next run — the safe direction — but the caller has
+    /// to be able to say so, because the alternative is a monitor that appears to storm every
+    /// run for no reason anybody can see.
+    fn write_notified(&self, _contents: &str) -> Result<(), String> {
+        Err(
+            "this World has no state store, so what was announced this run was not recorded"
+                .to_string(),
+        )
+    }
+
     /// Read the notification configuration.
     ///
     /// The **default returns no channels configured**, which is a legitimate state — a monitor

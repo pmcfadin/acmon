@@ -41,6 +41,15 @@ pub enum Tier {
 /// disagree about which file they mean.
 pub const STATE_FILE: &str = "state.json";
 
+/// The file the notification dedupe record lives in.
+///
+/// Named here, beside [`STATE_FILE`], for the same reason: the monitor that writes it and the
+/// reader that consults it must not be able to disagree about which file they mean. Its own
+/// artefact rather than a field of `state.json` because the two degrade independently — a
+/// `state.json` this build cannot understand must not also cost the dedupe record, which would
+/// turn one unreadable file into an alert storm.
+pub const NOTIFIED_FILE: &str = "notified.json";
+
 /// The environment variable that relocates the state **directory**.
 ///
 /// Distinct from `ACMON_STATE`, which names the pre-split memory *file*. Its job is to let a
@@ -317,6 +326,26 @@ impl StateStore {
                 path.display(),
                 e
             )),
+        }
+    }
+
+    /// Read a state artefact as text, in the three-outcome shape a reader has to act on.
+    ///
+    /// The same three outcomes [`crate::world::StateRead`] exists for, because collapsing any
+    /// two of them is how a state directory that cannot be read starts reading as a state
+    /// directory with nothing in it. Offered here so that the monitor and a test drive the same
+    /// code: a fake that reimplemented this read could pass while the real one was broken.
+    pub fn read_text(&self, name: &str) -> crate::world::StateRead {
+        match self.read_state(name) {
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(text) => crate::world::StateRead::Found(text),
+                Err(error) => crate::world::StateRead::Unreadable(format!(
+                    "{} is not valid UTF-8: {error}",
+                    self.paths.state_dir().join(name).display()
+                )),
+            },
+            Ok(None) => crate::world::StateRead::Absent,
+            Err(why) => crate::world::StateRead::Unreadable(why),
         }
     }
 

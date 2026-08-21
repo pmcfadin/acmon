@@ -104,15 +104,19 @@ pub struct RememberedSession {
     pub last_reading: Option<Reading>,
 }
 
-/// Everything carried between runs.
+/// The workspaces and sessions carried between runs.
+///
+/// **Not** what has been announced. Dedupe used to ride along in this file and now lives in its
+/// own — `notified.json` in the state directory — because the two have to be able to fail
+/// separately. A memory file this build cannot understand degrades to [`Memory::empty`], which
+/// costs a shorter at-risk list; if it took the dedupe record with it, the same unreadable file
+/// would also re-announce every notable condition on the machine. An `announcements` key left by
+/// a build that predates the split is ignored rather than fatal, and the run that ignores it says
+/// so through [`crate::notify::Rebuilt::NothingRecorded`] — one re-announcement, explained.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Memory {
     pub workspaces: Vec<RememberedWorkspace>,
     pub sessions: Vec<RememberedSession>,
-    /// What has been announced on earlier runs. Added in schema v1 with `#[serde(default)]`,
-    /// so that a state file written before this field existed still parses.
-    #[serde(default)]
-    pub announcements: crate::notify::AnnouncementRecord,
 }
 
 impl Memory {
@@ -266,7 +270,6 @@ pub fn remember(
     let Memory {
         workspaces: previous_workspaces,
         sessions: previous_sessions,
-        announcements,
     } = previous;
 
     let mut workspaces: Vec<RememberedWorkspace> = Vec::new();
@@ -342,7 +345,6 @@ pub fn remember(
     Memory {
         workspaces,
         sessions: remembered_sessions,
-        announcements,
     }
 }
 
@@ -356,7 +358,6 @@ pub fn forget(memory: Memory, now: SystemTime, retention: Duration) -> (Memory, 
     let Memory {
         workspaces,
         sessions,
-        announcements,
     } = memory;
 
     let mut kept = Vec::new();
@@ -383,7 +384,6 @@ pub fn forget(memory: Memory, now: SystemTime, retention: Duration) -> (Memory, 
         Memory {
             workspaces: kept,
             sessions,
-            announcements,
         },
         forgotten,
     )

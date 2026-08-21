@@ -7,6 +7,14 @@
 //! A workspace or session that leaves a notable state and later re-enters it announces again.
 //! An unchanged set of notable states does not re-announce — so a machine that stays waiting
 //! does not alert on every run.
+//!
+//! **The record is on disk, and the first pass after a start is not special.** Dedupe held only
+//! in memory dies with the process, and `launchd` `KeepAlive` makes restarts routine, so a
+//! resident monitor that restarted would re-announce every condition still true. The obvious fix
+//! — suppress the first pass after a start — stops the storm by also swallowing every real
+//! alert: a condition that *became* true while the monitor was down **is** a transition, and it
+//! is exactly the kind this tool exists to catch. So what suppresses an announcement here is
+//! always the record, never the pass number.
 
 use serde::{Deserialize, Serialize};
 
@@ -47,8 +55,9 @@ pub struct AnnouncedSession {
 
 /// What has been announced on earlier runs.
 ///
-/// Part of `Memory`, so it survives between runs and re-announcing rules can be enforced.
-/// Uses Vecs instead of HashMaps because HashMap with tuple keys doesn't serialize to JSON.
+/// Written to `notified.json` in the state directory, so it survives the process and the
+/// re-announcing rules can be enforced across a restart. Uses Vecs instead of HashMaps because
+/// HashMap with tuple keys doesn't serialize to JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AnnouncementRecord {
     /// Sessions that have been announced.
@@ -57,6 +66,126 @@ pub struct AnnouncementRecord {
     /// Workspaces that have been announced, with their paths and states.
     #[serde(default)]
     pub workspaces: Vec<(String, AnnouncedWorkspaceState)>,
+}
+
+impl AnnouncementRecord {
+    /// Nothing has been announced. What a first run starts from.
+    pub fn empty() -> Self {
+        AnnouncementRecord::default()
+    }
+
+    /// Whether anything at all is recorded as announced.
+    ///
+    /// An empty record suppresses nothing, which is why losing one costs a re-announcement
+    /// rather than a missed alert.
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty() && self.workspaces.is_empty()
+    }
+}
+
+/// The schema version written into `notified.json`.
+///
+/// Checked on read, and a version this build does not know is **not** guessed at — the same rule
+/// [`crate::memory::SCHEMA_VERSION`] follows, for a milder consequence: an unrecognised dedupe
+/// record costs one re-announcement of everything currently notable, where an unrecognised
+/// record silently reinterpreted could suppress a real alert forever.
+pub const NOTIFIED_SCHEMA_VERSION: u32 = 1;
+
+/// Why a run had to rebuild its dedupe record instead of carrying one forward.
+///
+/// Reported, never merely tolerated. Every arm has the same consequence — everything notable
+/// **now** is announced once — and a reader who is not told why has just watched their monitor
+/// storm for no stated reason, which is how a person learns to ignore alerts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rebuilt {
+    /// No `notified.json`. A first run on this machine, a deleted state directory, or the run
+    /// after an upgrade that moved the record out of the memory file.
+    NothingRecorded,
+    /// A `notified.json` is there and the filesystem would not hand it over.
+    Unreadable(String),
+    /// It was read and is not the shape this version writes. Carries the parser's complaint.
+    Unparsable(String),
+    /// It was written by a version of acmon whose dedupe schema this one does not know.
+    UnknownVersion { found: u32, understood: u32 },
+}
+
+impl std::fmt::Display for Rebuilt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Rebuilt::NothingRecorded => write!(
+                f,
+                "no record of what has already been announced was found, so this run started \
+                 with an empty one"
+            ),
+            Rebuilt::Unreadable(why) => {
+                write!(
+                    f,
+                    "the record of what has already been announced could not be read ({why})"
+                )
+            }
+            Rebuilt::Unparsable(why) => write!(
+                f,
+                "the record of what has already been announced could not be understood ({why})"
+            ),
+            Rebuilt::UnknownVersion { found, understood } => write!(
+                f,
+                "the record of what has already been announced is schema version {found}, and \
+                 this acmon understands {understood}"
+            ),
+        }
+    }
+}
+
+/// `notified.json` as it is stored: the version beside the data, never implied by its shape.
+#[derive(Debug, Serialize, Deserialize)]
+struct NotifiedFile {
+    version: u32,
+    #[serde(flatten)]
+    record: AnnouncementRecord,
+}
+
+/// Turn the dedupe record into the text of `notified.json`.
+///
+/// Pretty-printed, because a reader who is being told "this was already announced, so you got no
+/// alert" has to be able to check that claim by hand.
+pub fn serialise(record: &AnnouncementRecord) -> String {
+    let file = NotifiedFile {
+        version: NOTIFIED_SCHEMA_VERSION,
+        record: record.clone(),
+    };
+    // Cannot fail: every field is a string or an enum of unit variants. An `expect` rather than
+    // an empty file, because writing an empty record over a good one would silently re-announce
+    // everything on the next run with nothing to say why.
+    serde_json::to_string_pretty(&file).expect("the dedupe record is always serialisable")
+}
+
+/// Read `notified.json`, degrading to an empty record **with a stated reason**.
+///
+/// **Never partially applied.** Half a dedupe record is worse than none: the entries that
+/// survived would suppress their alerts while the ones that did not would fire, and nothing
+/// would say which had happened.
+pub fn parse(text: &str) -> (AnnouncementRecord, Option<Rebuilt>) {
+    let file: NotifiedFile = match serde_json::from_str(text) {
+        Ok(file) => file,
+        Err(error) => {
+            return (
+                AnnouncementRecord::empty(),
+                Some(Rebuilt::Unparsable(error.to_string())),
+            )
+        }
+    };
+
+    if file.version != NOTIFIED_SCHEMA_VERSION {
+        return (
+            AnnouncementRecord::empty(),
+            Some(Rebuilt::UnknownVersion {
+                found: file.version,
+                understood: NOTIFIED_SCHEMA_VERSION,
+            }),
+        );
+    }
+
+    (file.record, None)
 }
 
 /// One notable thing to announce.

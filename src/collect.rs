@@ -240,6 +240,8 @@ pub struct Remembered {
     pub notify_health: NotifyHealth,
     /// What detector configuration was active this run.
     pub detector_config: crate::world::DetectorConfig,
+    /// What this run knew had already been announced, and what it left recorded.
+    pub notified: Notified,
 }
 
 impl Remembered {
@@ -253,6 +255,46 @@ impl Remembered {
             retention: crate::memory::DEFAULT_FORGET,
             notify_health: NotifyHealth::none(),
             detector_config: crate::world::DetectorConfig::embedded_only(),
+            notified: Notified::none(),
+        }
+    }
+}
+
+/// The dedupe record as one run found it and left it.
+///
+/// Its own value rather than three fields on [`Remembered`], because the three only mean anything
+/// together: a record with two entries in it says nothing until you know whether it was carried
+/// from disk or rebuilt from nothing this pass, and whether the run managed to store it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notified {
+    /// What is recorded as announced after this run — what the **next** run will not re-announce.
+    ///
+    /// Contains only conditions that are notable now *and* actually reached a channel. An alert
+    /// that failed or was never attempted appears nowhere in here, so it is neither recorded as
+    /// sent nor recorded as deduped.
+    pub record: crate::notify::AnnouncementRecord,
+    /// Why the record had to be rebuilt rather than carried forward, when it did.
+    ///
+    /// `None` is the ordinary case: the record was read from `notified.json` and honoured. A
+    /// `Some` is the one condition under which a run legitimately re-announces conditions that
+    /// have not changed, and it must be reported — otherwise the monitor appears to storm for no
+    /// reason, which is precisely how a reader is trained to ignore it.
+    pub rebuilt: Option<crate::notify::Rebuilt>,
+    /// Whether the record was stored for the next run.
+    ///
+    /// An `Err` has to be surfaced. The failure is in the safe direction — an unrecorded alert is
+    /// re-announced rather than lost — but a run that keeps re-announcing the same condition with
+    /// nothing to explain why is indistinguishable from a broken dedupe rule.
+    pub persisted: Result<(), String>,
+}
+
+impl Notified {
+    /// A run that neither read nor wrote a dedupe record. What a fixture starts from.
+    pub fn none() -> Self {
+        Notified {
+            record: crate::notify::AnnouncementRecord::empty(),
+            rebuilt: None,
+            persisted: Ok(()),
         }
     }
 }
@@ -1133,9 +1175,15 @@ pub fn collect(
 
     // --- Notifications ---
     //
-    // Decided based on this run's observations and what was announced before. Delivery is
-    // verified: only outcomes that actually succeeded update the announcement record, so an
-    // undelivered alert is re-announced on the following run.
+    // Decided based on this run's observations and what was announced before — where "before"
+    // comes off disk, so a restart does not re-announce a condition that has not changed. What it
+    // pointedly does NOT come from is the pass number. Suppressing the first pass after a start
+    // would stop the storm and swallow every real alert with it: a `DIRTY-STRANDED` workspace
+    // created while the monitor was down IS a transition into a notable state, and it is the
+    // exact kind this tool exists to catch.
+    //
+    // Delivery is verified: only outcomes that actually succeeded update the announcement record,
+    // so an undelivered alert is re-announced on the following run.
     //
     // Each channel is asked **once for the whole run** rather than once per alert. A steady
     // state of fourteen at-risk workspaces used to be fourteen sequential requests at up to
@@ -1143,11 +1191,9 @@ pub fn collect(
     // notable fires at once — is the worst case of that. What the channel does with the batch
     // is its business; what it owes back is one verified outcome per alert, in order.
     let config = world.read_notify_config();
-    let (announcements, updated_announcements) = notify::decide(
-        &sessions,
-        &workspaces,
-        &memory_after_forgetting.announcements,
-    );
+    let (previously_announced, rebuilt) = read_notified(world);
+    let (announcements, updated_announcements) =
+        notify::decide(&sessions, &workspaces, &previously_announced);
 
     let payloads: Vec<String> = announcements.iter().map(|a| a.payload()).collect();
 
@@ -1241,11 +1287,13 @@ pub fn collect(
         }
     }
 
-    // Only update the announcement record with what actually got delivered.
-    let mut memory_with_announcements = memory_after_forgetting;
-    memory_with_announcements.announcements = successfully_announced;
+    // Only what actually got delivered is recorded, and it is recorded in its own file. Written
+    // even when nothing was announced: a record that still names a condition which has since
+    // cleared would suppress the alert when that condition returns, so retiring entries is as
+    // much a part of the write as adding them.
+    let notified_persisted = world.write_notified(&notify::serialise(&successfully_announced));
 
-    let persisted = world.write_state(&memory::serialise(&memory_with_announcements));
+    let persisted = world.write_state(&memory::serialise(&memory_after_forgetting));
 
     Ok(Snapshot {
         taken_at: now,
@@ -1254,7 +1302,7 @@ pub fn collect(
         unlocated,
         sweep_complete: sweep.complete,
         remembered: Remembered {
-            memory: memory_with_announcements,
+            memory: memory_after_forgetting,
             unusable,
             persisted,
             forgotten,
@@ -1275,6 +1323,31 @@ pub fn collect(
                     + remote_report.as_ref().map(|r| r.cost).unwrap_or_default(),
             },
             detector_config,
+            notified: Notified {
+                record: successfully_announced,
+                rebuilt,
+                persisted: notified_persisted,
+            },
         },
     })
+}
+
+/// Read the dedupe record, turning every way it can be missing into a stated reason.
+///
+/// Never a bare empty record. All four outcomes produce the same behaviour — everything notable
+/// now is announced once — and only the reason distinguishes an ordinary first run from a state
+/// directory this build cannot read. Without it, a monitor that has lost the ability to dedupe at
+/// all looks exactly like one that is working and simply had a lot to say.
+fn read_notified(world: &dyn World) -> (notify::AnnouncementRecord, Option<notify::Rebuilt>) {
+    match world.read_notified() {
+        StateRead::Found(text) => notify::parse(&text),
+        StateRead::Absent => (
+            notify::AnnouncementRecord::empty(),
+            Some(notify::Rebuilt::NothingRecorded),
+        ),
+        StateRead::Unreadable(why) => (
+            notify::AnnouncementRecord::empty(),
+            Some(notify::Rebuilt::Unreadable(why)),
+        ),
+    }
 }

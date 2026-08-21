@@ -127,6 +127,14 @@ pub struct RealWorld {
     /// developer's own `~/.acmon/state.json`, and a test suite that quietly overwrites the
     /// history the tool depends on is worse than one that skips the case.
     state_file: Result<std::path::PathBuf, String>,
+    /// Where the state **directory** is, or why that could not be worked out.
+    ///
+    /// The #25 split's directory, holding `notified.json` and the artefacts that follow it —
+    /// distinct from `state_file` above, which is the pre-split memory file and still lives at
+    /// its old path. A field for the same reason: a test must be able to point it somewhere
+    /// harmless, and a suite that re-announced against the developer's own dedupe record would
+    /// be a suite that alters what their monitor does next.
+    state_paths: Result<crate::state::Paths, String>,
     /// Where the notification configuration is kept, or why that could not be worked out.
     ///
     /// Resolved once at construction for the same reason as `state_file`.
@@ -151,6 +159,7 @@ impl RealWorld {
             observer_pid: std::process::id() as i32,
             timebase: read_timebase(),
             state_file: state_path(),
+            state_paths: crate::state::Paths::from_environment(),
             notify_config_file: notify_config_path(),
             detectors_file: detectors_path(),
             notify_request_budget: crate::deliver::REQUEST_BUDGET,
@@ -161,6 +170,22 @@ impl RealWorld {
     pub fn with_state_file(path: impl Into<std::path::PathBuf>) -> Self {
         RealWorld {
             state_file: Ok(path.into()),
+            ..RealWorld::new()
+        }
+    }
+
+    /// The same world, keeping the #25 state directory's artefacts under a named directory.
+    ///
+    /// A constructor rather than a test setting `ACMON_STATE_DIR`, because the environment is
+    /// process-wide: one test that relocated it would relocate it for every other test in the
+    /// same binary, including the ones running concurrently.
+    pub fn with_state_dir(directory: impl AsRef<std::path::Path>) -> Self {
+        RealWorld {
+            state_paths: crate::state::Paths::from_values(
+                None,
+                Some(&directory.as_ref().to_string_lossy()),
+                std::env::var("HOME").ok().as_deref(),
+            ),
             ..RealWorld::new()
         }
     }
@@ -1207,6 +1232,30 @@ impl World for RealWorld {
             let _ = std::fs::remove_file(&temporary);
             format!("could not store state in {}: {error}", path.display())
         })
+    }
+
+    fn read_notified(&self) -> StateRead {
+        match &self.state_paths {
+            // Not `Absent`. A state directory that could not be resolved has not told us that
+            // nothing was announced, and treating it as though it had would storm on every run
+            // while looking like an ordinary first pass.
+            Err(why) => StateRead::Unreadable(why.clone()),
+            Ok(paths) => {
+                crate::state::StateStore::new(paths.clone()).read_text(crate::state::NOTIFIED_FILE)
+            }
+        }
+    }
+
+    fn write_notified(&self, contents: &str) -> Result<(), String> {
+        let paths = self.state_paths.as_ref().map_err(String::clone)?;
+        // The same write-temp-then-rename the rest of the state directory uses, and the same
+        // create-if-missing: deleting the state directory has to be a safe recovery step, which
+        // means the next run recreates it rather than failing until someone makes it by hand.
+        crate::state::StateStore::new(paths.clone()).write_state(
+            crate::state::NOTIFIED_FILE,
+            contents.as_bytes(),
+            std::process::id(),
+        )
     }
 
     fn read_notify_config(&self) -> NotifyConfig {
