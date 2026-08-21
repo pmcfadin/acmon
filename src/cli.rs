@@ -88,9 +88,7 @@ impl AmonVerb {
                 built: "the single-writer lock, #26",
                 tracked_as: "#27",
             },
-            AmonVerb::Install | AmonVerb::Uninstall | AmonVerb::Status => {
-                VerbState::Planned { tracked_as: "#11" }
-            }
+            AmonVerb::Install | AmonVerb::Uninstall | AmonVerb::Status => VerbState::Available,
             AmonVerb::Probe | AmonVerb::Report => VerbState::Planned { tracked_as: "v2" },
         }
     }
@@ -233,6 +231,20 @@ pub fn amon_usage() -> String {
          \x20                 is two writers regardless of intent, so a second `amon watch`\n\
          \x20                 is refused here too. `amon status` and the log are how you\n\
          \x20                 watch the resident one work.\n\
+         \n\
+         WHAT IT WRITES, AND WHERE\n\
+         \x20   Config     ~/.config/acmon/          detectors.toml, notify.toml\n\
+         \x20   State      ~/.local/state/acmon/     state.json, notified.json, amon.log\n\
+         \x20   LaunchAgent\n\
+         \x20              ~/Library/LaunchAgents/io.github.pmcfadin.acmon.plist\n\
+         \n\
+         \x20   That plist is the ONLY file this tool writes outside those two directories,\n\
+         \x20   and `amon install` is the only thing that writes it. It says the path before\n\
+         \x20   creating it, verifies with launchd that the job actually loaded, and undoes\n\
+         \x20   its own plist if it did not — a plist with no job is a machine that is\n\
+         \x20   unmonitored today and monitored after the next login, with nothing on disk to\n\
+         \x20   say which. `amon uninstall` unloads the job and removes the file.\n\
+         \x20   No `sudo`: a per-user LaunchAgent needs none.\n\
          \n\
          The display is a separate binary, `agtop`. If it measures, it is amon; if it draws,\n\
          it is agtop.\n",

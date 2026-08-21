@@ -6,6 +6,7 @@ pub mod deliver;
 pub mod detect;
 pub mod display;
 mod isotime;
+pub mod launchd;
 pub mod liveness;
 pub mod lock;
 pub mod machtime;

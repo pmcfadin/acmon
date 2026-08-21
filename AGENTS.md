@@ -20,11 +20,19 @@ the table is what a short terminal drops. A terminal too short drops session row
 end and states how many are hidden; the at-risk panel and every warning under it are not
 candidates, and where the terminal cannot hold even those, the top line says the bottom is
 cut. One function decides what fits — `render::fit` — and the drawing obeys it.
-`amon` is a verb surface plus the single-writer lock:
+`amon` is the single-writer lock plus the LaunchAgent lifecycle:
 `amon watch` takes an exclusive `flock` in the state directory, publishes the writer pid,
-and a second instance is refused by name. Every verb still fails loudly rather than exiting
-zero having done nothing — `watch` included, because the collection loop the lock exists to
-guard is #27 — and `amon --help` names the ticket that will deliver each one.
+and a second instance is refused by name. `amon install`/`uninstall`/`status` are built —
+one per-user LaunchAgent at
+`~/Library/LaunchAgents/io.github.pmcfadin.acmon.plist`, which is the only file this tool
+writes outside `~/.config/acmon/` and `~/.local/state/acmon/`; the load is verified with
+launchd rather than assumed, and an install that could not be confirmed removes its own
+plist. **No test may write to the real `~/Library/LaunchAgents` or register a job with a
+real login session** — `ACMON_LAUNCH_AGENTS_DIR` relocates the directory and
+`ACMON_LAUNCHCTL` replaces `launchctl`, and any verb using the latter says so in its own
+output. `watch` still fails loudly rather than exiting zero having done nothing, because
+the collection loop the lock exists to guard is #27, and `amon --help` names the ticket
+that will deliver each unbuilt verb.
 
 **Ask GitHub which tickets are open and unblocked** — that is authoritative, and any list
 written here goes stale. Two carried-forward notes that GitHub would not tell you: #13

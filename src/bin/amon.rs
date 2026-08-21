@@ -12,8 +12,11 @@
 //! #27, so the run still ends non-zero.
 
 use std::process::ExitCode;
+use std::time::SystemTime;
 
 use acmon::cli::{amon_usage, parse_amon, AmonRequest, AmonVerb, VerbState};
+use acmon::launchd::{install, status, uninstall, Install, SystemLaunchctl, Uninstalled};
+use acmon::state::StateStore;
 use acmon::watch::{watch, WatchOptions, WatchStopped};
 
 fn main() -> ExitCode {
@@ -27,6 +30,21 @@ fn main() -> ExitCode {
             verb: AmonVerb::Watch,
             foreground,
         }) => run_watch(foreground),
+
+        Ok(AmonRequest::Verb {
+            verb: AmonVerb::Install,
+            ..
+        }) => run_install(),
+
+        Ok(AmonRequest::Verb {
+            verb: AmonVerb::Uninstall,
+            ..
+        }) => run_uninstall(),
+
+        Ok(AmonRequest::Verb {
+            verb: AmonVerb::Status,
+            ..
+        }) => run_status(),
 
         Ok(AmonRequest::Verb { verb, .. }) => match verb.state() {
             VerbState::Planned { tracked_as } => {
@@ -107,5 +125,116 @@ fn run_watch(foreground: bool) -> ExitCode {
             );
             ExitCode::FAILURE
         }
+    }
+}
+
+/// What the three LaunchAgent verbs need: where the plist goes, and how launchd is reached.
+///
+/// Resolved once, and reported as a failure rather than guessed at. A LaunchAgents directory
+/// chosen because it was probably right is a job nobody can find again.
+fn launchd_request(verb: &str) -> Result<(Install, SystemLaunchctl), ExitCode> {
+    match Install::from_environment() {
+        Ok(request) => Ok((request, SystemLaunchctl::from_environment())),
+        Err(reason) => {
+            eprintln!("amon: {verb} cannot run: {reason}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// `amon install`: write the LaunchAgent, load it, and verify the load with launchd.
+///
+/// Exits non-zero unless launchd confirms the job. Reporting success on a job that never loaded
+/// is the exact failure this verb exists to prevent — the machine would be unmonitored and
+/// nothing on it would say so.
+fn run_install() -> ExitCode {
+    let (request, launchctl) = match launchd_request("install") {
+        Ok(resolved) => resolved,
+        Err(code) => return code,
+    };
+
+    let mut notice = |line: &str| eprintln!("amon: install: {line}");
+    let outcome = install(&request, &launchctl, &mut notice);
+
+    if outcome.is_installed() {
+        eprintln!("amon: install: {}", outcome.message());
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "amon: install did not install anything: {}",
+            outcome.message()
+        );
+        ExitCode::FAILURE
+    }
+}
+
+/// `amon uninstall`: unload the job and remove the plist, verifying both.
+fn run_uninstall() -> ExitCode {
+    let (request, launchctl) = match launchd_request("uninstall") {
+        Ok(resolved) => resolved,
+        Err(code) => return code,
+    };
+
+    let mut notice = |line: &str| eprintln!("amon: uninstall: {line}");
+    let outcome = uninstall(&request, &launchctl, &mut notice);
+
+    if outcome.succeeded() {
+        eprintln!("amon: uninstall: {}", outcome.message());
+        // "There was nothing to remove" is a success, because the state this verb exists to
+        // reach holds and was checked rather than assumed. It is still said out loud, so nobody
+        // reads a zero as "the job you thought was installed has been removed".
+        if matches!(outcome, Uninstalled::NothingToRemove { .. }) {
+            eprintln!(
+                "amon: uninstall: nothing was installed here, so nothing changed on this machine"
+            );
+        }
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("amon: uninstall did not finish: {}", outcome.message());
+        ExitCode::FAILURE
+    }
+}
+
+/// `amon status`: whether the job is loaded, whether a process is running, and the age of the
+/// last write.
+///
+/// The report goes to stdout, because a reader wants whatever could be determined. The exit code
+/// says whether all three questions were *answered* — not whether the answers were good news. A
+/// monitor that is switched off is a determinate answer, and conflating it with a question
+/// nobody could answer would destroy the distinction this verb exists to draw.
+fn run_status() -> ExitCode {
+    let (request, launchctl) = match launchd_request("status") {
+        Ok(resolved) => resolved,
+        Err(code) => return code,
+    };
+
+    let paths = match acmon::state::Paths::from_environment() {
+        Ok(paths) => paths,
+        Err(reason) => {
+            eprintln!("amon: status cannot run: {reason}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let store = StateStore::new(paths);
+
+    let report = status(&request, &launchctl, &store, SystemTime::now(), &|pid| {
+        acmon::real_world::process_exists(pid as libc::pid_t)
+    });
+
+    for line in report.lines() {
+        println!("{line}");
+    }
+
+    if report.complete() {
+        ExitCode::SUCCESS
+    } else {
+        for missing in report.unanswered() {
+            eprintln!("amon: status could not determine {missing}");
+        }
+        eprintln!(
+            "amon: status is incomplete, so it is failing rather than letting an unanswered \
+             question read as a negative answer"
+        );
+        ExitCode::FAILURE
     }
 }

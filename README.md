@@ -37,6 +37,29 @@ its own death, so detection has to live outside the sessions being watched. At t
 time of writing, 12 of 34 git workspaces on this machine held uncommitted changes
 while only 2 had a live session.
 
+## What it writes, and where
+
+`amon install` writes and loads a per-user LaunchAgent, so alerts fire when no terminal is
+open. It states the path before creating it, asks launchd afterwards whether the job
+actually loaded, and removes its own plist if it did not — a plist with no job leaves a
+machine unmonitored today and monitored after the next login, with nothing on disk to say
+which. `amon uninstall` unloads the job and removes the file; `amon status` reports whether
+the job is loaded, whether a process is running, and how old the last state write is. No
+`sudo`, ever: a per-user LaunchAgent needs none.
+
+| Path | What it holds |
+| --- | --- |
+| `~/.config/acmon/` | Config: `detectors.toml`, `notify.toml`. Yours to keep in dotfiles. |
+| `~/.local/state/acmon/` | Mutable state: `state.json`, `notified.json`, `amon.log`. Deleting it loses history and nothing else. |
+| `~/Library/LaunchAgents/io.github.pmcfadin.acmon.plist` | The LaunchAgent. |
+
+**That plist is the only file this tool writes outside those two directories**, and `amon
+install` is the only thing that writes it. launchd's `KeepAlive` is the whole supervision
+story — there is deliberately no second process watching the first, because a watchdog can
+die just as quietly and then there are two silent failures instead of one. Gaps are made
+visible instead: `amon status` reports launchd's own run count and last exit code, so a
+monitor that keeps restarting is readable rather than invisible.
+
 ## Documents
 
 | Document | What it is |
@@ -99,9 +122,13 @@ absent cost is not a small one. It is read-only in fact: it writes no state and 
 notification, and with nothing published it says on screen that nothing is being recorded
 or alerted. `amon` is a verb surface plus its single-writer lock: `amon watch`
 takes an exclusive lock in the state directory, publishes which pid holds the writer role,
-and refuses to start when another instance already holds it — naming that pid. The tiered
-collection loop it would guard is not built, so every verb, `watch` included, still reports
-what is missing and exits non-zero rather than exiting zero having done nothing.
+and refuses to start when another instance already holds it — naming that pid. Its three
+LaunchAgent verbs work: `amon install` writes and loads the plist and verifies the load with
+launchd, `amon uninstall` unloads and removes it, and `amon status` answers the three
+questions above or says which one it could not. The tiered collection loop the job would run
+is not built, so `amon watch` still reports what is missing and exits non-zero rather than
+exiting zero having done nothing — and `amon install` says so before you install a job that
+launchd will restart every ten seconds.
 
 The one assumption still unverified is whether an interactive session emits a direct
 "blocked waiting on a human" signal.

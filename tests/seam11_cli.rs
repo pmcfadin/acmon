@@ -209,6 +209,31 @@ fn the_usage_text_says_the_foreground_flag_is_still_subject_to_the_lock() {
     );
 }
 
+#[test]
+fn the_usage_text_names_the_launch_agent_as_the_only_file_written_outside_our_own_directories() {
+    // F24 requires this to be *documented*, not merely true, and help is where somebody about to
+    // run `amon install` is standing. The claim is specific enough to be checkable: two
+    // directories this tool owns, one plist outside them, and no `sudo` anywhere.
+    let usage = acmon::cli::amon_usage();
+
+    for expected in [
+        "~/.config/acmon/",
+        "~/.local/state/acmon/",
+        "~/Library/LaunchAgents/",
+        acmon::launchd::LABEL,
+        "sudo",
+    ] {
+        assert!(
+            usage.contains(expected),
+            "help must name {expected} where an installer would read it:\n{usage}"
+        );
+    }
+    assert!(
+        usage.to_lowercase().contains("only file"),
+        "and it must say that the plist is the only file written outside them:\n{usage}"
+    );
+}
+
 // --- Parsing: the display's surface ---
 
 #[test]
