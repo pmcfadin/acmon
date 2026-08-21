@@ -6,8 +6,11 @@
 //! [`screen_to_lines`]. One drawing pass, so a rendering that has never been looked at by a
 //! human is still the rendering that was asserted on.
 //!
-//! What is decided elsewhere: everything about *what* to draw, in [`crate::display`]. What is
-//! decided here is only how it is said.
+//! What is decided elsewhere: everything about *what* to draw, in [`crate::display`] — which
+//! includes the order rows go in, because that is a statement about cost rather than about
+//! typography. What is decided here is how it is said, and how much of it fits: [`fit`] settles
+//! what a terminal too short for the whole screen gives up, and the drawing obeys it rather than
+//! deciding again.
 
 use std::time::Duration;
 
@@ -17,6 +20,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
 
 use crate::collect::{Identity, LivenessUnknown, Persistence, Session, Snapshot, WorkspaceReport};
+use crate::display::{Meters, Screen};
 use crate::notify::Rebuilt;
 use crate::vcs::{Unreadable, WorkspaceState};
 use crate::workspace::NamespaceResolution;
@@ -145,12 +149,11 @@ pub fn required_height(snapshot: &Snapshot, width: u16) -> u16 {
         return wrap_words(&too_narrow_message(width), width).len() as u16;
     }
     // Session table: top border + header row + one row per session + bottom border
-    let session_table_height = (snapshot.sessions.len() + 3) as u16;
+    let session_table_height = snapshot.sessions.len() as u16 + TABLE_CHROME;
 
     // At-risk panel: always present. Top border + title row + content rows + summary lines + bottom border.
     // The title row is a header inside the bordered block.
-    let (_, panel_rows, panel_summary) = at_risk_panel_content(snapshot, width);
-    let panel_height = 3 + panel_rows.len() as u16 + panel_summary.len() as u16;
+    let panel_height = panel_height(snapshot, width);
 
     // Footer caveats
     let footer_height = footer_lines(snapshot, width).len() as u16;
@@ -206,9 +209,35 @@ fn footer_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
         }
     }
 
+    lines.extend(order_lines(snapshot, width));
     lines.extend(unknown_state_lines(snapshot, width));
     lines.extend(memory_lines(snapshot, width));
     lines
+}
+
+/// What has to be said about the order the rows are in.
+///
+/// Only when a session has no child-CPU figure at all, because only then is the order not
+/// self-evident from the column it is drawn by: those rows sit above every measured one, and a
+/// reader seeing a reason where the largest total should be would otherwise reasonably conclude
+/// the table is ordered by something else.
+///
+/// The position is the whole point (NF10). An absent cost sorted low would rank a session as
+/// cheap on a figure nobody has — and the cheap end of the table is what a screen too short
+/// drops.
+fn order_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
+    let unmeasured = crate::display::sessions_without_a_cost(&snapshot.sessions);
+    if unmeasured == 0 {
+        return Vec::new();
+    }
+    wrap_words(
+        &format!(
+            "Rows are ordered by child CPU, descending. {unmeasured} session(s) have no \
+             child-CPU figure at all, so they are listed FIRST rather than last: an absent cost \
+             is not a small one, and the bottom of this table is what a terminal too short drops."
+        ),
+        width,
+    )
 }
 
 /// What has to be said about a state that could not be determined, one line per row.
@@ -717,16 +746,31 @@ fn too_narrow_message(width: u16) -> String {
     )
 }
 
-/// Draw a snapshot into a frame. The single source of truth for layout.
+/// Draw a snapshot into a frame, assuming it has [`required_height`] rows to draw into.
+///
+/// Every session it holds, so the caller has to have asked how tall that is. What a terminal
+/// shorter than that gives up is [`draw_screen`]'s, via [`fit`] — the display never reaches this
+/// entry point, and a second place deciding what fits is exactly what this ticket removed.
 pub fn draw(frame: &mut Frame, snapshot: &Snapshot) {
     draw_in(frame, snapshot, frame.area());
 }
 
-/// Draw a snapshot into part of a frame.
+/// Draw a snapshot into part of a frame, with every session in it.
 ///
 /// Separated from [`draw`] so the whole screen — meters, notices, then this — is one drawing
 /// pass rather than two that could disagree about how much room they have.
 pub fn draw_in(frame: &mut Frame, snapshot: &Snapshot, area: ratatui::layout::Rect) {
+    draw_body(
+        frame,
+        snapshot,
+        &Fit::everything(snapshot.sessions.len()),
+        area,
+    );
+}
+
+/// Draw the figures: the session table cut to what [`fit`] allowed, then the panel, then the
+/// caveats.
+fn draw_body(frame: &mut Frame, snapshot: &Snapshot, fit: &Fit, area: ratatui::layout::Rect) {
     if area.width < minimum_width() {
         let message = wrap_words(&too_narrow_message(area.width), area.width).join("\n");
         frame.render_widget(Paragraph::new(message), area);
@@ -735,40 +779,62 @@ pub fn draw_in(frame: &mut Frame, snapshot: &Snapshot, area: ratatui::layout::Re
 
     // Build the at-risk panel content
     let (panel_title, panel_rows, panel_summary) = at_risk_panel_content(snapshot, area.width);
-    let panel_height = 3 + panel_rows.len() as u16 + panel_summary.len() as u16;
+    let panel_height = PANEL_CHROME + panel_rows.len() as u16 + panel_summary.len() as u16;
 
     let caveats = footer_lines(snapshot, area.width);
-    let [table_area, panel_area, caveat_area] = Layout::vertical([
-        Constraint::Min(3),
+    // Every region is exactly the height its content needs, and the slack sits at the bottom.
+    // A region that absorbed the slack instead would grow or shrink with the terminal, and what
+    // fits would then be decided here as well as in `fit`.
+    let table_height = if fit.table {
+        TABLE_CHROME + fit.shown as u16
+    } else {
+        0
+    };
+    let [table_area, panel_area, caveat_area, _slack] = Layout::vertical([
+        Constraint::Length(table_height),
         Constraint::Length(panel_height),
         Constraint::Length(caveats.len() as u16),
+        Constraint::Min(0),
     ])
     .areas(area);
 
-    // Render session table
-    let title = format!(" acmon — {} agent session(s) ", snapshot.sessions.len());
-    let workspace_width = workspace_width(area.width);
-    let rows: Vec<Row> = snapshot
-        .sessions
-        .iter()
-        .map(|session| row_for(session, workspace_width))
-        .collect();
+    // Render session table, costliest session first (F55).
+    if fit.table {
+        let title = if fit.hidden > 0 {
+            format!(
+                " acmon — {} agent session(s), most child CPU first — {} shown ",
+                snapshot.sessions.len(),
+                fit.shown
+            )
+        } else {
+            format!(
+                " acmon — {} agent session(s), most child CPU first ",
+                snapshot.sessions.len()
+            )
+        };
+        let workspace_width = workspace_width(area.width);
+        let rows: Vec<Row> = crate::display::in_cost_order(&snapshot.sessions)
+            .into_iter()
+            .take(fit.shown)
+            .map(|session| row_for(session, workspace_width))
+            .collect();
 
-    let mut constraints: Vec<Constraint> = FIXED_COLUMNS
-        .iter()
-        .map(|(_, width)| Constraint::Length(*width))
-        .collect();
-    constraints.push(Constraint::Length(workspace_width));
+        let mut constraints: Vec<Constraint> = FIXED_COLUMNS
+            .iter()
+            .map(|(_, width)| Constraint::Length(*width))
+            .collect();
+        constraints.push(Constraint::Length(workspace_width));
 
-    let mut headers: Vec<&str> = FIXED_COLUMNS.iter().map(|(header, _)| *header).collect();
-    headers.push(WORKSPACE_HEADER);
+        let mut headers: Vec<&str> = FIXED_COLUMNS.iter().map(|(header, _)| *header).collect();
+        headers.push(WORKSPACE_HEADER);
 
-    let table = Table::new(rows, constraints)
-        .header(Row::new(headers))
-        .column_spacing(COLUMN_SPACING)
-        .block(Block::default().borders(Borders::ALL).title(title));
+        let table = Table::new(rows, constraints)
+            .header(Row::new(headers))
+            .column_spacing(COLUMN_SPACING)
+            .block(Block::default().borders(Borders::ALL).title(title));
 
-    frame.render_widget(table, table_area);
+        frame.render_widget(table, table_area);
+    }
 
     // Render at-risk panel
     let mut panel_content = panel_rows;
@@ -1005,29 +1071,207 @@ fn wrap_words(text: &str, width: u16) -> Vec<String> {
 
 // --- The whole screen: what it cost, what is wrong with it, and then the figures ---
 
-/// The meters, as one line.
+/// How much room a gauge's label gets. The width of the longest one, so the bars line up.
+const GAUGE_LABEL_WIDTH: usize = 19; // "collection overhead"
+/// How many cells a gauge's bar is drawn in.
+const GAUGE_BAR_WIDTH: usize = 10;
+/// The narrowest a gauge's figure may be printed in. A longer figure widens its own cell rather
+/// than being cut: no width may cost a digit.
+const GAUGE_FIGURE_WIDTH: usize = 8;
+/// A filled cell of a bar.
+const GAUGE_FILL: char = '|';
+/// What a bar is drawn with when there is no figure at all.
 ///
-/// A line rather than a row of gauges, and at the top rather than tucked under the table: the
-/// figures are first-class (F33), and turning them into `htop`'s header meters is #34's work.
+/// Not spaces. An empty bar is what a duty cycle of zero looks like — a monitor that is running
+/// and idle — and that is the one thing an absent figure never means.
+const GAUGE_ABSENT_FILL: char = '?';
+/// The last cell of a bar whose figure is past the end of its scale.
 ///
-/// A missing figure prints its reason where the number would be. Never `0%`, which is a monitor
-/// that is running and idle — the one thing a reader would most like to know and the one thing
-/// an absent duty cycle never means.
-pub fn meter_line(meters: &crate::display::Meters) -> String {
-    let overhead = match &meters.overhead {
-        Ok(cost) => format_cpu(cost),
-        Err(why) => why.to_string(),
-    };
-    let duty = match &meters.duty_cycle {
-        Ok(fraction) => format!("{:.1}%", fraction * 100.0),
-        Err(why) => why.to_string(),
-    };
-    format!("METERS  collection overhead: {overhead}  ·  amon duty cycle: {duty}")
+/// A bar silently pegged at full would report a collection that took two and a half times the
+/// refresh interval as one that exactly filled it.
+const GAUGE_PAST_SCALE: char = '>';
+/// What is printed where a gauge's figure would be when there is none.
+const GAUGE_ABSENT_FIGURE: &str = "absent";
+/// The gap between two gauges in the row.
+const GAUGE_SPACING: &str = "  ";
+
+/// What every bar in the row means, said once.
+///
+/// A gauge is a picture of a ratio, and a picture of a ratio whose denominator is unstated is
+/// not a measurement. Said on every screen rather than only when something is odd, because
+/// unlike a warning this is how to read the row at all.
+fn gauge_legend() -> String {
+    format!(
+        "Gauges: the overhead bar is a fraction of the {} refresh interval, the duty-cycle bar \
+         a fraction of wall time. A bar of {GAUGE_ABSENT_FILL} is no figure at all rather than \
+         a zero, and one ending {GAUGE_PAST_SCALE} is past the end of its scale.",
+        format_age(crate::display::POLL_INTERVAL),
+    )
 }
 
-/// Everything above the figures: the meters, then whatever has to be said about them.
-fn screen_header(screen: &crate::display::Screen, width: u16) -> Vec<String> {
-    let mut lines = wrap_words(&meter_line(&screen.meters), width);
+/// One meter in the row: what it is, and either its figure or why there is none.
+struct Gauge {
+    label: &'static str,
+    /// The figure as text and as a fraction of this gauge's scale, or the reason there is no
+    /// figure. Never a fraction standing in for an absent one.
+    reading: Result<(String, f64), String>,
+}
+
+/// The meters as gauges, in the order they are drawn.
+///
+/// A row rather than a sentence (decision 37): v2's machine-tax attribution — XProtect, Jamf,
+/// Gatekeeper, Zscaler — is a set of figures of exactly this shape, and it moves into this row
+/// rather than forcing a redesign of the top of the screen.
+fn gauges(meters: &Meters) -> Vec<Gauge> {
+    vec![
+        Gauge {
+            label: "collection overhead",
+            reading: match &meters.overhead {
+                Ok(cost) => Ok((
+                    format_cpu(cost),
+                    cost.as_secs_f64() / crate::display::POLL_INTERVAL.as_secs_f64(),
+                )),
+                Err(why) => Err(why.to_string()),
+            },
+        },
+        Gauge {
+            label: "amon duty cycle",
+            reading: match &meters.duty_cycle {
+                Ok(fraction) => Ok((format!("{:.1}%", fraction * 100.0), *fraction)),
+                Err(why) => Err(why.to_string()),
+            },
+        },
+    ]
+}
+
+/// A bar, at a fraction of its scale.
+fn bar_of(fraction: f64) -> String {
+    // A fraction that is not a number is not a fraction. Drawn as absent rather than as empty,
+    // for the same reason an absent figure is.
+    if !fraction.is_finite() {
+        return GAUGE_ABSENT_FILL.to_string().repeat(GAUGE_BAR_WIDTH);
+    }
+    if fraction > 1.0 {
+        let mut bar = GAUGE_FILL.to_string().repeat(GAUGE_BAR_WIDTH - 1);
+        bar.push(GAUGE_PAST_SCALE);
+        return bar;
+    }
+    let filled = (fraction.max(0.0) * GAUGE_BAR_WIDTH as f64).round() as usize;
+    // Anything above zero gets a cell. Rounding a small positive figure down to an empty bar
+    // would draw a measurement as the absence of one.
+    let filled = if fraction > 0.0 {
+        filled.clamp(1, GAUGE_BAR_WIDTH)
+    } else {
+        filled.min(GAUGE_BAR_WIDTH)
+    };
+    format!(
+        "{}{}",
+        GAUGE_FILL.to_string().repeat(filled),
+        " ".repeat(GAUGE_BAR_WIDTH - filled)
+    )
+}
+
+/// One gauge, as it appears in the row.
+fn gauge_cell(gauge: &Gauge) -> String {
+    let (bar, figure) = match &gauge.reading {
+        Ok((figure, fraction)) => (bar_of(*fraction), figure.clone()),
+        Err(_) => (
+            GAUGE_ABSENT_FILL.to_string().repeat(GAUGE_BAR_WIDTH),
+            GAUGE_ABSENT_FIGURE.to_string(),
+        ),
+    };
+    let figure_width = GAUGE_FIGURE_WIDTH.max(figure.chars().count());
+    format!(
+        "{:<label_width$}[{bar}{figure:>figure_width$}]",
+        gauge.label,
+        label_width = GAUGE_LABEL_WIDTH,
+    )
+}
+
+/// Pack cells onto as few lines as the width allows, in order.
+fn pack(cells: &[String], width: u16) -> Vec<String> {
+    let width = width.max(1) as usize;
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for cell in cells {
+        let needed = if line.is_empty() {
+            cell.chars().count()
+        } else {
+            line.chars().count() + GAUGE_SPACING.chars().count() + cell.chars().count()
+        };
+        if needed > width && !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push_str(GAUGE_SPACING);
+        }
+        line.push_str(cell);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// The meter row: what this tool costs, above the figures it produced.
+///
+/// First-class figures rather than a debug line (F33, G7): a resident process that cannot state
+/// its own duty cycle is exactly what this tool would flag on someone else's machine.
+///
+/// Plain lines, always — the same content full-screen and under `agtop --once` (F34), because
+/// the one-shot output is what makes the row assertable without a terminal.
+///
+/// Three things the row says besides the figures: the instant they were taken as of, so a gauge
+/// is not read as live; the scale each bar is drawn against; and, for a figure that is missing,
+/// the reason it is missing, in full and on its own line. A reason is a sentence and a cell is
+/// eight columns wide, so squeezing one into the other would truncate it — and the truncated
+/// reasons here all begin "no monitor".
+pub fn meter_row(meters: &Meters, width: u16) -> Vec<String> {
+    let gauges = gauges(meters);
+
+    // Stated as the instant it was read at, not as an age. Turning an instant into an age, and
+    // an age into a verdict about the monitor, is #30 — and half of that rule here would put
+    // two different freshness stories on one screen.
+    let mut lines = wrap_words(
+        &format!(
+            "METERS  as of {}",
+            crate::isotime::iso8601_from_unix_seconds(crate::isotime::unix_seconds(
+                meters.taken_at
+            ))
+        ),
+        width,
+    );
+
+    let cells: Vec<String> = gauges.iter().map(gauge_cell).collect();
+    if cells
+        .iter()
+        .all(|cell| cell.chars().count() <= width as usize)
+    {
+        lines.extend(pack(&cells, width));
+    } else {
+        // Narrower than one gauge. The figures are what matter, so they are printed as prose
+        // rather than as a bar that would run off the side of the terminal.
+        for gauge in &gauges {
+            let figure = match &gauge.reading {
+                Ok((figure, _)) => figure.clone(),
+                Err(_) => GAUGE_ABSENT_FIGURE.to_string(),
+            };
+            lines.extend(wrap_words(&format!("{}: {figure}", gauge.label), width));
+        }
+    }
+
+    for gauge in &gauges {
+        if let Err(why) = &gauge.reading {
+            lines.extend(wrap_words(&format!("  {}: {why}", gauge.label), width));
+        }
+    }
+    lines.extend(wrap_words(&gauge_legend(), width));
+    lines
+}
+
+/// Everything above the figures: the meter row, then whatever has to be said about them.
+fn screen_header(screen: &Screen, width: u16) -> Vec<String> {
+    let mut lines = meter_row(&screen.meters, width);
     for notice in &screen.notices {
         lines.extend(wrap_words(notice, width));
     }
@@ -1044,7 +1288,7 @@ fn no_facts_message(reason: &str) -> String {
 }
 
 /// How tall the whole screen needs to be to hold everything it has to say.
-pub fn screen_height(screen: &crate::display::Screen, width: u16) -> u16 {
+pub fn screen_height(screen: &Screen, width: u16) -> u16 {
     let header = screen_header(screen, width).len() as u16;
     let body = match &screen.facts {
         Ok(snapshot) => required_height(snapshot, width),
@@ -1053,23 +1297,191 @@ pub fn screen_height(screen: &crate::display::Screen, width: u16) -> u16 {
     header + body
 }
 
-/// Draw the whole screen: the meters, the notices, and then the figures or the reason there
-/// are none.
+// --- A terminal too short: what goes, and what says so ---------------------------------------
+
+/// What the height allowed: which session rows are drawn, and what has to be said about the
+/// rest.
+///
+/// Decided in one place, by [`fit`], and obeyed by the drawing below — the same rule that makes
+/// the footer caveats safe to draw. A height calculation and a drawing pass that each decided
+/// for themselves would clip a line without saying so, and a clipped warning is worse than no
+/// warning because the numbers above it then look unqualified.
+struct Fit {
+    /// Whether the session table is drawn at all.
+    table: bool,
+    /// How many session rows are drawn, costliest first.
+    shown: usize,
+    /// How many rows were dropped, cheapest first.
+    hidden: usize,
+    /// The lines that say so, wrapped. Empty when nothing was dropped.
+    notice: Vec<String>,
+}
+
+impl Fit {
+    /// Every row, and nothing to say.
+    fn everything(sessions: usize) -> Fit {
+        Fit {
+            table: true,
+            shown: sessions,
+            hidden: 0,
+            notice: Vec::new(),
+        }
+    }
+}
+
+/// What the session table costs before a single row is in it: two borders and the column
+/// headings.
+const TABLE_CHROME: u16 = 3;
+
+/// What the at-risk panel costs besides its rows: two borders and the blank line above its
+/// summary.
+const PANEL_CHROME: u16 = 3;
+
+fn panel_height(snapshot: &Snapshot, width: u16) -> u16 {
+    let (_, rows, summary) = at_risk_panel_content(snapshot, width);
+    PANEL_CHROME + rows.len() as u16 + summary.len() as u16
+}
+
+/// What has to be said when the terminal is shorter than the screen.
+///
+/// Never silent, and never at the bottom: the top of the screen is the one place a clip cannot
+/// reach, so the statement that something was dropped goes above everything it is about.
+fn shortfall_lines(
+    hidden: usize,
+    table_kept: bool,
+    bottom_cut: bool,
+    needs: u16,
+    has: u16,
+    width: u16,
+) -> Vec<String> {
+    let mut text = String::new();
+
+    // The worst news first, because on a screen this short the end of this very notice is what
+    // gets cut. A reader who sees one line of it has to see the line that matters.
+    if bottom_cut {
+        text.push_str(&format!(
+            "THIS TERMINAL IS TOO SHORT AND ITS BOTTOM IS CUT: the whole screen needs {needs} \
+             rows and this one has {has}, so the at-risk panel and the warnings under it are \
+             below the fold. Lengthen the terminal. "
+        ));
+    } else {
+        if hidden > 0 {
+            text.push_str(&format!("+{hidden} sessions not shown. "));
+        }
+        text.push_str(&format!(
+            "THIS TERMINAL IS TOO SHORT: the whole screen needs {needs} rows and this one has \
+             {has}. "
+        ));
+    }
+
+    if table_kept {
+        text.push_str(
+            "The session rows with the least child CPU were dropped, so the ones on screen are \
+             the costliest. ",
+        );
+    } else if hidden > 0 {
+        // Stated again here, because in the cut case above it is the sentence a clipped notice
+        // is most likely to lose, and a count nobody read is a silent cut.
+        text.push_str(&format!(
+            "+{hidden} sessions not shown: not one row fits, so the table is not drawn at all — \
+             column headings with nothing under them read as a machine with no agents on it. "
+        ));
+    } else {
+        text.push_str(
+            "There are no sessions to show, and the table's own headings do not fit either. ",
+        );
+    }
+
+    if !bottom_cut {
+        text.push_str(
+            "Nothing else was dropped: the at-risk panel is whole and every warning under it is \
+             still on screen.",
+        );
+    }
+    wrap_words(&text, width)
+}
+
+/// Decide what fits, once.
+///
+/// The session rows are the only elastic part of this screen, and they are dropped from the
+/// cheap end (F54). The at-risk panel is not a candidate — it is the highest-stakes thing on
+/// screen (F32) — and neither is the footer, which carries every warning about what was not
+/// announced and what could not be determined. A screen that quietly dropped one of those is
+/// the failure this project exists to remove.
+fn fit(screen: &Screen, snapshot: &Snapshot, width: u16, height: u16) -> Fit {
+    let total = snapshot.sessions.len();
+    let needs = screen_height(screen, width);
+    // A terminal too narrow for the numbers gets a refusal instead of a table, and there are no
+    // rows in a refusal to drop.
+    if height >= needs || width < minimum_width() {
+        return Fit::everything(total);
+    }
+
+    let fixed = screen_header(screen, width).len() as u16
+        + panel_height(snapshot, width)
+        + footer_lines(snapshot, width).len() as u16;
+
+    // The most rows that fit, costliest first.
+    for shown in (1..=total).rev() {
+        let hidden = total - shown;
+        let notice = shortfall_lines(hidden, true, false, needs, height, width);
+        if fixed + TABLE_CHROME + shown as u16 + notice.len() as u16 <= height {
+            return Fit {
+                table: true,
+                shown,
+                hidden,
+                notice,
+            };
+        }
+    }
+
+    // Not one row fits. The table goes with them, chrome included.
+    let notice = shortfall_lines(total, false, false, needs, height, width);
+    let notice = if fixed + notice.len() as u16 > height {
+        // Said, not discovered by the reader. The longer wording can only be reached from a
+        // screen that was already cut, so stating it cannot make the statement wrong.
+        shortfall_lines(total, false, true, needs, height, width)
+    } else {
+        notice
+    };
+    Fit {
+        table: false,
+        shown: 0,
+        hidden: total,
+        notice,
+    }
+}
+
+/// Draw the whole screen: what had to be dropped to fit it, the meters, the notices, and then
+/// the figures or the reason there are none.
 ///
 /// The one drawing entry point `agtop` uses, full-screen and one-shot alike. Two of them would
 /// be two screens that drift apart, and the one-shot output exists precisely so that what the
 /// full screen shows can be asserted on without a terminal.
-pub fn draw_screen(frame: &mut Frame, screen: &crate::display::Screen) {
+pub fn draw_screen(frame: &mut Frame, screen: &Screen) {
     let area = frame.area();
     let header = screen_header(screen, area.width);
+    // A screen with no figures has nothing elastic on it: its whole body is a stated refusal a
+    // few lines long, and there is no row in it to drop.
+    let fit = match &screen.facts {
+        Ok(snapshot) => fit(screen, snapshot, area.width, area.height),
+        Err(_) => Fit::everything(0),
+    };
 
-    let [header_area, body_area] =
-        Layout::vertical([Constraint::Length(header.len() as u16), Constraint::Min(0)]).areas(area);
+    let [notice_area, header_area, body_area] = Layout::vertical([
+        Constraint::Length(fit.notice.len() as u16),
+        Constraint::Length(header.len() as u16),
+        Constraint::Min(0),
+    ])
+    .areas(area);
 
+    if !fit.notice.is_empty() {
+        frame.render_widget(Paragraph::new(fit.notice.join("\n")), notice_area);
+    }
     frame.render_widget(Paragraph::new(header.join("\n")), header_area);
 
     match &screen.facts {
-        Ok(snapshot) => draw_in(frame, snapshot, body_area),
+        Ok(snapshot) => draw_body(frame, snapshot, &fit, body_area),
         Err(reason) => frame.render_widget(
             Paragraph::new(wrap_words(&no_facts_message(reason), body_area.width).join("\n")),
             body_area,
@@ -1082,7 +1494,7 @@ pub fn draw_screen(frame: &mut Frame, screen: &crate::display::Screen) {
 /// What `agtop --once` prints, and what the tests assert on. The one-shot mode is not a
 /// fallback: it is what keeps the renderer testable against a fixed buffer instead of a live
 /// terminal, and what keeps the output pipeable.
-pub fn screen_to_lines(screen: &crate::display::Screen, width: u16, height: u16) -> Vec<String> {
+pub fn screen_to_lines(screen: &Screen, width: u16, height: u16) -> Vec<String> {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("in-memory terminal");
     terminal
         .draw(|frame| draw_screen(frame, screen))

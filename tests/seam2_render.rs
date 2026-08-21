@@ -1807,3 +1807,115 @@ fn two_cli_ids_sharing_a_prefix_are_still_distinguishable_at_the_shortened_width
         "two distinct CLIs must not render identically"
     );
 }
+
+// --- The order the table draws its rows in ----------------------------------------------------
+
+/// The same session at a stated child-CPU cost.
+fn session_costing(pid: i32, children_cpu: Duration) -> Session {
+    Session {
+        identity: Identity::Process { pid },
+        cli: "claude".to_string(),
+        resources: Ok(Resources {
+            children_cpu: Ok(children_cpu),
+            ..measured_ledger()
+        }),
+        workspace: measured_workspace(),
+        last_reading: None,
+        liveness: active_verdict(),
+    }
+}
+
+/// The same session with the coarse reader's blind spot where its child CPU should be.
+fn session_with_no_child_cpu(pid: i32) -> Session {
+    Session {
+        resources: Ok(Resources {
+            children_cpu: Err(Unmeasured::NotReportedBy(ResourceSource::Ps)),
+            ..measured_ledger()
+        }),
+        ..session_costing(pid, Duration::ZERO)
+    }
+}
+
+fn snapshot_holding(sessions: Vec<Session>) -> Snapshot {
+    Snapshot {
+        sessions,
+        ..snapshot_of(&[])
+    }
+}
+
+/// Which line of the rendering a string is on.
+fn line_of(rendering: &str, needle: &str) -> usize {
+    rendering
+        .lines()
+        .position(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("{needle:?} is not in this rendering:\n{rendering}"))
+}
+
+#[test]
+fn the_table_puts_the_session_with_the_most_child_cpu_at_the_top() {
+    // F55. Pid order, which this table had, tells a reader nothing: the number the whole thesis
+    // rests on is child CPU — 32,317 s of it against 1,669 s of the agent's own — so the session
+    // actually costing the machine is the one at the top.
+    let rendering = rendered(
+        &snapshot_holding(vec![
+            session_costing(11, Duration::from_secs(19)),
+            session_costing(22, Duration::from_secs(32_317)),
+            session_costing(33, Duration::from_secs(600)),
+        ]),
+        wide(),
+    );
+
+    assert!(
+        line_of(&rendering, "8h58m") < line_of(&rendering, "10m00s"),
+        "got:\n{rendering}"
+    );
+    assert!(
+        line_of(&rendering, "10m00s") < line_of(&rendering, "19.0s"),
+        "got:\n{rendering}"
+    );
+}
+
+#[test]
+fn the_table_says_which_column_it_is_ordered_by() {
+    // A single fixed order is only usable if the reader knows what it is. There are no sort
+    // keybindings to discover it with, deliberately: that is asserted in seam 14, where the
+    // display's keys live.
+    let rendering = rendered(&snapshot_of(&[264]), wide());
+
+    assert!(
+        rendering.contains("most child CPU first"),
+        "got:\n{rendering}"
+    );
+}
+
+#[test]
+fn a_row_with_no_child_cpu_figure_is_drawn_above_every_row_that_has_one() {
+    // NF10 in the place it decides something: `ps` reports no child CPU at all, and an absent
+    // figure folded into zero would put this row at the bottom of the table — which is the end a
+    // terminal too short drops. The reason is printed in the cell, so a reader can see that the
+    // row was ordered by an absence rather than by a small number.
+    let snapshot = snapshot_holding(vec![
+        session_costing(11, Duration::from_secs(32_317)),
+        session_with_no_child_cpu(22),
+    ]);
+    let rendering = rendered(&snapshot, wide());
+
+    assert!(
+        line_of(&rendering, "ps-blind") < line_of(&rendering, "8h58m"),
+        "got:\n{rendering}"
+    );
+    let text = prose(&snapshot, wide());
+    assert!(
+        text.contains("listed FIRST rather than last"),
+        "and the screen states that this is where such a row goes; got:\n{text}"
+    );
+}
+
+#[test]
+fn nothing_is_said_about_the_order_when_every_row_has_a_figure_to_be_ordered_by() {
+    // A note printed on every run is furniture a reader stops seeing, and this one has to be
+    // read on the run where a row carries a reason instead of a total.
+    let rendering = rendered(&snapshot_of(&[264, 2880]), wide());
+
+    assert!(!rendering.contains("listed FIRST"), "got:\n{rendering}");
+}

@@ -11,15 +11,15 @@
 //!
 //! Two things it deliberately does not do:
 //!
-//! - It does not classify freshness. `FRESH`/`STALE`/`DEAD`/`ABSENT` and the age of each
-//!   tier's evidence are #30, which is larger and higher-stakes than anything here.
-//! - It does not lay the screen out. Sort order, the meter row proper, and what a screen too
-//!   short to hold everything drops are #34.
+//! One thing it deliberately does not do: it does not classify freshness. `FRESH`/`STALE`/
+//! `DEAD`/`ABSENT` and the age of each tier's evidence are #30, which is larger and
+//! higher-stakes than anything here. Every instant on this screen is stated as the instant it
+//! was read at, and nothing here turns one into a verdict about the monitor.
 
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::collect::{collect_as, Role};
+use crate::collect::{collect_as, Role, Session};
 use crate::liveness::Thresholds;
 use crate::state::{StateStore, STATE_FILE};
 use crate::{Snapshot, World};
@@ -166,6 +166,78 @@ pub fn read_state_file(store: &StateStore) -> StateReading {
     }
 }
 
+// --- What a session cost, and therefore where its row goes ---------------------------------
+
+/// What a session cost the machine, as far as it can be known.
+///
+/// Two arms, never one number. A session whose child CPU could not be read has no cost to
+/// compare with anything, and folding that into `0` would rank the least knowable session as
+/// the cheapest on screen — which is the position rows are dropped from when the terminal is
+/// too short (NF10, F54).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cost {
+    /// The child-CPU figure the row shows: read this run, or remembered from the last reading
+    /// taken before the process exited.
+    Measured(Duration),
+    /// No child-CPU figure at all, and why. Never a duration.
+    Unmeasurable(String),
+}
+
+/// What a session's row will show in its CHILD CPU column, as a cost.
+///
+/// The precedence is the row's precedence — a live reading, else a remembered one, else the
+/// reason there is neither. Sorting on anything else would order the table by a figure that is
+/// not the one printed in it, and the reader would have no way to see that.
+pub fn cost_of(session: &Session) -> Cost {
+    let from = |figure: &Result<Duration, crate::world::Unmeasured>| match figure {
+        Ok(cpu) => Cost::Measured(*cpu),
+        Err(why) => Cost::Unmeasurable(why.to_string()),
+    };
+    match (&session.resources, &session.last_reading) {
+        (Ok(resources), _) => from(&resources.children_cpu),
+        (Err(_), Some(reading)) => from(&reading.resources.children_cpu),
+        (Err(why), None) => Cost::Unmeasurable(why.to_string()),
+    }
+}
+
+/// The order rows are drawn in: the session costing the machine most, first.
+///
+/// Child CPU descending, because that is the quantity this project's thesis rests on — one
+/// session spent 1,669 s in its own process and 32,317 s in its children, and a table ordered
+/// by pid says nothing about which session is doing that (F55). Fixed, with no keys that change
+/// it: see [`command_for`], where the absence of sort keybindings is a requirement rather than
+/// an omission.
+///
+/// **Deterministic, including ties.** The sort is stable and the collection it is given is
+/// already ordered by identity, so two sessions with the same child CPU keep that order and the
+/// output reproduces run to run. A tie broken arbitrarily is a flaky test waiting to happen.
+///
+/// A session whose child CPU is unmeasurable sorts **above every measured one**, and that is
+/// the stated position NF10 asks for. It is not the top because such a session is important;
+/// it is the top because the bottom is where rows are dropped from, and an absent cost that
+/// sorted low would be a session quietly ranked as cheap by a figure nobody has.
+pub fn in_cost_order(sessions: &[Session]) -> Vec<&Session> {
+    let mut ordered: Vec<&Session> = sessions.iter().collect();
+    ordered.sort_by_key(|session| match cost_of(session) {
+        // Two keys, not one: the first separates the unmeasurable from the measured, so no
+        // duration can ever be compared against a stand-in for an absent one.
+        Cost::Unmeasurable(_) => (0u8, std::cmp::Reverse(Duration::ZERO)),
+        Cost::Measured(cpu) => (1u8, std::cmp::Reverse(cpu)),
+    });
+    ordered
+}
+
+/// How many of a snapshot's sessions have no child-CPU figure to be ordered by.
+///
+/// The screen states this rather than leaving the reader to work out why the top rows carry a
+/// reason where a total should be.
+pub fn sessions_without_a_cost(sessions: &[Session]) -> usize {
+    sessions
+        .iter()
+        .filter(|session| matches!(cost_of(session), Cost::Unmeasurable(_)))
+        .count()
+}
+
 /// Why a meter has no figure.
 ///
 /// Never a zero. A duty cycle of 0% is a monitor that is running and idle, which is the one
@@ -209,6 +281,13 @@ pub struct Meters {
     pub overhead: Result<Duration, Unmetered>,
     /// The monitor's duty cycle over its trailing window, as a fraction of 1.
     pub duty_cycle: Result<f64, Unmetered>,
+    /// The instant these figures were taken as of.
+    ///
+    /// Carried so the meter row can state its own evidence rather than implying the gauges are
+    /// current — a gauge is the easiest thing on a screen to read as live. Stated as an
+    /// instant, not turned into an age or a `STALE`/`DEAD` verdict: that is #30's, and doing
+    /// half of it here would put two different freshness rules on one screen.
+    pub taken_at: SystemTime,
 }
 
 impl Meters {
@@ -216,7 +295,11 @@ impl Meters {
     ///
     /// Its own overhead it measured, so that is a number. The monitor's duty cycle it cannot
     /// have, and which reason applies depends on what the state file turned out to be.
-    pub fn for_own_collection(reading: &StateReading, overhead: Duration) -> Meters {
+    pub fn for_own_collection(
+        reading: &StateReading,
+        overhead: Duration,
+        taken_at: SystemTime,
+    ) -> Meters {
         Meters {
             overhead: Ok(overhead),
             duty_cycle: Err(match reading {
@@ -224,6 +307,7 @@ impl Meters {
                 StateReading::Unrenderable { .. } => Unmetered::NotPublished { tracked_as: "#27" },
                 StateReading::Unusable(_) => Unmetered::Unreadable,
             }),
+            taken_at,
         }
     }
 }
@@ -288,7 +372,7 @@ impl Screen {
         Screen {
             notices,
             facts,
-            meters: Meters::for_own_collection(reading, overhead),
+            meters: Meters::for_own_collection(reading, overhead, taken_at),
         }
     }
 }
@@ -327,13 +411,14 @@ pub enum Command {
 /// (F55): interactive sorting would place this display inside `htop`'s interaction model, and
 /// a reader who feels they are in `htop` reaches for F9 — which N1 forbids this tool from ever
 /// honouring. There is nothing here that acts on a session, because there is nothing here that
-/// *can*.
+/// *can*. The single order [`in_cost_order`] draws is the answer to the question the tool
+/// exists to ask, so there is nothing for a sort key to buy either.
 pub fn command_for(event: &ratatui::crossterm::event::Event) -> Command {
     use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
     match event {
         // A redraw, not a relayout decision. `ratatui` re-measures the terminal on the next
-        // draw; what a screen too short for everything should drop is #34.
+        // draw, and the drawing code fits the table to whatever height it finds.
         Event::Resize(_, _) => Command::Redraw,
         Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => Command::Quit,

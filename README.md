@@ -89,10 +89,15 @@ Where a claim could not be verified, it says so.
 
 v1 in progress. `agtop` runs and is worth running: full screen by default, refreshing
 while it is open by polling the state file once a second, with `agtop --once` for one
-pass as plain lines. It draws a session table, an always-visible at-risk workspace panel,
-and its own collection overhead beside the figures. It is read-only in fact: it writes no
-state and sends no notification, and with nothing published it says on screen that nothing
-is being recorded or alerted. `amon` is a verb surface plus its single-writer lock: `amon watch`
+pass as plain lines. It draws a meter row of what this tool itself costs, a session table
+ordered by child CPU with the costliest session first, and an always-visible at-risk
+workspace panel. There are no sort keybindings, deliberately — a single correct order,
+and nothing that could be mistaken for a key that acts on a session. A terminal too short
+for everything drops session rows from the cheap end and states how many are not shown; a
+session whose child CPU could not be measured is listed first rather than last, because an
+absent cost is not a small one. It is read-only in fact: it writes no state and sends no
+notification, and with nothing published it says on screen that nothing is being recorded
+or alerted. `amon` is a verb surface plus its single-writer lock: `amon watch`
 takes an exclusive lock in the state directory, publishes which pid holds the writer role,
 and refuses to start when another instance already holds it — naming that pid. The tiered
 collection loop it would guard is not built, so every verb, `watch` included, still reports

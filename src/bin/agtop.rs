@@ -185,7 +185,8 @@ fn draw_until_told_to_stop(
         match wait_for_a_command(POLL_INTERVAL)? {
             Some(display::Command::Quit) => return Ok(()),
             // `ratatui` re-measures the terminal on the next draw, so a resize needs nothing
-            // but another pass. What a screen too short for everything should drop is #34.
+            // but another pass: the drawing code fits the session table to whatever height it
+            // finds, and says what it dropped to do so.
             Some(display::Command::Redraw) => redraw = true,
             Some(display::Command::Ignore) | None => {}
         }

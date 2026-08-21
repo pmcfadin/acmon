@@ -11,8 +11,15 @@ the alternate screen by default, refreshing while open by polling `state.json` o
 second and re-reading only on an mtime change, plus `agtop --once` for one pass as plain
 lines. It is read-only **in fact** — `collect` takes a role, and a display's collection
 writes no state and asks no notification channel anything. With nothing published it makes
-its own single collection (F28), states on screen that the figures are its own and that
-nothing is being recorded or alerted, and prints its collection overhead beside them.
+its own single collection (F28), and states on screen that the figures are its own and that
+nothing is being recorded or alerted. It is also laid out: a **meter row** of gauges above
+the table carrying collection overhead and `amon`'s duty cycle, session rows ordered by
+**child CPU descending** with no sort keybindings (deliberately — F55, N1), and a session
+whose child CPU is unmeasurable listed **first** rather than last, because the cheap end of
+the table is what a short terminal drops. A terminal too short drops session rows from that
+end and states how many are hidden; the at-risk panel and every warning under it are not
+candidates, and where the terminal cannot hold even those, the top line says the bottom is
+cut. One function decides what fits — `render::fit` — and the drawing obeys it.
 `amon` is a verb surface plus the single-writer lock:
 `amon watch` takes an exclusive `flock` in the state directory, publishes the writer pid,
 and a second instance is refused by name. Every verb still fails loudly rather than exiting
