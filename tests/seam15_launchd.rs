@@ -1188,8 +1188,14 @@ fn status_reports_the_durable_launch_record_rather_than_launchds_own_run_count()
         lines.contains("did not exit cleanly") && lines.contains("4242"),
         "and it names the monitor that died, which launchd's exit code cannot:\n{lines}"
     );
+    // Asserted against the sentence launchd's count is reported in, not against the number.
+    // `!lines.contains("37")` was the same claim and was flaky about once in three runs: the
+    // report prints an ISO 8601 timestamp, so any launch beginning at 37 minutes or 37 seconds
+    // past put "37" on screen with nothing to do with a run count. A substring that short is a
+    // coincidence waiting for a clock, and a test that fails by the hour teaches a reader to
+    // re-run rather than to look.
     assert!(
-        !lines.contains("37"),
+        !lines.contains("by launchd since this job was loaded"),
         "launchd's own run count must give way to the record rather than sit beside it as a \
          second answer:\n{lines}"
     );
@@ -1225,7 +1231,8 @@ fn status_falls_back_to_launchds_own_run_count_only_where_no_launch_record_exist
     let lines = report.lines().join("\n");
 
     assert!(
-        lines.contains("37") && lines.contains("all launchd itself can say"),
+        lines.contains("started 37 times by launchd")
+            && lines.contains("all launchd itself can say"),
         "with no record, launchd's count is the only evidence and is labelled as such:\n{lines}"
     );
     assert!(
