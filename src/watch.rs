@@ -45,6 +45,7 @@ use crate::schedule::{Budgets, Pace, Schedule, Tier, TIERS};
 use crate::starts::{self, Launch};
 use crate::state::{Paths, StateStore, TieredState, STATE_FILE};
 use crate::tiers::{self, Observed, Pass};
+use crate::world::World;
 use crate::RealWorld;
 
 /// How long `amon watch` runs before stopping cleanly, in milliseconds.
@@ -275,7 +276,18 @@ pub fn watch(options: &WatchOptions, notice: &mut dyn FnMut(&str)) -> WatchStopp
     listen_for_stop();
     STOP_REQUESTED.store(false, Ordering::SeqCst);
 
-    let world = RealWorld::with_state_dir(&state_dir);
+    // Built from the run's own resolved directories, not from the environment a second time. Two
+    // resolutions of the same question is how the state directory came to be relocated for the
+    // lock and the state file while the memory file stayed in `~/.acmon` (#36).
+    let world = RealWorld::with_paths(options.paths.clone());
+
+    // Said before the first collection, so that a run reading its history out of the pre-split
+    // `~/.acmon/` says so at the moment it decides to, rather than leaving a reader to infer it
+    // from a file that is suddenly somewhere else.
+    for line in world.path_notices() {
+        notice(&line);
+    }
+
     let outcome = run_loop(options, &world, &store, &mut state, &launch, notice);
 
     if let Err(reason) = lock.release() {

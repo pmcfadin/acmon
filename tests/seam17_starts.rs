@@ -893,9 +893,7 @@ fn amon(state_dir: &Path, arguments: &[&str], run_ms: Option<&str>) -> Child {
     command
         .args(arguments)
         .env(acmon::state::STATE_DIR_VARIABLE, state_dir)
-        // The pre-split memory file is still `~/.acmon/state.json`, so relocating the state
-        // directory alone would leave a running monitor writing the developer's own memory.
-        .env("ACMON_STATE", state_dir.join("legacy-memory.json"))
+        .env(acmon::state::CONFIG_DIR_VARIABLE, state_dir.join("config"))
         .env("ACMON_NOTIFY_CONFIG", state_dir.join("no-such-notify.toml"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

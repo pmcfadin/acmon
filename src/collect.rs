@@ -288,6 +288,13 @@ pub struct Remembered {
     pub detector_config: crate::world::DetectorConfig,
     /// What this run knew had already been announced, and what it left recorded.
     pub notified: Notified,
+    /// Where this run's own files were found, when that is worth saying.
+    ///
+    /// Empty on an ordinary run. Not empty when a file was read from the pre-split `~/.acmon/`
+    /// instead of the directory the #25 split puts it in, because a run that read the old file
+    /// and a run that found nothing produce the same screen otherwise — and one of those is a
+    /// machine with no remembered sessions. See [`World::path_notices`](crate::World::path_notices).
+    pub path_notices: Vec<String>,
 }
 
 impl Remembered {
@@ -302,6 +309,7 @@ impl Remembered {
             notify_health: NotifyHealth::none(),
             detector_config: crate::world::DetectorConfig::embedded_only(),
             notified: Notified::none(),
+            path_notices: Vec::new(),
         }
     }
 }
@@ -1453,6 +1461,7 @@ pub fn collect_as(
                 rebuilt,
                 persisted: notified_persisted,
             },
+            path_notices: world.path_notices(),
         },
     })
 }

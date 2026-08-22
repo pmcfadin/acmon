@@ -437,6 +437,23 @@ pub trait World {
         StateRead::Absent
     }
 
+    /// Anything that has to be said about **where** this world's own files were found.
+    ///
+    /// The reason this exists: `~/.config/acmon/` and `~/.local/state/acmon/` replaced a single
+    /// `~/.acmon/`, and a machine that ran the older build still has its history in the old
+    /// place. That history is read rather than ignored — starting from an empty memory because a
+    /// file moved would report a machine with no remembered sessions, and a shorter at-risk list
+    /// reads as a safer machine. Reading it is only half of not lying about it, though: a run
+    /// that read the pre-split file has to **say** it did, or "read the old one" and "started
+    /// from nothing" arrive on screen as the same run.
+    ///
+    /// Empty for the ordinary case, and only for the ordinary case. The **default is a World
+    /// with no files of its own**, which is what a fixture-driven fake is, and it has nothing to
+    /// say about where they came from.
+    fn path_notices(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Replace the stored state with `contents`.
     ///
     /// Implementations MUST make the replacement atomic from a reader's point of view: a

@@ -1210,12 +1210,9 @@ fn amon_watch_drives_every_tier_from_one_loop_and_publishes_what_each_one_cost()
         .arg("watch")
         .env(acmon::state::STATE_DIR_VARIABLE, &state_dir)
         .env(acmon::watch::RUN_VARIABLE, "26000")
+        .env(acmon::state::CONFIG_DIR_VARIABLE, state_dir.join("config"))
         // No notification configuration, so nothing is delivered anywhere by a test run.
         .env("ACMON_NOTIFY_CONFIG", state_dir.join("no-such-notify.toml"))
-        // And the pre-split memory file, which is still `~/.acmon/state.json` rather than an
-        // artefact of the state directory. Without this a test run would write the developer's own
-        // remembered workspaces — which is the thing seam 13 refuses to let any test do.
-        .env("ACMON_STATE", state_dir.join("legacy-memory.json"))
         .stdin(Stdio::null())
         .output()
         .expect("amon is built and runnable");

@@ -58,11 +58,7 @@ fn amon(state_dir: &Path, arguments: &[&str], run_ms: Option<&str>) -> Child {
     command
         .args(arguments)
         .env(acmon::state::STATE_DIR_VARIABLE, state_dir)
-        // The pre-split memory file is not inside the state directory yet — it is still
-        // `~/.acmon/state.json` — so relocating the state directory alone would leave a running
-        // monitor writing the developer's own memory. Redirected here for the same reason the
-        // `agtop` case below does it, and it comes out of the list there when that file moves.
-        .env("ACMON_STATE", state_dir.join("legacy-memory.json"))
+        .env(acmon::state::CONFIG_DIR_VARIABLE, state_dir.join("config"))
         .env("ACMON_NOTIFY_CONFIG", state_dir.join("no-such-notify.toml"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -553,7 +549,9 @@ fn agtop_takes_no_lock_and_leaves_the_state_directory_exactly_as_it_found_it() {
     // a named list is a list that a new state artefact is not on. That is not hypothetical: #29
     // put `notified.json` in this directory, `agtop` reached it through `collect`, and this test
     // stayed green while its own name said the display writes nothing. #10 made the display a
-    // reader, so the guarantee is now the strong one: nothing at all.
+    // reader, so the guarantee is now the strong one: nothing at all — and since #36 moved the
+    // memory file into this directory, "nothing at all" covers that file too, without this test
+    // having to name it.
     //
     // Run through `--once`, deliberately. A bare `agtop` takes the screen and refuses when
     // there is no terminal, which is every test harness — it would never reach a collection,
@@ -561,13 +559,12 @@ fn agtop_takes_no_lock_and_leaves_the_state_directory_exactly_as_it_found_it() {
     let state_dir = scratch("agtop-readonly");
     std::fs::create_dir_all(&state_dir).expect("create state directory");
 
-    let legacy = state_dir.join("legacy-memory.json");
     let absent_notify = state_dir.join("no-such-notify.toml");
 
     let output = Command::new(env!("CARGO_BIN_EXE_agtop"))
         .arg("--once")
         .env(acmon::state::STATE_DIR_VARIABLE, &state_dir)
-        .env("ACMON_STATE", &legacy)
+        .env(acmon::state::CONFIG_DIR_VARIABLE, state_dir.join("config"))
         .env("ACMON_NOTIFY_CONFIG", &absent_notify)
         .stdin(Stdio::null())
         .output()
@@ -590,11 +587,6 @@ fn agtop_takes_no_lock_and_leaves_the_state_directory_exactly_as_it_found_it() {
         "the display left {left_behind:?} in the monitor's state directory; it is read-only \
          (exit was {:?})",
         output.status
-    );
-    assert!(
-        !legacy.exists(),
-        "the display must not write the pre-split memory file either — a reader that writes \
-         anywhere is a second writer"
     );
 
     let _ = std::fs::remove_dir_all(&state_dir);

@@ -1015,7 +1015,17 @@ fn the_real_world_keeps_the_dedupe_record_in_the_state_directory_and_reads_it_ba
     // monitor writing its record somewhere the next run does not look would dedupe nothing while
     // every test above still passed.
     let state_dir = scratch_state("real-world");
-    let world = acmon::RealWorld::with_state_dir(&state_dir);
+    // Both directories named, so this world reaches nothing under the developer's home — not even
+    // the pre-split `~/.acmon/`, which naming either one takes out of play (#36).
+    let scratch_paths = || {
+        Paths::from_values(
+            Some(&state_dir.join("config").to_string_lossy()),
+            Some(&state_dir.to_string_lossy()),
+            None,
+        )
+        .expect("both directories were given explicitly")
+    };
+    let world = acmon::RealWorld::with_paths(scratch_paths());
 
     assert_eq!(
         world.read_notified(),
@@ -1034,7 +1044,7 @@ fn the_real_world_keeps_the_dedupe_record_in_the_state_directory_and_reads_it_ba
     );
 
     // A second RealWorld is a restart: it shares nothing with the first but the directory.
-    match acmon::RealWorld::with_state_dir(&state_dir).read_notified() {
+    match acmon::RealWorld::with_paths(scratch_paths()).read_notified() {
         StateRead::Found(text) => assert_eq!(
             acmon::notify::parse(&text),
             (record, None),

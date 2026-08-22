@@ -288,6 +288,14 @@ fn memory_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
     let mut lines = Vec::new();
     let remembered = &snapshot.remembered;
 
+    // Where the files came from, before anything about what was in them. A run that read its
+    // history out of the pre-split `~/.acmon/` says so here — not as a warning, because reading
+    // it is the correct thing to have done, but never silently either: silence would make it
+    // indistinguishable from a run that started from nothing.
+    for notice in &remembered.path_notices {
+        lines.extend(wrap_words(&format!("{notice}."), width));
+    }
+
     if let Some(unusable) = &remembered.unusable {
         lines.extend(wrap_words(
             &format!(

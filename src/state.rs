@@ -50,9 +50,31 @@ pub const STATE_FILE: &str = "state.json";
 /// turn one unreadable file into an alert storm.
 pub const NOTIFIED_FILE: &str = "notified.json";
 
+/// The file the workspaces and sessions carried between runs live in.
+///
+/// Not `state.json`: that name is taken, in this very directory, by the tiered file above. The
+/// memory file was called `state.json` while it lived alone in `~/.acmon/`, and moving it here
+/// under that name would have made one directory hold two different files with one name.
+pub const MEMORY_FILE: &str = "memory.json";
+
+/// The notification channel configuration, in the config directory.
+pub const NOTIFY_CONFIG_FILE: &str = "notify.toml";
+
+/// The user's detector overrides, in the config directory.
+pub const DETECTORS_FILE: &str = "detectors.toml";
+
+/// The one directory all of this lived in before #25 split config from state.
+///
+/// Named here rather than spelled out where it is consulted, because the whole point of naming
+/// it is that no new code should ever join it to a path again.
+pub const LEGACY_DIR: &str = ".acmon";
+
+/// What [`MEMORY_FILE`] was called in [`LEGACY_DIR`].
+pub const LEGACY_MEMORY_FILE: &str = "state.json";
+
 /// The environment variable that relocates the state **directory**.
 ///
-/// Distinct from `ACMON_STATE`, which names the pre-split memory *file*. Its job is to let a
+/// Distinct from `ACMON_STATE`, which names the memory *file* on its own. Its job is to let a
 /// test drive the real acquire-write-release path — lock included — against a temporary
 /// directory. A test that had to use the developer's own `~/.local/state/acmon/` would either
 /// destroy real history or be skipped, and a skipped test of a lock is how two writers ship.
@@ -70,6 +92,15 @@ pub const CONFIG_DIR_VARIABLE: &str = "ACMON_CONFIG_DIR";
 pub struct Paths {
     config: PathBuf,
     state: PathBuf,
+    /// The pre-split `~/.acmon`, and only when this run's directories are the machine's own.
+    ///
+    /// `None` the moment either directory is named explicitly, which is what makes
+    /// `ACMON_STATE_DIR` and `ACMON_CONFIG_DIR` enough to isolate a run: an isolated run has no
+    /// legacy directory to consult, so it cannot read one file out of the developer's home while
+    /// writing every other one into a scratch tree. A relocated run that still reached into
+    /// `~/.acmon` would be the worst of both — isolated enough to look safe in a test name, and
+    /// not isolated at all.
+    legacy: Option<PathBuf>,
 }
 
 impl Paths {
@@ -78,6 +109,7 @@ impl Paths {
         Paths {
             config: home.join(".config").join("acmon"),
             state: home.join(".local").join("state").join("acmon"),
+            legacy: Some(home.join(LEGACY_DIR)),
         }
     }
 
@@ -86,6 +118,10 @@ impl Paths {
         Paths {
             config: base.join("config"),
             state: base.join("state"),
+            // Both directories are named, so there is no home this could be under. A test that
+            // wants the pre-split directory in play builds a whole scratch home and resolves
+            // through [`Paths::from_values`], the way a real run does.
+            legacy: None,
         }
     }
 
@@ -128,9 +164,23 @@ impl Paths {
             },
         };
 
+        let named = |explicit: Option<&str>| {
+            explicit
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+        };
+        // The pre-split directory belongs to a run using this machine's own directories. Naming
+        // either one is a statement that this run's files live somewhere else entirely, and it is
+        // taken at its word.
+        let legacy = match (named(config_dir) || named(state_dir), home) {
+            (false, Some(home)) => Some(PathBuf::from(home).join(LEGACY_DIR)),
+            _ => None,
+        };
+
         Ok(Paths {
             config: resolve(config_dir, CONFIG_DIR_VARIABLE, &[".config", "acmon"])?,
             state: resolve(state_dir, STATE_DIR_VARIABLE, &[".local", "state", "acmon"])?,
+            legacy,
         })
     }
 
@@ -147,6 +197,185 @@ impl Paths {
     /// Split from config so that deleting this directory loses history and nothing else.
     pub fn state_dir(&self) -> &Path {
         &self.state
+    }
+
+    /// The pre-split `~/.acmon`, when this run is entitled to look at it at all.
+    ///
+    /// `None` for a run whose directories were named explicitly. See the field.
+    pub fn legacy_dir(&self) -> Option<&Path> {
+        self.legacy.as_deref()
+    }
+
+    /// Where this run reads and writes the workspaces and sessions carried between runs.
+    ///
+    /// `explicit` is `ACMON_STATE`, which still names the file outright when it is set.
+    pub fn locate_memory(&self, explicit: Option<&str>) -> Located {
+        self.locate(
+            "the remembered history",
+            "and everything written from here on is written there, so the history carries itself \
+             across without anything being moved",
+            self.state.join(MEMORY_FILE),
+            LEGACY_MEMORY_FILE,
+            explicit,
+            crate::real_world::STATE_VARIABLE,
+        )
+    }
+
+    /// Where this run reads its notification channel configuration.
+    ///
+    /// `explicit` is `ACMON_NOTIFY_CONFIG`.
+    pub fn locate_notify_config(&self, explicit: Option<&str>) -> Located {
+        self.locate(
+            "the notification configuration",
+            "and nothing writes it, so move it there yourself when you want it read from the \
+             split's own location",
+            self.config.join(NOTIFY_CONFIG_FILE),
+            NOTIFY_CONFIG_FILE,
+            explicit,
+            crate::real_world::NOTIFY_CONFIG_VARIABLE,
+        )
+    }
+
+    /// Where this run reads its detector overrides.
+    ///
+    /// `explicit` is `ACMON_DETECTORS`.
+    pub fn locate_detectors(&self, explicit: Option<&str>) -> Located {
+        self.locate(
+            "the detector configuration",
+            "and nothing writes it, so move it there yourself when you want it read from the \
+             split's own location",
+            self.config.join(DETECTORS_FILE),
+            DETECTORS_FILE,
+            explicit,
+            crate::real_world::DETECTORS_VARIABLE,
+        )
+    }
+
+    /// The one rule all three follow, so none of them can drift from the others.
+    ///
+    /// An explicit path wins outright. Otherwise the split's own location is used — unless it
+    /// holds no such file and the pre-split directory does, in which case the pre-split one is
+    /// **read** and said out loud. That last clause is the whole of this ticket: starting from an
+    /// empty memory because a file moved would report a machine with no remembered sessions,
+    /// which is a calm, plausible, wrong answer and is exactly what `AGENTS.md` forbids. Nothing
+    /// is moved or deleted to achieve it — a write always goes to `canonical`, so the first run
+    /// that writes carries the history across on its own and leaves the old file untouched behind
+    /// it, recoverable by anyone who wants it back.
+    fn locate(
+        &self,
+        what: &'static str,
+        then: &'static str,
+        canonical: PathBuf,
+        legacy_name: &str,
+        explicit: Option<&str>,
+        variable: &'static str,
+    ) -> Located {
+        if let Some(path) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+            return Located {
+                what,
+                then,
+                read: PathBuf::from(path),
+                canonical: PathBuf::from(path),
+                how: Found::Named(variable),
+            };
+        }
+
+        // Checked in this order deliberately: the split's location is authoritative the instant it
+        // exists, so a machine that has been carried forward once never looks back again.
+        if !canonical.exists() {
+            if let Some(legacy) = self.legacy.as_ref().map(|dir| dir.join(legacy_name)) {
+                if legacy.exists() {
+                    return Located {
+                        what,
+                        then,
+                        read: legacy,
+                        canonical,
+                        how: Found::CarriedForward,
+                    };
+                }
+            }
+        }
+
+        Located {
+            what,
+            then,
+            read: canonical.clone(),
+            canonical,
+            how: Found::InPlace,
+        }
+    }
+}
+
+/// Which file a run actually reads, and where a write of it would go.
+///
+/// Two paths rather than one, because they differ for exactly one run per machine: the one that
+/// finds its history in the pre-split directory, reads it from there, and writes it to the
+/// split's own location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Located {
+    what: &'static str,
+    /// What follows "nothing was moved or deleted" in the sentence a carried-forward file says.
+    ///
+    /// Per file, because the two halves of the split differ in the one way that matters to whoever
+    /// reads the line: the state directory's file is written, so it carries itself across on the
+    /// next write, and the config directory's files are only ever read, so they stay where they are
+    /// until their owner moves them.
+    then: &'static str,
+    read: PathBuf,
+    canonical: PathBuf,
+    how: Found,
+}
+
+/// How a [`Located`] path was arrived at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Found {
+    /// In the directory the #25 split puts it in. The ordinary case, and silent.
+    InPlace,
+    /// At a path named outright by the given environment variable.
+    Named(&'static str),
+    /// In the pre-split `~/.acmon`, because the split's own location holds no such file.
+    CarriedForward,
+}
+
+impl Located {
+    /// The file this run reads.
+    pub fn read_path(&self) -> &Path {
+        &self.read
+    }
+
+    /// The file this run writes, and where the next run will look first.
+    pub fn write_path(&self) -> &Path {
+        &self.canonical
+    }
+
+    /// How this path was arrived at.
+    pub fn how(&self) -> Found {
+        self.how
+    }
+
+    /// What has to be said about where this file was found, or `None` when nothing does.
+    ///
+    /// Silent for the ordinary case and only for the ordinary case. A run that read a pre-split
+    /// file says so, because "read the old one" and "started from nothing" produce the same
+    /// screen otherwise, and one of them is a lie about the machine.
+    pub fn worth_stating(&self) -> Option<String> {
+        match self.how {
+            Found::InPlace => None,
+            Found::Named(variable) => Some(format!(
+                "{} is {}, named by {variable} rather than found in its usual directory",
+                self.what,
+                self.read.display()
+            )),
+            Found::CarriedForward => Some(format!(
+                "{} was read from the pre-split {}, because {} does not exist. Nothing was moved \
+                 or deleted: {} is where this tool looks first, {}",
+                self.what,
+                self.read.display(),
+                self.canonical.display(),
+                self.canonical.display(),
+                self.then
+            )),
+        }
     }
 }
 

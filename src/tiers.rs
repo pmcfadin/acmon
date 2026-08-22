@@ -568,6 +568,10 @@ impl World for TieredWorld<'_> {
         self.delegate.read_state()
     }
 
+    fn path_notices(&self) -> Vec<String> {
+        self.delegate.path_notices()
+    }
+
     fn write_state(&self, contents: &str) -> Result<(), String> {
         self.delegate.write_state(contents)
     }

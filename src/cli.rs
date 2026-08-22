@@ -236,9 +236,24 @@ pub fn amon_usage() -> String {
          \n\
          WHAT IT WRITES, AND WHERE\n\
          \x20   Config     ~/.config/acmon/          detectors.toml, notify.toml\n\
-         \x20   State      ~/.local/state/acmon/     state.json, notified.json, amon.log\n\
+         \x20                                        Read, never written. Yours to keep in\n\
+         \x20                                        dotfiles.\n\
+         \x20   State      ~/.local/state/acmon/     state.json, memory.json, notified.json,\n\
+         \x20                                        starts.jsonl, watch.lock, amon.log\n\
+         \x20                                        Deleting it loses history and nothing else.\n\
          \x20   LaunchAgent\n\
          \x20              ~/Library/LaunchAgents/io.github.pmcfadin.acmon.plist\n\
+         \n\
+         \x20   ACMON_CONFIG_DIR and ACMON_STATE_DIR move those two directories, and between\n\
+         \x20   them they move everything a run touches. ACMON_DETECTORS, ACMON_NOTIFY_CONFIG\n\
+         \x20   and ACMON_STATE still name those three files outright.\n\
+         \n\
+         \x20   Earlier builds kept all of it in one ~/.acmon/. Nothing is migrated behind your\n\
+         \x20   back: a file still there is READ from there while the new location has none,\n\
+         \x20   and the run says on screen that it did. The remembered history is written to\n\
+         \x20   ~/.local/state/acmon/memory.json from then on, so it carries itself across; the\n\
+         \x20   old ~/.acmon/ is left exactly as it is and can be deleted by hand once you are\n\
+         \x20   satisfied. Nothing under ~/.acmon/ is ever written.\n\
          \n\
          \x20   That plist is the ONLY file this tool writes outside those two directories,\n\
          \x20   and `amon install` is the only thing that writes it. It says the path before\n\

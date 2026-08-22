@@ -50,8 +50,18 @@ the job is loaded, whether a process is running, and how old the last state writ
 | Path | What it holds |
 | --- | --- |
 | `~/.config/acmon/` | Config: `detectors.toml`, `notify.toml`. Yours to keep in dotfiles. |
-| `~/.local/state/acmon/` | Mutable state: `state.json`, `notified.json`, `starts.jsonl`, `amon.log`. Deleting it loses history and nothing else. |
+| `~/.local/state/acmon/` | Mutable state: `state.json`, `memory.json`, `notified.json`, `starts.jsonl`, `watch.lock`, `amon.log`. Deleting it loses history and nothing else. |
 | `~/Library/LaunchAgents/io.github.pmcfadin.acmon.plist` | The LaunchAgent. |
+
+`ACMON_CONFIG_DIR` and `ACMON_STATE_DIR` move those two directories, and between them they
+move everything a run touches; `ACMON_DETECTORS`, `ACMON_NOTIFY_CONFIG` and `ACMON_STATE`
+still name those three files outright. Earlier builds kept all of it in a single `~/.acmon/`,
+and nothing is migrated behind your back: a file still there is **read** from there for as
+long as the new location has none, and the run says on screen that it did — starting from an
+empty memory because a file moved would report a machine with no remembered sessions. The
+remembered history is written to `~/.local/state/acmon/memory.json` from then on, so it
+carries itself across on the first run that writes; `~/.acmon/` is left exactly as it is,
+never written to, and can be deleted by hand once you are satisfied.
 
 **That plist is the only file this tool writes outside those two directories**, and `amon
 install` is the only thing that writes it. launchd's `KeepAlive` is the whole supervision

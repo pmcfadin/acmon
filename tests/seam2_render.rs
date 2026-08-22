@@ -1198,6 +1198,38 @@ fn a_session_with_nothing_remembered_still_states_the_reason_it_has_no_figures()
 }
 
 #[test]
+fn a_history_read_from_the_pre_split_directory_is_stated_on_screen_rather_than_inferred() {
+    // #36. `~/.config/acmon/` and `~/.local/state/acmon/` replaced a single `~/.acmon/`, and a
+    // machine that ran the older build still has its history there. It is read rather than
+    // ignored — but reading it is only half of not lying about it. Silence would put "read the old
+    // file" and "started from nothing" on the same screen, and the second of those is a machine
+    // with no remembered sessions, which is the calm plausible wrong answer this tool exists to
+    // remove. Not a WARNING: reading it is the correct thing to have done.
+    let text = rendered(
+        &Snapshot {
+            remembered: Remembered {
+                path_notices: vec!["the remembered history was read from the pre-split \
+                     /Users/test/.acmon/state.json, because \
+                     /Users/test/.local/state/acmon/memory.json does not exist"
+                    .to_string()],
+                ..Remembered::none()
+            },
+            ..snapshot_of_sessions(Vec::new())
+        },
+        wide(),
+    );
+
+    assert!(
+        text.contains("/Users/test/.acmon/state.json"),
+        "the screen must name the file the history was read from; got:\n{text}"
+    );
+    assert!(
+        text.contains("/Users/test/.local/state/acmon/memory.json"),
+        "and where it is kept from now on; got:\n{text}"
+    );
+}
+
+#[test]
 fn a_lost_history_is_reported_because_it_shortens_the_at_risk_list() {
     let text = rendered(
         &Snapshot {

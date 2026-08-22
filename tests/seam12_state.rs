@@ -30,6 +30,69 @@ fn scratch(name: &str) -> PathBuf {
     directory
 }
 
+/// A whole scratch home directory, with a pre-split `~/.acmon` in it.
+///
+/// Every test below that has anything to do with the old location builds one of these. None of
+/// them may go anywhere near the developer's own `~/.acmon`, which on a machine that has been
+/// running this tool holds the only record of what it saw — and a test that destroyed it would
+/// have destroyed exactly the thing this ticket exists to stop being lost.
+fn scratch_home_with_pre_split_files(name: &str) -> PathBuf {
+    let home = scratch(name);
+    let legacy = home.join(".acmon");
+    std::fs::create_dir_all(&legacy).expect("create the pre-split directory");
+
+    std::fs::write(legacy.join("state.json"), pre_split_memory()).expect("the old memory file");
+    // Deliberately malformed, both of them. A run that reads either one says so, naming the path,
+    // which is what makes "the legacy directory is never named in the output" evidence that it was
+    // never read rather than merely evidence that it was empty.
+    std::fs::write(legacy.join("notify.toml"), "local_command = [oh dear\n")
+        .expect("the old notify config");
+    std::fs::write(legacy.join("detectors.toml"), "[[detector]] oh dear\n")
+        .expect("the old detector config");
+
+    home
+}
+
+/// The workspace remembered only by the pre-split memory file.
+///
+/// A path nothing on this machine will ever discover on its own, so its presence in a run's
+/// remembered set proves the old file was read rather than rediscovered.
+const CARRIED_WORKSPACE: &str = "/tmp/acmon-seam12-remembered-only-in-the-old-file";
+
+/// The text of a pre-split `~/.acmon/state.json`, in the shape this build writes.
+///
+/// Built through `acmon::memory::serialise` rather than typed out, so the fixture cannot drift
+/// from the format the parser expects and quietly start proving nothing.
+fn pre_split_memory() -> String {
+    acmon::memory::serialise(&acmon::memory::Memory {
+        workspaces: vec![acmon::memory::RememberedWorkspace {
+            path: CARRIED_WORKSPACE.to_string(),
+            first_seen: now(),
+            last_seen: now(),
+            // Never settled, so no retention rule can forget it and make an unread file look
+            // like a read one.
+            settled_since: None,
+        }],
+        sessions: Vec::new(),
+    })
+}
+
+/// Every file under a directory, with its bytes, so "untouched" can be asserted rather than hoped.
+fn tree(directory: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut entries: Vec<(String, Vec<u8>)> = std::fs::read_dir(directory)
+        .expect("the directory is listable")
+        .map(|entry| {
+            let entry = entry.expect("a readable entry");
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).expect("a readable file"),
+            )
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
 // --- Path resolution: config vs. state split ---
 
 #[test]
@@ -770,4 +833,435 @@ fn an_unknown_schema_version_errors_and_names_both_versions() {
     );
 
     let _ = std::fs::remove_dir_all(paths.state_dir());
+}
+
+// --- Everything a run touches, on one side of the split or the other (#36) ---
+//
+// The failure this section exists to prevent: `ACMON_STATE_DIR` relocated the state directory
+// while three files — the memory file and the two config files — still resolved their own paths
+// under the pre-split `~/.acmon`. A monitor started with only that variable set therefore wrote
+// the developer's own remembered workspaces, which is why two seams had to redirect `ACMON_STATE`
+// by hand. Forgetting that redirection did not produce a red test; it produced a test that wrote
+// real user data. That is the wrong direction for a mistake to fail in.
+
+#[test]
+fn the_memory_file_is_state_and_both_config_files_are_config() {
+    // Each file on the side of the #25 split its content belongs on: the remembered workspaces
+    // and sessions are mutable state, the two `.toml` files are config the user owns.
+    use acmon::state::Paths;
+
+    let paths = Paths::from_values(
+        Some("/tmp/acmon-config"),
+        Some("/tmp/acmon-state"),
+        Some("/Users/test"),
+    )
+    .expect("both directories were given explicitly");
+
+    assert_eq!(
+        paths.locate_memory(None).read_path(),
+        PathBuf::from("/tmp/acmon-state/memory.json"),
+        "the remembered set is mutable state and belongs in the state directory"
+    );
+    assert_eq!(
+        paths.locate_notify_config(None).read_path(),
+        PathBuf::from("/tmp/acmon-config/notify.toml"),
+        "notification channels are config"
+    );
+    assert_eq!(
+        paths.locate_detectors(None).read_path(),
+        PathBuf::from("/tmp/acmon-config/detectors.toml"),
+        "detector overrides are config"
+    );
+
+    // Not `state.json`: that name is taken in this very directory by the tiered file the monitor
+    // publishes, and one directory holding two different files under one name is not a split.
+    assert_ne!(
+        paths.locate_memory(None).read_path(),
+        paths.state_dir().join(acmon::state::STATE_FILE),
+        "the memory file must not collide with the tiered state file"
+    );
+}
+
+#[test]
+fn naming_either_directory_leaves_no_pre_split_directory_for_a_run_to_reach_into() {
+    // The mechanism behind the isolation criterion. A run told where its files live has no
+    // business reading one of them out of a home directory it was told to leave alone — that
+    // would be isolated enough to look safe in a test name and not isolated at all.
+    use acmon::state::Paths;
+
+    let own =
+        Paths::from_values(None, None, Some("/Users/test")).expect("HOME answers both directories");
+    assert_eq!(
+        own.legacy_dir(),
+        Some(std::path::Path::new("/Users/test/.acmon")),
+        "a run using this machine's own directories may consult the pre-split one"
+    );
+
+    for (config, state) in [
+        (Some("/tmp/acmon-config"), None),
+        (None, Some("/tmp/acmon-state")),
+        (Some("/tmp/acmon-config"), Some("/tmp/acmon-state")),
+    ] {
+        let relocated = Paths::from_values(config, state, Some("/Users/test")).expect("resolvable");
+        assert_eq!(
+            relocated.legacy_dir(),
+            None,
+            "naming a directory ({config:?}, {state:?}) must take the pre-split one out of play"
+        );
+    }
+}
+
+#[test]
+fn the_three_specific_variables_still_name_their_files_outright() {
+    // They stop being the only way to move these files; they do not stop working. Several tests
+    // in other seams point `ACMON_NOTIFY_CONFIG` at a file that does not exist precisely so that
+    // no test run can deliver a notification anywhere.
+    use acmon::state::{Found, Paths};
+
+    let paths = Paths::from_values(Some("/tmp/acmon-config"), Some("/tmp/acmon-state"), None)
+        .expect("resolvable");
+
+    for (located, expected, variable) in [
+        (
+            paths.locate_memory(Some("/tmp/named-memory.json")),
+            "/tmp/named-memory.json",
+            "ACMON_STATE",
+        ),
+        (
+            paths.locate_notify_config(Some("/tmp/named-notify.toml")),
+            "/tmp/named-notify.toml",
+            "ACMON_NOTIFY_CONFIG",
+        ),
+        (
+            paths.locate_detectors(Some("/tmp/named-detectors.toml")),
+            "/tmp/named-detectors.toml",
+            "ACMON_DETECTORS",
+        ),
+    ] {
+        assert_eq!(located.read_path(), PathBuf::from(expected));
+        assert_eq!(
+            located.write_path(),
+            PathBuf::from(expected),
+            "a file named outright is also written where it was named"
+        );
+        assert_eq!(located.how(), Found::Named(variable));
+        let said = located
+            .worth_stating()
+            .expect("an overridden path is worth saying out loud");
+        assert!(
+            said.contains(variable) && said.contains(expected),
+            "and the sentence names the variable and the path; got {said:?}"
+        );
+    }
+
+    // A blank value is not an answer, and must not read as one.
+    assert_eq!(
+        paths.locate_memory(Some("   ")).read_path(),
+        PathBuf::from("/tmp/acmon-state/memory.json"),
+        "a blank override falls through to the split's own location"
+    );
+}
+
+#[test]
+fn a_pre_split_file_is_read_from_its_old_place_and_the_run_says_which_one_it_read() {
+    // The criterion: an existing `~/.acmon/state.json` is not silently ignored. Starting from an
+    // empty memory because the file moved would report a machine with no remembered sessions —
+    // the calm, plausible, wrong answer this project exists to remove. Reading it is only half of
+    // not lying about it: a run that read the old file has to say so, or "read the old one" and
+    // "started from nothing" arrive on screen as the same run.
+    use acmon::state::{Found, Paths};
+
+    let home = scratch_home_with_pre_split_files("says-which-one");
+    let paths = Paths::from_values(None, None, Some(&home.to_string_lossy()))
+        .expect("the scratch home answers both directories");
+
+    for (located, old_name, new_name) in [
+        (paths.locate_memory(None), "state.json", "memory.json"),
+        (
+            paths.locate_notify_config(None),
+            "notify.toml",
+            "notify.toml",
+        ),
+        (
+            paths.locate_detectors(None),
+            "detectors.toml",
+            "detectors.toml",
+        ),
+    ] {
+        assert_eq!(located.how(), Found::CarriedForward);
+        assert_eq!(
+            located.read_path(),
+            home.join(".acmon").join(old_name),
+            "the old file is what this run reads"
+        );
+
+        let said = located
+            .worth_stating()
+            .expect("a run that read the old file says so");
+        assert!(
+            said.contains(&*home.join(".acmon").join(old_name).to_string_lossy()),
+            "the sentence names the file it read; got {said:?}"
+        );
+        assert!(
+            said.contains(new_name) && said.contains("Nothing was moved or deleted"),
+            "and says where the tool looks now, and that nothing was moved; got {said:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn once_the_new_location_has_the_file_the_pre_split_one_is_never_consulted_again() {
+    // A machine is carried forward once. Preferring the old file for as long as it exists would
+    // make the old one authoritative forever, and then a deleted state directory would silently
+    // resurrect a history from months ago.
+    use acmon::state::{Found, Paths};
+
+    let home = scratch_home_with_pre_split_files("only-once");
+    let paths = Paths::from_values(None, None, Some(&home.to_string_lossy()))
+        .expect("the scratch home answers both directories");
+
+    std::fs::create_dir_all(paths.state_dir()).expect("create the state directory");
+    std::fs::write(paths.state_dir().join("memory.json"), "{}").expect("the new memory file");
+    std::fs::create_dir_all(paths.config_dir()).expect("create the config directory");
+    std::fs::write(paths.config_dir().join("notify.toml"), "").expect("the new notify config");
+
+    let memory = paths.locate_memory(None);
+    assert_eq!(memory.how(), Found::InPlace);
+    assert_eq!(memory.read_path(), paths.state_dir().join("memory.json"));
+    assert_eq!(
+        memory.worth_stating(),
+        None,
+        "the ordinary case is silent, or the line means nothing"
+    );
+
+    let notify = paths.locate_notify_config(None);
+    assert_eq!(notify.how(), Found::InPlace);
+    assert_eq!(notify.worth_stating(), None);
+
+    // And the file that has NOT been carried across is still read from the old place, so this is
+    // per file rather than per machine.
+    assert_eq!(paths.locate_detectors(None).how(), Found::CarriedForward);
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn the_history_carries_itself_across_on_the_first_write_and_the_old_file_is_left_alone() {
+    // The whole of the decision, exercised through the real world rather than through the path
+    // resolution alone: the old file is READ, the result is WRITTEN to the split's own location,
+    // and nothing is moved or deleted — so a user who loses faith in this can put the old file
+    // back by doing nothing at all.
+    //
+    // Driven through `RealWorld::with_paths` rather than by setting variables, because the
+    // environment is process-wide and this binary's tests run concurrently.
+    use acmon::state::Paths;
+    use acmon::World;
+
+    let home = scratch_home_with_pre_split_files("carries-itself");
+    let legacy = home.join(".acmon").join("state.json");
+    let before = std::fs::read(&legacy).expect("the old file is readable");
+
+    let paths = Paths::from_values(None, None, Some(&home.to_string_lossy()))
+        .expect("the scratch home answers both directories");
+    let world = acmon::RealWorld::with_paths(paths.clone());
+
+    match world.read_state() {
+        acmon::world::StateRead::Found(text) => assert!(
+            text.contains(CARRIED_WORKSPACE),
+            "the run read the old file's contents, not an empty memory; got:\n{text}"
+        ),
+        other => {
+            panic!("the old file must be read, not treated as absent or unreadable: {other:?}")
+        }
+    }
+
+    assert!(
+        world
+            .path_notices()
+            .iter()
+            .any(|line| line.contains(&*legacy.to_string_lossy())),
+        "and it says which file it read: {:?}",
+        world.path_notices()
+    );
+
+    let carried = acmon::memory::serialise(&acmon::memory::Memory {
+        workspaces: Vec::new(),
+        sessions: Vec::new(),
+    });
+    world.write_state(&carried).expect("the write succeeds");
+
+    let new_file = paths.state_dir().join("memory.json");
+    assert_eq!(
+        std::fs::read_to_string(&new_file).expect("the new file exists"),
+        carried,
+        "the write went to the state directory, which is where the next run looks first"
+    );
+    assert_eq!(
+        std::fs::read(&legacy).expect("the old file is still there"),
+        before,
+        "and the old file is byte-for-byte as it was: nothing was moved, nothing was deleted"
+    );
+
+    // The next run finds the history where this one left it, and stops mentioning the old file.
+    // The two config files keep announcing themselves, and should: nothing writes them, so they
+    // stay in the old place until their owner moves them, and a run that is still reading them
+    // from there has not finished saying so.
+    let next = acmon::RealWorld::with_paths(paths);
+    assert!(
+        !next
+            .path_notices()
+            .iter()
+            .any(|line| line.contains("remembered")),
+        "a machine's history is carried forward once, and then stops being mentioned: {:?}",
+        next.path_notices()
+    );
+    match next.read_state() {
+        acmon::world::StateRead::Found(text) => assert_eq!(
+            text, carried,
+            "and the next run reads what this one wrote, not the old file again"
+        ),
+        other => panic!("the next run must find the carried history: {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// --- Both binaries, against a whole scratch home (#36) ---
+//
+// Asserted by running the real binaries and inspecting what exists afterwards, because the
+// criterion is about what a *process* touched rather than about what a function returned. The two
+// tests below share one fixture and differ in one thing — whether the directory variables are set
+// — and they assert opposite outcomes from it. That pairing is what stops either of them passing
+// for the wrong reason: the second proves the pre-split directory would have been named in the
+// output had it been read, and the first proves it was not.
+
+/// Run one of the two binaries against a scratch home, returning (succeeded, everything it said).
+fn run_binary(
+    binary: &str,
+    home: &std::path::Path,
+    relocated: Option<&std::path::Path>,
+) -> (bool, String) {
+    let mut command = std::process::Command::new(binary);
+    if binary.ends_with("amon") {
+        command.arg("watch").env(acmon::watch::RUN_VARIABLE, "400");
+    } else {
+        // `--once`, deliberately: a bare `agtop` takes the screen and refuses without a terminal,
+        // which is every test harness — it would never reach a collection at all.
+        command.arg("--once");
+    }
+    command.env("HOME", home);
+    if let Some(directory) = relocated {
+        command
+            .env(acmon::state::STATE_DIR_VARIABLE, directory.join("state"))
+            .env(acmon::state::CONFIG_DIR_VARIABLE, directory.join("config"));
+    }
+    let output = command
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap_or_else(|e| panic!("{binary} is built and runnable: {e}"));
+    (
+        output.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+}
+
+#[test]
+fn setting_only_the_two_directory_variables_isolates_a_run_from_the_pre_split_directory() {
+    // The criterion this ticket turns on. Before it, `ACMON_STATE_DIR` moved `state.json` and
+    // `notified.json` and left the memory file in `~/.acmon` — so a test that relocated the state
+    // directory and forgot the extra variable wrote the developer's own remembered workspaces, and
+    // did it while passing. Asserted for both binaries, because both of them read these files.
+    let home = scratch_home_with_pre_split_files("isolated");
+    let elsewhere = scratch("isolated-elsewhere");
+    let legacy = home.join(".acmon");
+    let before = tree(&legacy);
+
+    for binary in [env!("CARGO_BIN_EXE_amon"), env!("CARGO_BIN_EXE_agtop")] {
+        let (succeeded, said) = run_binary(binary, &home, Some(&elsewhere));
+        // Assert success before believing anything about what it did or did not touch: a binary
+        // that failed to start touched nothing, and would pass this test having proved nothing.
+        assert!(
+            !said.trim().is_empty(),
+            "{binary} said nothing at all, so it cannot be evidence of anything"
+        );
+        if binary.ends_with("amon") {
+            assert!(
+                succeeded,
+                "the monitor has to have actually run its window; it said:\n{said}"
+            );
+            assert!(
+                said.contains(&*elsewhere.join("state").to_string_lossy()),
+                "and to have used the directory it was given; it said:\n{said}"
+            );
+        }
+
+        // Nothing read. Every file resolved out of the pre-split directory is announced by the
+        // run that resolved it — that is the other half of this ticket — and each of the three
+        // fixtures there would announce itself: the memory file by being carried forward, the two
+        // malformed `.toml` files by being unreadable as configuration. So the directory's own
+        // path appearing nowhere in what the run said is evidence that none of them was reached.
+        assert!(
+            !said.contains(&*legacy.to_string_lossy()),
+            "{binary} named the pre-split directory, so it reached into it; it said:\n{said}"
+        );
+
+        // Nothing written, and nothing changed: byte-for-byte, name-for-name.
+        assert_eq!(
+            tree(&legacy),
+            before,
+            "{binary} altered the pre-split directory"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&elsewhere);
+}
+
+#[test]
+fn a_run_using_this_machines_own_directories_reads_the_pre_split_files_and_says_so() {
+    // The counterpart, same fixture: with nothing relocated, a machine whose history is still in
+    // `~/.acmon` has it read, and the run states that it did rather than leaving it to be inferred
+    // from a file that is suddenly somewhere else. It is also what makes the test above mean
+    // something — the pre-split directory really does get named when it is read.
+    let home = scratch_home_with_pre_split_files("machines-own");
+    let legacy = home.join(".acmon");
+    let before = tree(&legacy);
+
+    let (succeeded, said) = run_binary(env!("CARGO_BIN_EXE_amon"), &home, None);
+    assert!(
+        succeeded,
+        "the monitor has to have actually run its window; it said:\n{said}"
+    );
+    assert!(
+        said.contains(&*legacy.join("state.json").to_string_lossy()),
+        "the run must name the pre-split file it read; it said:\n{said}"
+    );
+    assert!(
+        said.contains(
+            &*home
+                .join(".local/state/acmon/memory.json")
+                .to_string_lossy()
+        ),
+        "and where it keeps that history from now on; it said:\n{said}"
+    );
+    assert!(
+        said.contains("Nothing was moved or deleted"),
+        "and that it is a read rather than a migration; it said:\n{said}"
+    );
+
+    // The reading is not a taking. Whatever the run did with what it read, the old file is
+    // exactly as it was — which is what makes this recoverable by doing nothing.
+    assert_eq!(
+        tree(&legacy),
+        before,
+        "the pre-split directory must be left byte-for-byte as it was found"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
 }

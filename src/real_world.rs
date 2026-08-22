@@ -28,90 +28,81 @@ const SWEEP_MAX_DEPTH: usize = 4;
 /// silently stop exercising the bound the day the bound changed.
 pub const SWEEP_BUDGET: usize = 4096;
 
-/// The environment variable that relocates the state file.
+/// The environment variable that names the memory file outright.
 ///
-/// Its main job is to let a test drive the real read-and-write path against a temporary
-/// directory. A test that had to write to the developer's own `~/.acmon/state.json` would
-/// either destroy real history or be skipped, and a skipped test of an atomic write is how
-/// a non-atomic write ships.
+/// It no longer decides where that file *lives* — `ACMON_STATE_DIR` does, because the memory
+/// file is mutable state and belongs in the state directory with everything else that is (#36).
+/// This overrides that, and its main job is to let a test drive the real read-and-write path
+/// against a named temporary file. A test that had to write the developer's own memory would
+/// either destroy real history or be skipped, and a skipped test of an atomic write is how a
+/// non-atomic write ships.
 pub const STATE_VARIABLE: &str = "ACMON_STATE";
 
-/// The environment variable that relocates the notification config file.
+/// The environment variable that names the notification config file outright.
 ///
-/// Lets tests configure notifications without touching the developer's real config.
+/// Overrides `notify.toml` in the config directory. Lets a test configure notifications without
+/// touching the developer's real config.
 pub const NOTIFY_CONFIG_VARIABLE: &str = "ACMON_NOTIFY_CONFIG";
 
-/// The environment variable that relocates the detector config file.
+/// The environment variable that names the detector config file outright.
 ///
-/// Lets tests configure detectors without touching the developer's real config.
+/// Overrides `detectors.toml` in the config directory. Lets a test configure detectors without
+/// touching the developer's real config.
 pub const DETECTORS_VARIABLE: &str = "ACMON_DETECTORS";
 
-/// Where the state carried between runs is kept.
+/// Where all three of this world's own files are, resolved once from one place.
 ///
-/// `~/.acmon/state.json`, alongside the `~/.claude` and `~/.codex` directories the agents
-/// themselves use — findable and deletable by hand, which matters for a file whose contents
-/// change what the tool reports.
-fn state_path() -> Result<std::path::PathBuf, String> {
-    if let Ok(explicit) = std::env::var(STATE_VARIABLE) {
-        if !explicit.trim().is_empty() {
-            return Ok(std::path::PathBuf::from(explicit));
-        }
-    }
-    let home = std::env::var("HOME").map_err(|e| {
-        format!(
-            "HOME is not readable, so {STATE_VARIABLE} \
-             must name the state file explicitly: {e}"
-        )
-    })?;
-    Ok(std::path::Path::new(&home)
-        .join(".acmon")
-        .join("state.json"))
+/// One function rather than three, because the three used to be three: each resolved its own
+/// path under `~/.acmon` from its own variable, which is how `ACMON_STATE_DIR` came to relocate
+/// a state directory that did not contain all of the state (#36). They now share the #25 split's
+/// [`Paths`](crate::state::Paths), so the two directory variables between them move everything a
+/// run touches, and each file's own variable still names it outright.
+///
+/// Every path is a `Result`, and an unresolvable one stays unresolvable rather than becoming a
+/// stand-in that is certain to be empty. "No alerting configured" and "no history yet" are both
+/// legitimate states, which makes them the worst possible disguises for a fault.
+fn own_files() -> Result<OwnFiles, String> {
+    crate::state::Paths::from_environment()
+        .map_err(|why| {
+            format!(
+                "{why} — or name each file outright with {STATE_VARIABLE}, \
+                 {NOTIFY_CONFIG_VARIABLE} and {DETECTORS_VARIABLE}"
+            )
+        })
+        .map(OwnFiles::under)
 }
 
-/// Where the notification configuration is kept.
-///
-/// `~/.acmon/notify.toml`, alongside the state file. Resolved as a `Result` for the same
-/// reason [`state_path`] is: without a home directory there is no answer, and a stand-in path
-/// chosen because it is certain to fail would report "no alerting configured" — which is a
-/// legitimate state, and therefore the worst possible disguise for a fault.
-fn notify_config_path() -> Result<std::path::PathBuf, String> {
-    if let Ok(explicit) = std::env::var(NOTIFY_CONFIG_VARIABLE) {
-        if !explicit.trim().is_empty() {
-            return Ok(std::path::PathBuf::from(explicit));
-        }
-    }
-    let home = std::env::var("HOME").map_err(|e| {
-        format!(
-            "HOME is not readable, so {NOTIFY_CONFIG_VARIABLE} must name the notification \
-             configuration explicitly: {e}"
-        )
-    })?;
-    Ok(std::path::Path::new(&home)
-        .join(".acmon")
-        .join("notify.toml"))
+/// The files this world reads and writes for itself, and where each one was found.
+#[derive(Debug, Clone)]
+struct OwnFiles {
+    paths: crate::state::Paths,
+    memory: crate::state::Located,
+    notify_config: crate::state::Located,
+    detectors: crate::state::Located,
 }
 
-/// Where the detector configuration is kept.
-///
-/// `~/.acmon/detectors.toml`, alongside the state file and notification config. Resolved as a
-/// `Result` for the same reason [`state_path`] is: without a home directory there is no answer,
-/// and a stand-in path chosen because it is certain to fail would report "no detector config" —
-/// which is a legitimate state, and therefore the worst possible disguise for a fault.
-fn detectors_path() -> Result<std::path::PathBuf, String> {
-    if let Ok(explicit) = std::env::var(DETECTORS_VARIABLE) {
-        if !explicit.trim().is_empty() {
-            return Ok(std::path::PathBuf::from(explicit));
+impl OwnFiles {
+    /// The three files under the given directories, each still overridable by its own variable.
+    fn under(paths: crate::state::Paths) -> Self {
+        let named = |variable: &str| std::env::var(variable).ok();
+        OwnFiles {
+            memory: paths.locate_memory(named(STATE_VARIABLE).as_deref()),
+            notify_config: paths.locate_notify_config(named(NOTIFY_CONFIG_VARIABLE).as_deref()),
+            detectors: paths.locate_detectors(named(DETECTORS_VARIABLE).as_deref()),
+            paths,
         }
     }
-    let home = std::env::var("HOME").map_err(|e| {
-        format!(
-            "HOME is not readable, so {DETECTORS_VARIABLE} must name the detector \
-             configuration explicitly: {e}"
-        )
-    })?;
-    Ok(std::path::Path::new(&home)
-        .join(".acmon")
-        .join("detectors.toml"))
+
+    /// Everything worth saying about where these files were found, in a fixed order.
+    ///
+    /// Empty on an ordinary run. Never empty when a pre-split file was read: see
+    /// [`Located::worth_stating`](crate::state::Located::worth_stating).
+    fn worth_stating(&self) -> Vec<String> {
+        [&self.memory, &self.notify_config, &self.detectors]
+            .iter()
+            .filter_map(|located| located.worth_stating())
+            .collect()
+    }
 }
 
 pub struct RealWorld {
@@ -119,30 +110,19 @@ pub struct RealWorld {
     /// Read once from this machine, never assumed. Every duration in the kernel's
     /// ledger is a tick count that means nothing without it.
     timebase: MachTimebase,
-    /// Where the state carried between runs is kept, or why that could not be worked out.
+    /// The three files this world owns, and where each one was found — or why that could not be
+    /// worked out at all.
     ///
-    /// Resolved once, at construction, rather than each time it is used. A path that is a
+    /// Resolved once, at construction, rather than each time one is used. A path that is a
     /// *field* is a path a test can point somewhere harmless — where one read from the
     /// environment at the point of use would have made every test that collects write to the
-    /// developer's own `~/.acmon/state.json`, and a test suite that quietly overwrites the
-    /// history the tool depends on is worse than one that skips the case.
-    state_file: Result<std::path::PathBuf, String>,
-    /// Where the state **directory** is, or why that could not be worked out.
+    /// developer's own memory, and a test suite that quietly overwrites the history the tool
+    /// depends on is worse than one that skips the case.
     ///
-    /// The #25 split's directory, holding `notified.json` and the artefacts that follow it —
-    /// distinct from `state_file` above, which is the pre-split memory file and still lives at
-    /// its old path. A field for the same reason: a test must be able to point it somewhere
-    /// harmless, and a suite that re-announced against the developer's own dedupe record would
-    /// be a suite that alters what their monitor does next.
-    state_paths: Result<crate::state::Paths, String>,
-    /// Where the notification configuration is kept, or why that could not be worked out.
-    ///
-    /// Resolved once at construction for the same reason as `state_file`.
-    notify_config_file: Result<std::path::PathBuf, String>,
-    /// Where the detector configuration is kept, or why that could not be worked out.
-    ///
-    /// Resolved once at construction for the same reason as `state_file`.
-    detectors_file: Result<std::path::PathBuf, String>,
+    /// One field for all three because they share one resolution (see [`own_files`]). While they
+    /// were three fields they were three rules, and the memory file's rule was the one nobody
+    /// updated when #25 split the directories.
+    files: Result<OwnFiles, String>,
     /// How long one notification delivery gets, and — the same figure — how long a whole
     /// channel's deliveries get in one run.
     ///
@@ -158,50 +138,57 @@ impl RealWorld {
         RealWorld {
             observer_pid: std::process::id() as i32,
             timebase: read_timebase(),
-            state_file: state_path(),
-            state_paths: crate::state::Paths::from_environment(),
-            notify_config_file: notify_config_path(),
-            detectors_file: detectors_path(),
+            files: own_files(),
             notify_request_budget: crate::deliver::REQUEST_BUDGET,
         }
     }
 
-    /// The same world, keeping its state in a named file instead of the usual one.
-    pub fn with_state_file(path: impl Into<std::path::PathBuf>) -> Self {
+    /// The same world, with every file it owns resolved under the given directories.
+    ///
+    /// What `amon watch` uses, so that the monitor's world and the monitor's lock and state store
+    /// are looking at one pair of directories rather than each resolving its own. Each file's own
+    /// variable still overrides, exactly as it does for [`RealWorld::new`].
+    pub fn with_paths(paths: crate::state::Paths) -> Self {
         RealWorld {
-            state_file: Ok(path.into()),
+            files: Ok(OwnFiles::under(paths)),
             ..RealWorld::new()
         }
     }
 
-    /// The same world, keeping the #25 state directory's artefacts under a named directory.
-    ///
-    /// A constructor rather than a test setting `ACMON_STATE_DIR`, because the environment is
-    /// process-wide: one test that relocated it would relocate it for every other test in the
-    /// same binary, including the ones running concurrently.
-    pub fn with_state_dir(directory: impl AsRef<std::path::Path>) -> Self {
+    /// The same world, keeping its memory in a named file instead of the usual one.
+    pub fn with_state_file(path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
         RealWorld {
-            state_paths: crate::state::Paths::from_values(
-                None,
-                Some(&directory.as_ref().to_string_lossy()),
-                std::env::var("HOME").ok().as_deref(),
-            ),
+            files: own_files().map(|files| OwnFiles {
+                memory: files.paths.locate_memory(Some(&path.to_string_lossy())),
+                ..files
+            }),
             ..RealWorld::new()
         }
     }
 
     /// The same world, reading notification config from a named file.
     pub fn with_notify_config(path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
         RealWorld {
-            notify_config_file: Ok(path.into()),
+            files: own_files().map(|files| OwnFiles {
+                notify_config: files
+                    .paths
+                    .locate_notify_config(Some(&path.to_string_lossy())),
+                ..files
+            }),
             ..RealWorld::new()
         }
     }
 
     /// The same world, reading detector config from a named file.
     pub fn with_detectors(path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
         RealWorld {
-            detectors_file: Ok(path.into()),
+            files: own_files().map(|files| OwnFiles {
+                detectors: files.paths.locate_detectors(Some(&path.to_string_lossy())),
+                ..files
+            }),
             ..RealWorld::new()
         }
     }
@@ -1208,25 +1195,43 @@ impl World for RealWorld {
     }
 
     fn read_state(&self) -> StateRead {
-        let path = match &self.state_file {
-            Ok(path) => path,
+        let path = match &self.files {
+            Ok(files) => files.memory.read_path(),
             Err(why) => return StateRead::Unreadable(why.clone()),
         };
 
         match std::fs::read_to_string(path) {
             Ok(contents) => StateRead::Found(contents),
-            // Both of these mean nothing has been stored yet: no file, and no `~/.acmon`
-            // for one to be in. Neither is a failure, and reporting them as one would put a
-            // warning on every first run.
+            // Both of these mean nothing has been stored yet: no file, and no directory for one
+            // to be in. Neither is a failure, and reporting them as one would put a warning on
+            // every first run. This is reached for a machine that has never run acmon at all —
+            // a machine that ran the pre-split one is served by `Found` above, from the old file,
+            // because the resolution looked there before giving this answer.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => StateRead::Absent,
             Err(error) => StateRead::Unreadable(format!("{}: {error}", path.display())),
+        }
+    }
+
+    fn path_notices(&self) -> Vec<String> {
+        match &self.files {
+            Ok(files) => files.worth_stating(),
+            // Not silence. A world that could not work out where its own files are has something
+            // to say about it, and this is the channel for saying it.
+            Err(why) => vec![why.clone()],
         }
     }
 
     fn write_state(&self, contents: &str) -> Result<(), String> {
         use std::io::Write;
 
-        let path = self.state_file.as_ref().map_err(String::clone)?;
+        // Never the path that was read: a run that found its history in the pre-split directory
+        // writes the result to the split's own location, which is what carries the history across
+        // without moving or deleting anything. The old file stops being consulted the moment the
+        // new one exists, and stays on disk in case anyone wants it back.
+        let path = match &self.files {
+            Ok(files) => files.memory.write_path(),
+            Err(why) => return Err(why.clone()),
+        };
         let directory = path
             .parent()
             .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
@@ -1264,19 +1269,18 @@ impl World for RealWorld {
     }
 
     fn read_notified(&self) -> StateRead {
-        match &self.state_paths {
+        match &self.files {
             // Not `Absent`. A state directory that could not be resolved has not told us that
             // nothing was announced, and treating it as though it had would storm on every run
             // while looking like an ordinary first pass.
             Err(why) => StateRead::Unreadable(why.clone()),
-            Ok(paths) => {
-                crate::state::StateStore::new(paths.clone()).read_text(crate::state::NOTIFIED_FILE)
-            }
+            Ok(files) => crate::state::StateStore::new(files.paths.clone())
+                .read_text(crate::state::NOTIFIED_FILE),
         }
     }
 
     fn write_notified(&self, contents: &str) -> Result<(), String> {
-        let paths = self.state_paths.as_ref().map_err(String::clone)?;
+        let paths = &self.files.as_ref().map_err(|why| why.clone())?.paths;
         // The same write-temp-then-rename the rest of the state directory uses, and the same
         // create-if-missing: deleting the state directory has to be a safe recovery step, which
         // means the next run recreates it rather than failing until someone makes it by hand.
@@ -1288,8 +1292,8 @@ impl World for RealWorld {
     }
 
     fn read_notify_config(&self) -> NotifyConfig {
-        let path = match &self.notify_config_file {
-            Ok(path) => path,
+        let path = match &self.files {
+            Ok(files) => files.notify_config.read_path(),
             Err(why) => return NotifyConfig::unusable(why.clone()),
         };
 
@@ -1340,8 +1344,8 @@ impl World for RealWorld {
     fn read_detector_config(&self) -> crate::world::DetectorConfig {
         use crate::world::DetectorConfig;
 
-        let path = match &self.detectors_file {
-            Ok(path) => path,
+        let path = match &self.files {
+            Ok(files) => files.detectors.read_path(),
             Err(why) => return DetectorConfig::unusable(why.clone()),
         };
 

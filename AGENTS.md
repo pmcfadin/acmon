@@ -69,6 +69,15 @@ output. The v2 verbs still fail loudly rather than exiting zero having done noth
 written here goes stale. Carried-forward notes GitHub would not tell you:
 
 - #13 records a #2 criterion met in effect rather than in letter.
+- **`ACMON_STATE_DIR` and `ACMON_CONFIG_DIR` between them now move everything a run touches**, so
+  a test that spawns either binary needs no third variable to keep it off the developer's own
+  files — which is why the hand-written `ACMON_STATE` redirection is gone from seams 13, 16 and 17.
+  The memory file is `memory.json` in the state directory, not `state.json`: that name belongs to
+  the tiered file the monitor publishes. `ACMON_STATE`, `ACMON_NOTIFY_CONFIG` and `ACMON_DETECTORS`
+  still name their files outright. A machine with a pre-split `~/.acmon/` has it **read** while the
+  new location has none, and the run says on screen that it did; nothing is moved, deleted, or
+  written there ever. Naming either directory takes `~/.acmon/` out of play entirely, which is what
+  makes a relocated run isolated rather than nearly isolated.
 - The collection's ~2.5 s against a one-second budget **is fixed**, by tiering rather than by
   making anything faster: `amon watch` now measures its own cost at **0.37–0.47% of one core**
   over the trailing minute, inside NF9's 1%. A fast pass is ~49 ms, a medium pass ~207 ms, and
