@@ -138,6 +138,21 @@ impl Pace {
             Pace::Idle => "idle",
         }
     }
+
+    /// The pace a published word names, or `None` for a word this build does not know.
+    ///
+    /// Paired with [`Pace::name`] so the two cannot drift, and `Option` rather than a default
+    /// because the display judges every tier's age against this cadence: silently reading an
+    /// unknown word as `active` would report an idled-down monitor as stale on every screen,
+    /// and silently reading it as `idle` would hide a genuinely stale one. The reader says so
+    /// instead.
+    pub fn from_name(word: &str) -> Option<Pace> {
+        match word {
+            "active" => Some(Pace::Active),
+            "idle" => Some(Pace::Idle),
+            _ => None,
+        }
+    }
 }
 
 /// What one tier's pass may cost before the loop says so.

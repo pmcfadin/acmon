@@ -10,9 +10,25 @@ the monitor, and `agtop`, the display. **If it measures, it is `amon`; if it dra
 the alternate screen by default, refreshing while open by polling `state.json` once a
 second and re-reading only on an mtime change, plus `agtop --once` for one pass as plain
 lines. It is read-only **in fact** — `collect` takes a role, and a display's collection
-writes no state and asks no notification channel anything. With nothing published it makes
-its own single collection (F28), and states on screen that the figures are its own and that
-nothing is being recorded or alerted. It is also laid out: a **meter row** of gauges above
+writes no state and asks no notification channel anything.
+
+**It now draws what `amon` published, and says how old every part of it is.** The display
+reads the tier payloads, so a live monitor's sessions, at-risk panel and duty cycle come off
+disk rather than from a collection of the display's own. It classifies the monitor itself,
+from the file alone — `FRESH` / `STALE` / `DEAD` / `ABSENT` — and the word is the first thing
+on the screen. The verdict rests on **two** observations and says which: the writer pid the
+file records, asked of the kernel with signal 0, and each tier's own stamp against the
+cadence the monitor published. A pid that is gone is `DEAD` however young the file it left;
+a tier that has missed a whole pass is `STALE` while its writer is still there, and the two
+get different sentences because "alive but slow" and "gone, and everything here is a corpse"
+are opposite facts. Marking is **whole-screen, never per-row**. Every tier prints two ages —
+when it last ran and how old its oldest fact is — because for the slow tier those differ by
+tens of minutes, and the at-risk panel is aged by the **slow** tier's evidence with a
+per-workspace age on every row. It never signals, restarts or tidies up after a monitor it
+has declared dead. With nothing published it still makes its own single collection (F28), and
+states on screen that the figures are its own and that nothing is being recorded or alerted.
+
+It is also laid out: a **meter row** of gauges above
 the table carrying collection overhead and `amon`'s duty cycle, session rows ordered by
 **child CPU descending** with no sort keybindings (deliberately — F55, N1), and a session
 whose child CPU is unmeasurable listed **first** rather than last, because the cheap end of
@@ -65,9 +81,16 @@ written here goes stale. Carried-forward notes GitHub would not tell you:
   and published, never reported as clean. And a duty cycle read from a run shorter than the slow
   interval is inflated by the once-only first round, so a short run is not a steady-state
   measurement.
-- `agtop`'s **own** collection (F28, nothing published) is still one untiered pass and still
-  costs seconds. Tiering is a property of the monitor's loop; there is nothing to tier in a
-  single one-shot read.
+- `agtop`'s **own** collection (F28) is still one untiered pass and still costs seconds —
+  measured at 4.7 s on a loaded machine, well past its own gauge's scale. Tiering is a property
+  of the monitor's loop; there is nothing to tier in a single one-shot read. It is now reached
+  **only** when there are no published facts to draw: no state file, a monitor that has not
+  finished a fast pass, or a file that cannot be believed. With a monitor publishing, the
+  display collects nothing at all.
+- A tier is called `STALE` after it has missed a whole pass — `display::MISSED_A_PASS`, two
+  intervals — not the instant it is late. One interval old is a tier *due now*, which is the
+  ordinary state of the fast tier for most of every interval, and flipping the word on at that
+  boundary would blink it every ten seconds until a reader stopped seeing it.
 
 ## Orientation
 

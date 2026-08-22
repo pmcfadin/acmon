@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
 
 use acmon::cli::{agtop_usage, parse_agtop, AgtopRequest, ONCE_FLAG};
-use acmon::display::{self, Poll, Poller, Screen, StateReading, POLL_INTERVAL};
+use acmon::display::{self, Poll, Poller, Presence, Screen, StateReading, Writer, POLL_INTERVAL};
 use acmon::liveness::Thresholds;
 use acmon::render;
 use acmon::state::{Paths, StateStore, STATE_FILE};
@@ -53,26 +53,44 @@ fn standing() -> Result<Standing, String> {
     })
 }
 
-/// Read the state file, then assemble the screen that describes what was found.
+/// Classify the monitor, then assemble the screen that says what was found.
 ///
-/// The display's own collection is made **once per run** and reused, which is what F28 asks for
-/// — "its own single collection". A display that re-collected on every poll would spend the
-/// 2.7 s git sweep once a second to watch a machine nobody is monitoring, becoming the tax it
-/// exists to measure.
+/// The clock is read here, once per screen, and passed in: every age below is arithmetic over the
+/// stamps in the file against that one instant, and the writer pid is asked about once. That is
+/// the whole of the freshness decision, and none of it needs a terminal.
+///
+/// A monitor with published facts is drawn from the file and nothing is collected. The display's
+/// own collection happens only when there is nothing of the monitor's to draw, and then **once
+/// per run**, reused — which is what F28 asks for ("its own single collection"). A display that
+/// re-collected on every poll would spend the 2.7 s git sweep once a second to watch a machine
+/// nobody is monitoring, becoming the tax it exists to measure.
 fn screen_for(
     standing: &Standing,
     reading: &StateReading,
     own: &mut Option<(Result<acmon::Snapshot, String>, Duration, SystemTime)>,
 ) -> Screen {
+    let now = SystemTime::now();
+    let writer = match reading {
+        StateReading::Published(published) => Writer::of(published.writer_pid),
+        StateReading::Unrenderable { writer_pid, .. } => Writer::of(*writer_pid),
+        // No pid to ask about. A file that could not be parsed does not name one, and an absent
+        // file names nothing at all.
+        StateReading::Absent | StateReading::Unusable(_) => Writer::Gone,
+    };
+    let presence = display::presence_of(reading, now, writer);
+
+    if let (StateReading::Published(published), false) =
+        (reading, matches!(presence, Presence::Absent(_)))
+    {
+        return Screen::from_published(&presence, published);
+    }
+
     let (facts, overhead, taken_at) = own.get_or_insert_with(|| {
-        // The clock is read once, here, and injected. Everything downstream is deterministic
-        // given that instant, which is what makes a liveness verdict testable.
-        let now = SystemTime::now();
         let (facts, overhead) = display::own_collection(&standing.world, now, &standing.thresholds);
         (facts, overhead, now)
     });
 
-    Screen::from_own_collection(reading, facts.clone(), *overhead, *taken_at)
+    Screen::from_own_collection(&presence, facts.clone(), *overhead, *taken_at)
 }
 
 /// One pass, as plain lines.
@@ -95,7 +113,7 @@ fn once() -> ExitCode {
 
     // A screen with no figures on it is not a rendering; it is a stated failure, and it goes
     // to stderr with a non-zero exit so that a pipeline cannot read it as a quiet machine.
-    if screen.facts.is_err() {
+    if screen.facts.are_absent() {
         for line in lines {
             eprintln!("{line}");
         }

@@ -25,18 +25,25 @@ use std::process::Command as Process;
 use std::time::{Duration, Instant, SystemTime};
 
 use acmon::display::{
-    command_for, cost_of, in_cost_order, own_collection, read_state_file, stat_state_file, Command,
-    Cost, Meters, Poll, Poller, Screen, Stat, StateReading, Unmetered, POLL_INTERVAL,
+    ages_of, command_for, cost_of, in_cost_order, own_collection, presence_of, published_cost_of,
+    published_in_cost_order, read_state_file, reading_of, stat_state_file, Absence, Command, Cost,
+    Facts, Meters, Poll, Poller, Presence, PublishedReading, Screen, Stat, StateReading, TierAge,
+    Unmetered, Writer, MISSED_A_PASS, POLL_INTERVAL,
 };
 use acmon::liveness::{Method, State, Thresholds, Verdict};
+use acmon::meter::{Measured, PassReport, SelfReport};
 use acmon::render::{meter_row, minimum_width, screen_height, screen_to_lines};
+use acmon::schedule::Cadence;
 use acmon::state::{Paths, StateStore, Tier, TieredState, STATE_FILE};
+use acmon::tiers::{
+    FastPayload, MediumPayload, NotifyRow, PassEnvelope, SessionRow, SlowPayload, WorkspaceRow,
+};
 use acmon::vcs::{Unreadable, VcsFacts, WorkspaceState};
 use acmon::workspace::{NamespaceResolution, Workspace, WorkspaceUnknown};
 use acmon::world::{
-    ActivityUnavailable, CodexSession, NotifyConfig, NotifyOutcome, ProcessRecord, ProcessSnapshot,
-    ResourceSource, Resources, ResourcesUnavailable, StateRead, Sweep, Unmeasured, World,
-    WorldError,
+    ActivityUnavailable, CodexSession, LoadAverage, NotifyConfig, NotifyOutcome, ProcessRecord,
+    ProcessSnapshot, ResourceSource, Resources, ResourcesUnavailable, StateRead, Sweep, Unmeasured,
+    World, WorldError,
 };
 use acmon::{
     collect_as, Identity, Persistence, Remembered, Role, Session, Snapshot, WorkspaceReport,
@@ -123,6 +130,16 @@ fn prose_at(screen: &Screen, width: u16, height: u16) -> String {
         .split_whitespace()
         .collect::<Vec<&str>>()
         .join(" ")
+}
+
+/// The verdict a display reaches with no state file at all: `ABSENT`, and its own read.
+fn no_monitor() -> Presence {
+    Presence::Absent(Absence::NoStateFile)
+}
+
+/// The verdict for a state file that could not be believed.
+fn unbelievable(why: &str) -> Presence {
+    Presence::Absent(Absence::Unbelievable(why.to_string()))
 }
 
 /// A directory this test owns, emptied before use.
@@ -355,7 +372,7 @@ fn the_display_says_it_wrote_nothing_rather_than_warning_that_it_failed_to() {
     );
 
     let screen = Screen::from_own_collection(
-        &StateReading::Absent,
+        &no_monitor(),
         Ok(snapshot),
         Duration::from_millis(9),
         fixture_now(),
@@ -394,7 +411,7 @@ fn a_display_screen_still_reports_alerts_a_monitor_did_not_attempt() {
     };
 
     let screen = Screen::from_own_collection(
-        &StateReading::Absent,
+        &no_monitor(),
         Ok(snapshot),
         Duration::from_millis(9),
         fixture_now(),
@@ -426,7 +443,7 @@ fn a_display_screen_still_states_why_a_liveness_verdict_could_not_be_reached() {
     }];
 
     let screen = Screen::from_own_collection(
-        &StateReading::Absent,
+        &no_monitor(),
         Ok(snapshot),
         Duration::from_millis(9),
         fixture_now(),
@@ -625,10 +642,12 @@ fn a_state_file_with_no_tiers_names_its_writer_and_says_it_has_collected_nothing
 }
 
 #[test]
-fn a_state_file_with_tiers_this_display_cannot_read_says_so_rather_than_drawing_nothing() {
-    // The other half of the same rule: the monitor publishes tier payloads (`acmon::tiers`), and a
-    // display with no reader for them must say that rather than report a quiet machine. Reading
-    // them is #30's, so this is the state the display is in until then.
+fn a_tier_payload_this_display_cannot_decode_condemns_the_whole_file() {
+    // The other half of the same rule, and the shape of it changed with #30: the display now has
+    // a reader for every tier, so a payload it cannot decode is no longer "a tier I have no
+    // reader for" — it is a file that cannot be believed. Taking the tiers that happened to
+    // decode would render a shorter session list and a shorter at-risk panel, which is the shape
+    // of a healthy screen.
     let directory = scratch("unknown-tiers");
     let store = store_in(&directory);
     let mut state = TieredState::new(31_337);
@@ -642,11 +661,11 @@ fn a_state_file_with_tiers_this_display_cannot_read_says_so_rather_than_drawing_
         .expect("publishing a state file");
 
     match read_state_file(&store) {
-        StateReading::Unrenderable { why, .. } => assert!(
-            why.contains("1 tier"),
-            "the count of what could not be read is the fact a reader acts on; got {why}"
+        StateReading::Unusable(why) => assert!(
+            why.contains("fast"),
+            "the reason has to name the tier whose payload could not be read; got {why}"
         ),
-        other => panic!("expected an unrenderable state file, got {other:?}"),
+        other => panic!("expected an unusable state file, got {other:?}"),
     }
 
     let _ = std::fs::remove_dir_all(&directory);
@@ -676,7 +695,7 @@ fn a_torn_state_file_is_reported_as_such_and_nothing_is_taken_from_it() {
     }
 
     let screen = Screen::from_own_collection(
-        &reading,
+        &presence_of(&reading, fixture_now(), Writer::Gone),
         Ok(ordinary_snapshot()),
         Duration::from_millis(9),
         fixture_now(),
@@ -810,7 +829,7 @@ fn a_gauge_with_no_figure_is_never_drawn_as_an_empty_bar() {
     // gauge's figure column is eight columns wide.
     let meters = Meters {
         overhead: Ok(Duration::from_millis(400)),
-        duty_cycle: Err(Unmetered::NotRead { tracked_as: "#30" }),
+        duty_cycle: Err(Unmetered::NothingPublishedYet),
         taken_at: fixture_now(),
     };
     let text = meters_as_text(&meters);
@@ -829,7 +848,7 @@ fn a_gauge_with_no_figure_is_never_drawn_as_an_empty_bar() {
         "and must not draw any of the fill a measured figure draws; got:\n{row}"
     );
     assert!(
-        text.contains("cannot read its tier payloads yet") && text.contains("#30"),
+        text.contains("has not published a pass carrying this figure yet"),
         "the reason is stated in full rather than squeezed into the cell; got:\n{text}"
     );
 }
@@ -934,30 +953,30 @@ fn no_line_of_the_meter_row_runs_off_the_side_of_any_terminal() {
 }
 
 #[test]
-fn which_reason_a_missing_duty_cycle_carries_depends_on_what_the_state_file_was() {
-    // Three silences that need three different responses: start a monitor, wait for the reader
-    // #30 will add, or go and look at a file that is damaged. The middle one is not "the monitor
-    // published nothing" — since #27 it publishes its own duty cycle on every pass, and what is
-    // missing is the reader on this side of the file.
-    for (reading, expected) in [
-        (StateReading::Absent, "no monitor is recording"),
+fn which_reason_a_missing_duty_cycle_carries_depends_on_why_there_were_no_published_figures() {
+    // Three silences that need three different responses: start a monitor, wait a few seconds
+    // for one that has just started, or go and look at a file that is damaged. None of them is
+    // "this display cannot read the payloads yet", which is what the middle one used to say and
+    // which #30 made false.
+    for (absence, expected) in [
+        (Absence::NoStateFile, "no monitor is recording"),
         (
-            StateReading::Unrenderable {
+            Absence::NothingPublished {
                 writer_pid: 1,
                 why: "no tier yet".to_string(),
             },
-            "cannot read its tier payloads yet",
+            "has not published a pass carrying this figure yet",
         ),
         (
-            StateReading::Unusable("torn".to_string()),
+            Absence::Unbelievable("torn".to_string()),
             "could not be believed",
         ),
     ] {
-        let meters = Meters::for_own_collection(&reading, Duration::from_millis(1), fixture_now());
+        let meters = Meters::for_own_collection(&absence, Duration::from_millis(1), fixture_now());
         let line = meters_as_text(&meters);
         assert!(
             line.contains(expected),
-            "for {reading:?} the meter line should contain {expected:?}; got:\n{line}"
+            "for {absence:?} the meter line should contain {expected:?}; got:\n{line}"
         );
     }
 }
@@ -966,7 +985,7 @@ fn which_reason_a_missing_duty_cycle_carries_depends_on_what_the_state_file_was(
 fn the_meters_are_on_the_same_screen_as_the_figures_they_qualify() {
     // F33: first-class, alongside the data — not in a log, not behind a flag.
     let screen = Screen::from_own_collection(
-        &StateReading::Absent,
+        &no_monitor(),
         Ok(ordinary_snapshot()),
         Duration::from_millis(2_470),
         fixture_now(),
@@ -1115,7 +1134,7 @@ fn the_screen_states_where_a_session_with_no_child_cpu_figure_was_put() {
     ];
 
     let screen = Screen::from_own_collection(
-        &StateReading::Absent,
+        &no_monitor(),
         Ok(snapshot),
         Duration::from_millis(9),
         fixture_now(),
@@ -1166,7 +1185,7 @@ fn the_table_draws_its_rows_in_the_order_the_sort_decided() {
     ];
 
     let screen = Screen::from_own_collection(
-        &StateReading::Absent,
+        &no_monitor(),
         Ok(snapshot),
         Duration::from_millis(9),
         fixture_now(),
@@ -1216,7 +1235,7 @@ fn the_rows_on_the_screen_are_sessions() {
     snapshot.sessions = vec![session(69_046), session(264)];
 
     let screen = Screen::from_own_collection(
-        &StateReading::Absent,
+        &no_monitor(),
         Ok(snapshot),
         Duration::from_millis(9),
         fixture_now(),
@@ -1237,7 +1256,7 @@ fn the_rows_on_the_screen_are_sessions() {
 fn the_at_risk_panel_is_on_the_screen_when_nothing_is_at_risk() {
     // F32. "0 at risk" is information, and an absent panel reads as "did not check".
     let screen = Screen::from_own_collection(
-        &StateReading::Absent,
+        &no_monitor(),
         Ok(ordinary_snapshot()),
         Duration::from_millis(9),
         fixture_now(),
@@ -1265,7 +1284,7 @@ fn the_at_risk_panel_lists_the_stranded_workspaces_it_found() {
     });
 
     let screen = Screen::from_own_collection(
-        &StateReading::Absent,
+        &no_monitor(),
         Ok(snapshot),
         Duration::from_millis(9),
         fixture_now(),
@@ -1282,7 +1301,7 @@ fn the_at_risk_panel_lists_the_stranded_workspaces_it_found() {
 #[test]
 fn a_screen_with_no_figures_says_so_instead_of_drawing_an_empty_table() {
     let screen = Screen::from_own_collection(
-        &StateReading::Absent,
+        &no_monitor(),
         Err("process snapshot incomplete (observer 4242 not in its own result)".to_string()),
         Duration::from_millis(9),
         fixture_now(),
@@ -1303,16 +1322,16 @@ fn a_screen_with_no_figures_says_so_instead_of_drawing_an_empty_table() {
 fn every_screen_states_where_its_figures_came_from() {
     // A screen that says nothing about its own provenance is a screen a reader will assume came
     // from a running monitor.
-    for reading in [
-        StateReading::Absent,
-        StateReading::Unrenderable {
+    for presence in [
+        no_monitor(),
+        Presence::Absent(Absence::NothingPublished {
             writer_pid: 31_337,
             why: "no tier yet".to_string(),
-        },
-        StateReading::Unusable("torn".to_string()),
+        }),
+        unbelievable("torn"),
     ] {
         let screen = Screen::from_own_collection(
-            &reading,
+            &presence,
             Ok(ordinary_snapshot()),
             Duration::from_millis(9),
             fixture_now(),
@@ -1325,7 +1344,7 @@ fn every_screen_states_where_its_figures_came_from() {
         let text = prose(&screen, wide());
         assert!(
             text.contains("this display took for itself"),
-            "for {reading:?} the screen has to say the figures are its own read; got:\n{text}"
+            "for {presence:?} the screen has to say the figures are its own read; got:\n{text}"
         );
         assert!(
             text.contains("read-only"),
@@ -1339,7 +1358,7 @@ fn every_screen_states_where_its_figures_came_from() {
 fn a_screen_with_no_monitor_says_that_nothing_is_being_recorded_or_alerted() {
     // F28, and the first thing a fresh `brew install` hits.
     let screen = Screen::from_own_collection(
-        &StateReading::Absent,
+        &no_monitor(),
         Ok(ordinary_snapshot()),
         Duration::from_millis(9),
         fixture_now(),
@@ -1360,7 +1379,7 @@ fn the_same_screen_fits_whatever_width_the_terminal_is() {
     // line may overflow it. Absolute widths are not asserted — only that every line fits, at
     // every width from the narrowest the table can be drawn in upwards.
     let screen = Screen::from_own_collection(
-        &StateReading::Unusable("torn".to_string()),
+        &unbelievable("torn"),
         Ok(ordinary_snapshot()),
         Duration::from_millis(2_470),
         fixture_now(),
@@ -1392,7 +1411,7 @@ fn a_terminal_too_narrow_for_the_numbers_still_says_why() {
     // Inherited from the table and asserted here so the screen wrapper cannot lose it: a
     // truncated CPU total is a plausible wrong answer, so none is printed.
     let screen = Screen::from_own_collection(
-        &StateReading::Absent,
+        &no_monitor(),
         Ok(ordinary_snapshot()),
         Duration::from_millis(9),
         fixture_now(),
@@ -1486,7 +1505,7 @@ fn crowded_snapshot() -> Snapshot {
 
 fn crowded_screen() -> Screen {
     Screen::from_own_collection(
-        &StateReading::Absent,
+        &no_monitor(),
         Ok(crowded_snapshot()),
         Duration::from_millis(2_470),
         fixture_now(),
@@ -1848,6 +1867,842 @@ fn a_resize_asks_for_another_pass() {
     assert_eq!(command_for(&Event::Resize(80, 24)), Command::Redraw);
 }
 
+// --- How old the facts are, and whether the monitor is still there ---------------------------
+//
+// The failure this section exists to prevent is the one PRD §2.2 opens with, reproduced inside
+// this tool: `amon` wedges forty minutes ago and `state.json` still reads as perfectly healthy.
+//
+// Every test here drives the decision as a function over stamps and a clock. **Nothing sleeps.**
+// An age is a figure computed from two instants, so ageing a fixture by waiting would assert the
+// scheduler's accuracy rather than the display's arithmetic — and on this class of machine that
+// varies by 2x between runs. The pid check is a parameter for the same reason: a transition that
+// could only be tested by killing a process is a transition nobody would test.
+
+/// The instants these fixtures use, relative to [`fixture_now`].
+fn ago(seconds: u64) -> SystemTime {
+    fixture_now() - Duration::from_secs(seconds)
+}
+
+fn iso(time: SystemTime) -> String {
+    acmon::isotime::iso8601_from_unix_seconds(acmon::isotime::unix_seconds(time))
+}
+
+/// A state file a monitor could have written, with every stamp under the test's control.
+///
+/// Built from the payload structs rather than by running a collection, deliberately: what is
+/// asserted below is what a display concludes from *stamps*, and no collection can be asked to
+/// have happened forty minutes ago. That the payload structs are what the monitor really writes
+/// is `seam16`'s round-trip test, not this one's.
+struct Publication {
+    writer_pid: u32,
+    pace: String,
+    every_tier_has_run: bool,
+    /// When each tier's most recent pass started. `None` for a tier that has not published.
+    fast_pass: SystemTime,
+    medium_pass: Option<SystemTime>,
+    slow_pass: Option<SystemTime>,
+    /// The oldest workspace reading the slow tier published — its **stamp**, which is emphatically
+    /// not its last pass. On a machine with seventy repositories these are twenty minutes apart.
+    slow_evidence: SystemTime,
+    sessions: Vec<SessionRow>,
+    workspaces: Vec<WorkspaceRow>,
+    never_read: usize,
+}
+
+impl Publication {
+    /// A healthy monitor: every tier published at `fixture_now`, one session, one clean
+    /// workspace, nothing warming up.
+    fn healthy() -> Publication {
+        Publication {
+            writer_pid: 31_337,
+            pace: "active".to_string(),
+            every_tier_has_run: true,
+            fast_pass: fixture_now(),
+            medium_pass: Some(fixture_now()),
+            slow_pass: Some(fixture_now()),
+            slow_evidence: fixture_now(),
+            sessions: vec![published_session()],
+            workspaces: vec![published_workspace(
+                "/Users/pmcfadin/projects/agentic_coding_monitor",
+                "CLEAN",
+                false,
+                Some(0),
+                Some(fixture_now()),
+            )],
+            never_read: 0,
+        }
+    }
+
+    fn into_state(self) -> TieredState {
+        let mut state = TieredState::new(self.writer_pid);
+        state.set_tier_data(
+            Tier::Fast,
+            // The one place in this file that names every field of a published payload, so a
+            // field added to the contract shows up here and nowhere else.
+            serde_json::to_value(FastPayload {
+                pass: envelope("fast", self.fast_pass, self.every_tier_has_run),
+                sessions: self.sessions,
+                monitor: self_report(&self.pace),
+                notify: NotifyRow {
+                    notable: 0,
+                    delivered: 0,
+                    failed: 0,
+                    not_attempted: 0,
+                    reason: None,
+                    read_only: None,
+                },
+                silence_read_by: "medium".to_string(),
+            })
+            .expect("a fast payload serialises"),
+            self.fast_pass,
+        );
+        if let Some(at) = self.medium_pass {
+            state.set_tier_data(
+                Tier::Medium,
+                serde_json::to_value(MediumPayload {
+                    pass: envelope("medium", at, self.every_tier_has_run),
+                    directories_visited: 812,
+                    sweep_complete: true,
+                    repositories_found: 34,
+                    unlocated: Vec::new(),
+                })
+                .expect("a medium payload serialises"),
+                at,
+            );
+        }
+        if let Some(at) = self.slow_pass {
+            let at_risk = self.workspaces.iter().filter(|row| row.at_risk).count();
+            state.set_tier_data(
+                Tier::Slow,
+                serde_json::to_value(SlowPayload {
+                    pass: envelope("slow", at, self.every_tier_has_run),
+                    at_risk,
+                    workspaces: self.workspaces,
+                    read_this_pass: 5,
+                    never_read: self.never_read,
+                    next_slice: 5,
+                })
+                .expect("a slow payload serialises"),
+                // The tier's stamp is the oldest evidence in it, which is what `tiers::stamp_for`
+                // publishes for this tier and the whole reason F30 needs two ages.
+                self.slow_evidence,
+            );
+        }
+        state
+    }
+
+    /// The reading a display gets from this file.
+    fn read(self) -> PublishedReading {
+        match reading_of(&self.into_state()) {
+            StateReading::Published(reading) => *reading,
+            other => panic!("this fixture has to decode as published facts; got {other:?}"),
+        }
+    }
+}
+
+fn envelope(tier: &str, started_at: SystemTime, every_tier_has_run: bool) -> PassEnvelope {
+    PassEnvelope {
+        tier: tier.to_string(),
+        sequence: 7,
+        started_at: iso(started_at),
+        took_ms: 49,
+        budget_ms: 150,
+        overran: None,
+        load: Measured::known(LoadAverage {
+            one_minute: 4.9,
+            five_minute: 5.2,
+            fifteen_minute: 4.4,
+            cpus: 16,
+        }),
+        every_tier_has_run,
+        announcing: every_tier_has_run,
+    }
+}
+
+fn self_report(pace: &str) -> SelfReport {
+    SelfReport {
+        own_cpu_ms: Measured::known(412),
+        window_secs: 60,
+        duty_cycle: Measured::known(0.004_13),
+        busy_fraction: Measured::known(0.006),
+        budget: 0.01,
+        within_budget: Measured::known(true),
+        pace: pace.to_string(),
+        passes: vec![("fast".to_string(), 7)],
+        last_pass: vec![PassReport {
+            tier: "fast".to_string(),
+            took_ms: 49,
+            budget_ms: 150,
+            overran: None,
+            age_ms: 0,
+        }],
+    }
+}
+
+/// One session as the monitor publishes it: measured, active, in a known workspace.
+fn published_session() -> SessionRow {
+    SessionRow {
+        pid: Some(69_046),
+        recorded_as: None,
+        cli: "claude".to_string(),
+        state: "ACTIVE".to_string(),
+        method: "the transcript changed recently".to_string(),
+        inferred: false,
+        unknown_why: None,
+        unknown_is_structural: false,
+        workspace: Measured::known("/Users/pmcfadin/projects/agentic_coding_monitor".to_string()),
+        own_cpu_ms: Measured::known(1_669_000),
+        children_cpu_ms: Measured::known(32_317_000),
+        current_memory_bytes: Measured::known(482_000_000),
+        peak_memory_bytes: Measured::known(622_000_000),
+        bytes_written: Measured::known(166_000_000),
+        source: Measured::known("proc_pid_rusage".to_string()),
+        remembered_at: None,
+    }
+}
+
+fn published_workspace(
+    path: &str,
+    state: &str,
+    at_risk: bool,
+    entries: Option<usize>,
+    observed_at: Option<SystemTime>,
+) -> WorkspaceRow {
+    WorkspaceRow {
+        path: path.to_string(),
+        state: state.to_string(),
+        at_risk,
+        unknown_why: if state == "UNKNOWN" {
+            Some("not read yet".to_string())
+        } else {
+            None
+        },
+        uncommitted_entries: entries,
+        linked_worktree: false,
+        observed_at: observed_at.map(iso),
+    }
+}
+
+/// The screen a display draws from a published file, at `now`, with the writer's liveness given.
+fn published_screen(reading: &PublishedReading, now: SystemTime, writer: Writer) -> Screen {
+    let presence = presence_of(
+        &StateReading::Published(Box::new(reading.clone())),
+        now,
+        writer,
+    );
+    Screen::from_published(&presence, reading)
+}
+
+#[test]
+fn a_monitor_publishing_inside_every_interval_is_fresh_and_says_what_that_rests_on() {
+    let reading = Publication::healthy().read();
+    let screen = published_screen(&reading, fixture_now(), Writer::Alive);
+
+    assert_eq!(screen.presence.label(), "FRESH");
+    assert!(screen.presence.trustworthy());
+
+    let text = prose(&screen, wide());
+    assert!(
+        text.contains("FRESH — the monitor at pid 31337 is running"),
+        "the screen names the monitor it is drawing; got:\n{text}"
+    );
+    assert!(
+        text.contains(
+            "the writer pid still exists and every tier published inside its own \
+                       cadence"
+        ),
+        "and which two observations the verdict rests on — a verdict whose evidence is unstated \
+         is an assertion; got:\n{text}"
+    );
+    assert!(
+        text.contains("69046"),
+        "and it draws the monitor's own session rows rather than collecting for itself; \
+         got:\n{text}"
+    );
+    assert!(
+        !text.contains("this display took for itself"),
+        "a screen drawn from published facts must never claim they are its own; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_tier_that_has_missed_a_whole_pass_marks_the_whole_screen_and_never_a_row() {
+    // F29. A stale file is uniformly untrustworthy: every row in it came out of the same write,
+    // so marking rows individually would imply the unmarked ones had been re-verified.
+    let mut publication = Publication::healthy();
+    // The fast tier has not run for well past the point where a pass was missed. Expressed as a
+    // multiple of the interval it is judged against, so the fixture cannot drift from the rule.
+    let missed = Cadence::ACTIVE.fast * (MISSED_A_PASS + 1);
+    publication.fast_pass = fixture_now() - missed;
+    let reading = publication.read();
+
+    let screen = published_screen(&reading, fixture_now(), Writer::Alive);
+    assert_eq!(screen.presence.label(), "STALE");
+    assert!(
+        !screen.presence.trustworthy(),
+        "a stale screen may not be described as trustworthy"
+    );
+
+    let lines = screen_to_lines(&screen, wide(), screen_height(&screen, wide()));
+    let mark = lines
+        .iter()
+        .position(|line| line.contains("THIS WHOLE SCREEN IS STALE"))
+        .expect("the whole-screen mark has to be on the screen");
+    let first_row = lines
+        .iter()
+        .position(|line| line.contains("69046"))
+        .expect("the rows are still drawn — a stale fact is still a fact, said as one");
+    assert!(
+        mark < first_row,
+        "the mark has to be above everything it is about, at line {mark} against {first_row}"
+    );
+    assert!(
+        !lines[first_row].contains("STALE"),
+        "no row carries a freshness judgement of its own; got:\n{}",
+        lines[first_row]
+    );
+}
+
+#[test]
+fn a_dead_monitor_is_never_drawn_as_a_live_one_however_fresh_the_file_it_left() {
+    // The `SIGKILL` case at the far end: the pid is reaped a moment after the last write, so the
+    // stamps are seconds old and the monitor is gone. Age alone would call this FRESH.
+    let reading = Publication::healthy().read();
+    let screen = published_screen(&reading, fixture_now(), Writer::Gone);
+
+    assert_eq!(
+        screen.presence.label(),
+        "DEAD",
+        "a pid that no longer exists outranks every stamp in the file: nothing will refresh it"
+    );
+    let text = prose(&screen, wide());
+    assert!(
+        text.contains("THE MONITOR IS DEAD"),
+        "and the screen leads with it; got:\n{text}"
+    );
+    assert!(
+        text.contains("asking the kernel about the writer pid"),
+        "stating that this verdict is an observation about a pid rather than arithmetic over \
+         stamps; got:\n{text}"
+    );
+    assert!(
+        text.contains("nothing is being recorded") && text.contains("will be announced"),
+        "a reader has to be told that alerts have stopped too; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_monitor_that_is_gone_and_one_that_is_merely_slow_are_told_apart_in_words() {
+    // The two sentences a reader most needs to be able to distinguish. Both exist, and neither
+    // is a shortened version of the other.
+    let mut slow = Publication::healthy();
+    slow.fast_pass = fixture_now() - Cadence::ACTIVE.fast * (MISSED_A_PASS + 1);
+    let stale = prose(
+        &published_screen(&slow.read(), fixture_now(), Writer::Alive),
+        wide(),
+    );
+    let dead = prose(
+        &published_screen(&Publication::healthy().read(), fixture_now(), Writer::Gone),
+        wide(),
+    );
+
+    assert!(
+        stale.contains("still exists") && stale.contains("may yet catch up"),
+        "a stale monitor is alive, and the screen has to say a refresh is still possible; \
+         got:\n{stale}"
+    );
+    assert!(
+        !stale.contains("CORPSE") && !stale.contains("THE MONITOR IS DEAD"),
+        "and must not be described as dead; got:\n{stale}"
+    );
+    assert!(
+        dead.contains("EVERY FIGURE BELOW IS A CORPSE") && dead.contains("will ever be refreshed"),
+        "a dead monitor's screen has to say the figures will never improve; got:\n{dead}"
+    );
+    assert!(
+        !dead.contains("may yet catch up"),
+        "and must not offer the hope a stale one does; got:\n{dead}"
+    );
+}
+
+#[test]
+fn the_screen_goes_fresh_then_stale_then_dead_as_the_same_file_ages_and_its_writer_goes() {
+    // S8 as an ordering over stamps rather than a stopwatch: one file, three clocks, and the pid
+    // check flipped once. No process is killed and nothing sleeps.
+    let reading = Publication::healthy().read();
+    let interval = Cadence::ACTIVE.fast;
+
+    let verdicts: Vec<&'static str> = [
+        // Inside its interval, and one interval old — a tier due right now is not a late one.
+        (interval, Writer::Alive),
+        (
+            interval * MISSED_A_PASS + Duration::from_secs(1),
+            Writer::Alive,
+        ),
+        (
+            interval * MISSED_A_PASS + Duration::from_secs(1),
+            Writer::Gone,
+        ),
+    ]
+    .iter()
+    .map(|(age, writer)| {
+        published_screen(&reading, fixture_now() + *age, *writer)
+            .presence
+            .label()
+    })
+    .collect();
+
+    assert_eq!(
+        verdicts,
+        vec!["FRESH", "STALE", "DEAD"],
+        "the same file has to pass through all three as it ages and its writer goes"
+    );
+}
+
+#[test]
+fn every_tier_s_age_is_drawn_from_that_tier_s_own_stamp() {
+    // F30. Three tiers, three ages, and the relationship between them is what reproduces — never
+    // an absolute figure.
+    let mut publication = Publication::healthy();
+    publication.fast_pass = ago(5);
+    publication.medium_pass = Some(ago(50));
+    publication.slow_pass = Some(ago(12));
+    publication.slow_evidence = ago(1_500);
+    let reading = publication.read();
+
+    let ages = ages_of(&reading, fixture_now());
+    let age = |tier: Tier| -> TierAge { ages.of(tier).expect("every tier published").clone() };
+
+    assert_eq!(age(Tier::Fast).since_evidence, Ok(Duration::from_secs(5)));
+    assert_eq!(
+        age(Tier::Medium).since_evidence,
+        Ok(Duration::from_secs(50))
+    );
+    assert!(
+        age(Tier::Slow).since_evidence.clone().expect("published")
+            > age(Tier::Medium).since_evidence.clone().expect("published"),
+        "the slow tier's evidence is the oldest thing in the file, and its age has to say so"
+    );
+    assert!(
+        age(Tier::Slow).since_pass.clone().expect("published")
+            < age(Tier::Slow).since_evidence.clone().expect("published"),
+        "and its last pass is far younger than its oldest fact — one number for both would have \
+         to be wrong about one of them"
+    );
+    assert_eq!(
+        ages.oldest_evidence(),
+        Some(Duration::from_secs(1_500)),
+        "the oldest fact on the screen is what a whole-screen mark has to state"
+    );
+
+    let text = prose(
+        &published_screen(&reading, fixture_now(), Writer::Alive),
+        wide(),
+    );
+    for tier in ["fast", "medium", "slow"] {
+        assert!(
+            text.contains(&format!("{tier} last pass")),
+            "each tier's age is on the screen, drawn from its own stamp; {tier} is missing \
+             from:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn a_session_s_liveness_ages_against_the_medium_tier_rather_than_the_fast_one() {
+    // The correction #27 handed forward. The rows are the fast tier's, but a WAITING rests on
+    // transcript silence read by the *medium* tier, so ageing that evidence against the fast
+    // stamp would report ten-minute-old silence as ten seconds old.
+    let mut publication = Publication::healthy();
+    publication.fast_pass = ago(3);
+    publication.medium_pass = Some(ago(45));
+    let reading = publication.read();
+
+    assert_eq!(reading.fast.silence_read_by, "medium");
+    let text = prose(
+        &published_screen(&reading, fixture_now(), Writer::Alive),
+        wide(),
+    );
+    assert!(
+        text.contains("rests on transcript activity read by the medium tier"),
+        "the screen has to name the tier a state's evidence ages against; got:\n{text}"
+    );
+    assert!(
+        text.contains("not as old as this table's"),
+        "and say plainly that it is not the table's own age; got:\n{text}"
+    );
+}
+
+#[test]
+fn the_at_risk_panel_states_the_slow_tier_s_evidence_age_and_not_the_newest_write() {
+    // S13, and the criterion in words: a workspace committed 50 s ago must not appear at-risk
+    // under a 1 s stamp. The panel is fed by the slowest tier, so its age is that tier's oldest
+    // reading — never the fast tier's, however recently the file was rewritten.
+    let mut publication = Publication::healthy();
+    publication.fast_pass = fixture_now();
+    publication.slow_pass = Some(ago(30));
+    publication.slow_evidence = ago(1_320);
+    publication.workspaces = vec![published_workspace(
+        "/Users/pmcfadin/projects/workforceos",
+        "DIRTY-STRANDED",
+        true,
+        Some(27),
+        Some(ago(1_320)),
+    )];
+    let reading = publication.read();
+
+    let text = prose(
+        &published_screen(&reading, fixture_now(), Writer::Alive),
+        wide(),
+    );
+    let expected = acmon::render::format_age(Duration::from_secs(1_320));
+
+    assert!(
+        text.contains(&format!("slow-tier evidence, oldest {expected} old")),
+        "the panel states its own evidence age beside it; got:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("{expected} /Users/pmcfadin/projects/workforceos")),
+        "and each row carries the age of the reading it rests on, not the file's; got:\n{text}"
+    );
+    assert!(
+        !text.contains("oldest 0s old"),
+        "the panel must never take the fast tier's freshness for its own; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_workspace_the_slow_tier_has_never_read_is_counted_and_never_called_clean() {
+    let mut publication = Publication::healthy();
+    publication.workspaces = vec![published_workspace(
+        "/Users/pmcfadin/projects/never-looked-at",
+        "UNKNOWN",
+        false,
+        None,
+        None,
+    )];
+    publication.never_read = 1;
+    let reading = publication.read();
+
+    let text = prose(
+        &published_screen(&reading, fixture_now(), Writer::Alive),
+        wide(),
+    );
+    assert!(
+        text.contains("1 workspace(s) have never been read") && text.contains("NOT exhaustive"),
+        "a panel that has not finished looking may not present itself as a clear result; \
+         got:\n{text}"
+    );
+    assert!(
+        !text.contains("all checked workspaces are clean"),
+        "and must not describe an unread workspace as a clean one; got:\n{text}"
+    );
+    assert!(
+        text.contains("not read yet"),
+        "and the state it is accounted under is the monitor's own reason rather than a silence; \
+         got:\n{text}"
+    );
+    assert!(
+        text.contains("1 of 1 could not be read"),
+        "with the denominator said out loud, because 0 at risk means nothing when nothing was \
+         checked; got:\n{text}"
+    );
+}
+
+#[test]
+fn an_idled_down_monitor_is_not_called_stale_for_keeping_its_own_slower_cadence() {
+    // F22: with no session live the loop idles down, and the fast tier legitimately runs once a
+    // minute. Judged against the active cadence the same file would read as STALE — which is a
+    // monitor doing exactly what it was told to, reported as broken.
+    let mut publication = Publication::healthy();
+    publication.pace = "idle".to_string();
+    publication.fast_pass = fixture_now() - Cadence::ACTIVE.fast * (MISSED_A_PASS + 1);
+    let reading = publication.read();
+
+    let presence = presence_of(
+        &StateReading::Published(Box::new(reading.clone())),
+        fixture_now(),
+        Writer::Alive,
+    );
+    assert_eq!(presence.label(), "FRESH");
+    assert_eq!(
+        presence
+            .ages()
+            .expect("published")
+            .of(Tier::Fast)
+            .expect("published")
+            .interval,
+        Cadence::IDLE.fast,
+        "the ages are judged against the cadence the monitor said it was keeping"
+    );
+}
+
+#[test]
+fn a_cadence_word_this_build_does_not_know_is_said_out_loud_rather_than_guessed() {
+    let mut publication = Publication::healthy();
+    publication.pace = "hibernating".to_string();
+    let reading = publication.read();
+    let screen = published_screen(&reading, fixture_now(), Writer::Alive);
+
+    let ages = screen.presence.ages().expect("published");
+    assert!(ages.pace_unknown);
+    assert_eq!(
+        ages.cadence,
+        Cadence::IDLE,
+        "an unknown word is judged against the slower cadence, so it cannot manufacture a \
+         staleness warning"
+    );
+    let text = prose(&screen, wide());
+    assert!(
+        text.contains("hibernating") && text.contains("does not know"),
+        "and it is never silent about having done so; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_tier_stamped_in_the_future_has_no_age_rather_than_a_fresh_one() {
+    // A clock that moved backwards between the monitor's write and this read. Zero would present
+    // the least trustworthy stamp on the screen as the freshest thing on it.
+    let mut publication = Publication::healthy();
+    publication.medium_pass = Some(fixture_now() + Duration::from_secs(600));
+    let reading = publication.read();
+
+    let ages = ages_of(&reading, fixture_now());
+    let medium = ages.of(Tier::Medium).expect("published");
+    let why = medium
+        .since_pass
+        .clone()
+        .expect_err("a stamp in the future is not an age");
+    assert!(
+        why.contains("clock moved backwards"),
+        "and the reason says why rather than showing 0s; got {why}"
+    );
+    assert!(
+        prose(
+            &published_screen(&reading, fixture_now(), Writer::Alive),
+            wide()
+        )
+        .contains("clock moved backwards"),
+        "and it reaches the screen"
+    );
+}
+
+#[test]
+fn a_monitor_that_died_before_publishing_anything_is_dead_rather_than_absent() {
+    // Under a KeepAlive LaunchAgent (#11) this is a crash loop, and "no monitor is recording"
+    // would describe it as a machine nobody had set up.
+    let state = TieredState::new(31_337);
+    let reading = reading_of(&state);
+    assert!(matches!(reading, StateReading::Unrenderable { .. }));
+
+    let alive = presence_of(&reading, fixture_now(), Writer::Alive);
+    assert_eq!(
+        alive.label(),
+        "ABSENT",
+        "a monitor that has just started and holds the writer role is warming up, not dead"
+    );
+
+    let gone = presence_of(&reading, fixture_now(), Writer::Gone);
+    assert_eq!(gone.label(), "DEAD");
+    let text = prose(
+        &Screen::from_own_collection(
+            &gone,
+            Ok(ordinary_snapshot()),
+            Duration::from_millis(9),
+            fixture_now(),
+        ),
+        wide(),
+    );
+    assert!(
+        text.contains("THE MONITOR IS DEAD") && text.contains("crash loop"),
+        "the screen has to name what a monitor dying before its first pass means; got:\n{text}"
+    );
+    assert!(
+        text.contains("this display took for itself"),
+        "and still say whose the figures on it are, because they are not the monitor's; \
+         got:\n{text}"
+    );
+}
+
+#[test]
+fn asking_whether_a_writer_is_alive_never_signals_anything_and_pid_zero_is_no_process() {
+    // The tool observes; it never acts (N1). `kill(0, 0)` addresses the caller's whole process
+    // group, so a state file naming 0 as its writer must not become a signal to the terminal
+    // session this display is running in.
+    assert_eq!(Writer::of(0), Writer::Gone);
+    assert_eq!(
+        Writer::of(std::process::id()),
+        Writer::Alive,
+        "and this test's own process is observably alive, which is what makes the negative \
+         meaningful"
+    );
+}
+
+#[test]
+fn published_rows_are_ordered_by_child_cpu_with_an_unmeasurable_cost_first() {
+    // The same rule as a locally collected table (NF10, F54, F55): the bottom of the table is
+    // what a short terminal drops, so a session with no cost at all must not be ranked cheap.
+    let cheap = SessionRow {
+        pid: Some(1),
+        children_cpu_ms: Measured::known(1_000),
+        ..published_session()
+    };
+    let dear = SessionRow {
+        pid: Some(2),
+        children_cpu_ms: Measured::known(90_000),
+        ..published_session()
+    };
+    let unknown = SessionRow {
+        pid: Some(3),
+        children_cpu_ms: Measured::unavailable("the ledger could not be read"),
+        ..published_session()
+    };
+
+    let rows = vec![cheap, dear, unknown];
+    let order: Vec<Option<i32>> = published_in_cost_order(&rows)
+        .into_iter()
+        .map(|row| row.pid)
+        .collect();
+    assert_eq!(order, vec![Some(3), Some(2), Some(1)]);
+    assert!(matches!(published_cost_of(&rows[2]), Cost::Unmeasurable(_)));
+}
+
+#[test]
+fn a_remembered_published_figure_is_marked_and_carries_its_own_age() {
+    // Almost all of an agent's cost is in its children, and once the process is gone that total
+    // exists nowhere but in what the monitor wrote down. Showing it is the point; showing it
+    // without its age would make a memory indistinguishable from a measurement.
+    let mut publication = Publication::healthy();
+    publication.sessions = vec![SessionRow {
+        pid: None,
+        recorded_as: Some("-Users-pmcfadin-projects-acmon".to_string()),
+        remembered_at: Some(iso(ago(3_600))),
+        ..published_session()
+    }];
+    let reading = publication.read();
+    let text = prose(
+        &published_screen(&reading, fixture_now(), Writer::Alive),
+        wide(),
+    );
+
+    assert!(
+        text.contains("last read 1h00m before that pass"),
+        "the age is stated against the pass that published it, so the monitor's own staleness is \
+         not folded into it; got:\n{text}"
+    );
+    assert!(
+        text.contains("A figure marked * is the last reading"),
+        "and the marker is explained; got:\n{text}"
+    );
+}
+
+#[test]
+fn a_published_screen_shows_the_monitor_s_own_duty_cycle_rather_than_a_reason_for_its_absence() {
+    // The gap this ticket closed. Before it, a monitor could be publishing 0.4% of a core while
+    // the display printed "this display cannot read its tier payloads yet" where the figure
+    // should be — and collected for itself at 2.5 s a pass to fill the table.
+    let reading = Publication::healthy().read();
+    let screen = published_screen(&reading, fixture_now(), Writer::Alive);
+
+    assert_eq!(screen.meters.duty_cycle, Ok(0.004_13));
+    let text = prose(&screen, wide());
+    assert!(
+        text.contains("0.4%"),
+        "the monitor's measured duty cycle is on the screen as a figure; got:\n{text}"
+    );
+    assert!(
+        !text.contains("absent"),
+        "with no gauge left standing in for one; got:\n{text}"
+    );
+    assert!(
+        matches!(screen.facts, Facts::Monitor(_)),
+        "and the figures beside it are the monitor's too"
+    );
+}
+
+#[test]
+fn no_screen_is_ever_blank_or_a_bare_error_whatever_the_monitor_turned_out_to_be() {
+    // The criterion a fresh `brew install` hits first, asserted across every verdict at once. A
+    // blank screen or a one-line error would be the "fail to zero" this project exists to remove.
+    let reading = Publication::healthy().read();
+    let screens = vec![
+        (
+            "FRESH",
+            published_screen(&reading, fixture_now(), Writer::Alive),
+        ),
+        (
+            "DEAD",
+            published_screen(&reading, fixture_now(), Writer::Gone),
+        ),
+        (
+            "ABSENT",
+            Screen::from_own_collection(
+                &no_monitor(),
+                Ok(ordinary_snapshot()),
+                Duration::from_millis(9),
+                fixture_now(),
+            ),
+        ),
+        (
+            "ABSENT",
+            Screen::from_own_collection(
+                &unbelievable("the file is torn"),
+                Err("the collection failed too".to_string()),
+                Duration::from_millis(9),
+                fixture_now(),
+            ),
+        ),
+    ];
+
+    for (expected, screen) in screens {
+        assert_eq!(screen.presence.label(), expected);
+        let text = prose(&screen, wide());
+        assert!(
+            text.starts_with(expected),
+            "the word the screen is marked with is the first thing on it, not only a value in an \
+             enum; for {expected} got:\n{text}"
+        );
+        assert!(
+            text.split_whitespace().count() > 40,
+            "a screen that says almost nothing is the failure this project exists to remove; \
+             for {expected} got:\n{text}"
+        );
+        assert!(
+            text.contains("read-only"),
+            "and every screen says which binary it is; for {expected} got:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn a_published_screen_fits_every_width_and_every_height_without_losing_its_freshness_mark() {
+    // The mark is the one line on this screen that may never be clipped: it is what makes every
+    // figure below it readable. It is drawn above everything it qualifies for exactly that
+    // reason, and a short terminal cuts from the bottom.
+    let mut publication = Publication::healthy();
+    publication.fast_pass = fixture_now() - Cadence::ACTIVE.fast * (MISSED_A_PASS + 1);
+    let reading = publication.read();
+    let screen = published_screen(&reading, fixture_now(), Writer::Alive);
+
+    for width in [minimum_width(), minimum_width() + 24, minimum_width() + 96] {
+        let full = screen_height(&screen, width);
+        for height in [3, full / 2, full] {
+            let lines = screen_to_lines(&screen, width, height);
+            for line in &lines {
+                assert!(
+                    line.chars().count() <= width as usize,
+                    "a line ran off the side at {width}x{height}: {line:?}"
+                );
+            }
+            assert!(
+                lines.iter().any(|line| line.contains("STALE")),
+                "the freshness mark survives {width}x{height}; got:\n{}",
+                lines.join("\n")
+            );
+        }
+    }
+}
+
 // --- The binary, where the rule has to hold in fact -----------------------------------------
 
 #[test]
@@ -1899,6 +2754,110 @@ fn agtop_leaves_no_mark_where_the_monitor_would_write_one() {
     assert!(
         !stdout.trim().is_empty() || !stderr.trim().is_empty(),
         "and it still has to have said something"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn agtop_draws_a_live_monitor_as_fresh_and_the_same_file_as_dead_once_its_writer_is_gone() {
+    // S8, end to end, with two real processes. Nothing here is a fixture: `amon watch` publishes
+    // a real `state.json` and `agtop --once` reads it twice — once while the monitor holds the
+    // writer role, and once after it has exited and its pid has been reaped.
+    //
+    // The waits below are waits for a *process*, not assertions about timing. What is asserted is
+    // that the same file reads as FRESH with its writer alive and DEAD without it.
+    let directory = scratch("live-then-dead");
+    let state_directory = directory.join("state");
+    let memory = directory.join("memory.json");
+    let notify_config = directory.join("no-such-notify.toml");
+
+    let mut monitor = Process::new(env!("CARGO_BIN_EXE_amon"))
+        .arg("watch")
+        .env(acmon::state::STATE_DIR_VARIABLE, &state_directory)
+        .env(acmon::state::CONFIG_DIR_VARIABLE, directory.join("config"))
+        .env(acmon::real_world::STATE_VARIABLE, &memory)
+        .env(acmon::real_world::NOTIFY_CONFIG_VARIABLE, &notify_config)
+        .env(acmon::watch::RUN_VARIABLE, "4000")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("amon is built and runnable");
+
+    let display = |label: &str| -> String {
+        let output = Process::new(env!("CARGO_BIN_EXE_agtop"))
+            .arg("--once")
+            .env(acmon::state::STATE_DIR_VARIABLE, &state_directory)
+            .env(acmon::state::CONFIG_DIR_VARIABLE, directory.join("config"))
+            .env(acmon::real_world::STATE_VARIABLE, &memory)
+            .env(acmon::real_world::NOTIFY_CONFIG_VARIABLE, &notify_config)
+            .output()
+            .expect("agtop is built and runnable");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !text.trim().is_empty(),
+            "agtop said nothing at all while {label}"
+        );
+        text
+    };
+
+    // Wait for the monitor to publish a fast pass. Bounded, and a timeout is a failure rather
+    // than a skip: a test that quietly stopped waiting would assert nothing.
+    let store = store_in(&state_directory);
+    //
+    // The wait is for *this* child to name itself the writer, not merely for a decodable file. A
+    // state directory that has held an earlier monitor still names that one until the new pass
+    // lands, and taking the first pid the file offers would age a screen against a process that
+    // died before this test started.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let writer_pid = loop {
+        if let StateReading::Published(reading) = read_state_file(&store) {
+            if reading.writer_pid == monitor.id() {
+                break reading.writer_pid;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the monitor published no fast pass of its own before the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let live = display("the monitor was running");
+    assert!(
+        live.contains("FRESH — the monitor at pid") && live.contains(&writer_pid.to_string()),
+        "a running monitor's own figures are drawn and marked fresh; got:\n{live}"
+    );
+    assert!(
+        !live.contains("this display took for itself"),
+        "and nothing was collected by the display while a monitor was publishing; got:\n{live}"
+    );
+
+    // Its own run window ends it, so nothing is signalled: the tool observes and never acts, and
+    // this test does not get an exception. `wait` reaps it, which is what makes the pid go.
+    let finished = monitor.wait().expect("the monitor exits on its own");
+    assert!(
+        finished.success(),
+        "the monitor has to have stopped cleanly, or the second screen would be asserting \
+         something else: {finished:?}"
+    );
+
+    let dead = display("the monitor was gone");
+    assert!(
+        dead.contains("THE MONITOR IS DEAD") && dead.contains("CORPSE"),
+        "the same file, with its writer gone, must never read as a live monitor; got:\n{dead}"
+    );
+    assert!(
+        dead.contains(&writer_pid.to_string()),
+        "and the screen names the pid it asked about; got:\n{dead}"
+    );
+    assert!(
+        !dead.contains("FRESH — the monitor"),
+        "at no point are dead facts rendered as current; got:\n{dead}"
     );
 
     let _ = std::fs::remove_dir_all(&directory);

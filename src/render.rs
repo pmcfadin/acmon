@@ -12,7 +12,7 @@
 //! what a terminal too short for the whole screen gives up, and the drawing obeys it rather than
 //! deciding again.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use ratatui::backend::TestBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -20,8 +20,11 @@ use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
 
 use crate::collect::{Identity, LivenessUnknown, Persistence, Session, Snapshot, WorkspaceReport};
-use crate::display::{Meters, Screen};
+use crate::display::{Ages, Facts, Meters, Presence, PublishedReading, Screen};
+use crate::meter::Measured;
 use crate::notify::Rebuilt;
+use crate::schedule::TIERS;
+use crate::tiers::{NotifyRow, PassEnvelope, SessionRow, WorkspaceRow};
 use crate::vcs::{Unreadable, WorkspaceState};
 use crate::workspace::NamespaceResolution;
 use crate::world::Resources;
@@ -148,17 +151,7 @@ pub fn required_height(snapshot: &Snapshot, width: u16) -> u16 {
     if width < minimum_width() {
         return wrap_words(&too_narrow_message(width), width).len() as u16;
     }
-    // Session table: top border + header row + one row per session + bottom border
-    let session_table_height = snapshot.sessions.len() as u16 + TABLE_CHROME;
-
-    // At-risk panel: always present. Top border + title row + content rows + summary lines + bottom border.
-    // The title row is a header inside the bordered block.
-    let panel_height = panel_height(snapshot, width);
-
-    // Footer caveats
-    let footer_height = footer_lines(snapshot, width).len() as u16;
-
-    session_table_height + panel_height + footer_height
+    Body::of_snapshot(snapshot, width).height()
 }
 
 /// The caveats printed under the table.
@@ -508,7 +501,11 @@ fn memory_lines(snapshot: &Snapshot, width: u16) -> Vec<String> {
 
 /// A duration at the coarsest precision that still says something: days for the retention
 /// period, hours and minutes for a reading's age, seconds only while it is still small.
-fn format_age(age: Duration) -> String {
+///
+/// Public because [`crate::display`] states ages in the sentences it composes — the whole-screen
+/// freshness mark among them — and two functions formatting the same duration two ways would put
+/// two different-looking ages for one fact on one screen.
+pub fn format_age(age: Duration) -> String {
     let seconds = age.as_secs();
     match seconds {
         s if s >= 172_800 => format!("{} days", s / 86_400),
@@ -703,7 +700,7 @@ fn at_risk_panel_content(snapshot: &Snapshot, width: u16) -> (String, Vec<String
         );
     }
 
-    (title, rows, summary)
+    (title, rows, wrapped_inside_the_panel(&summary, width))
 }
 
 const PANEL_STATE_WIDTH: u16 = 14; // "DIRTY-STRANDED", the longest state
@@ -775,28 +772,68 @@ pub fn draw(frame: &mut Frame, snapshot: &Snapshot) {
 /// Separated from [`draw`] so the whole screen — meters, notices, then this — is one drawing
 /// pass rather than two that could disagree about how much room they have.
 pub fn draw_in(frame: &mut Frame, snapshot: &Snapshot, area: ratatui::layout::Rect) {
-    draw_body(
-        frame,
-        snapshot,
-        &Fit::everything(snapshot.sessions.len()),
-        area,
-    );
+    let body = Body::of_snapshot(snapshot, area.width);
+    let fit = Fit::everything(body.total);
+    draw_body(frame, &body, &fit, area);
+}
+
+/// Everything below the header, prepared: the session rows, the at-risk panel, the caveats.
+///
+/// One shape for two sources — a collection this display made, and a collection the monitor
+/// published — because what a screen too short gives up (F54), the order rows go in (F55) and how
+/// tall the whole thing is must not be decided twice. Two renderers would be two screens that
+/// drift apart, and the one that drifted would be the one nobody was watching.
+struct Body {
+    /// How many session rows there are in all, before anything is dropped.
+    total: usize,
+    /// The rows, ordered costliest first, ready to draw.
+    rows: Vec<Row<'static>>,
+    /// The width the workspace column was laid out at.
+    workspace_width: u16,
+    panel_title: String,
+    panel_rows: Vec<String>,
+    panel_summary: Vec<String>,
+    caveats: Vec<String>,
+}
+
+impl Body {
+    /// The body for a collection this display made for itself.
+    fn of_snapshot(snapshot: &Snapshot, width: u16) -> Body {
+        let workspace_width = workspace_width(width);
+        let (panel_title, panel_rows, panel_summary) = at_risk_panel_content(snapshot, width);
+        Body {
+            total: snapshot.sessions.len(),
+            rows: crate::display::in_cost_order(&snapshot.sessions)
+                .into_iter()
+                .map(|session| row_for(session, workspace_width))
+                .collect(),
+            workspace_width,
+            panel_title,
+            panel_rows,
+            panel_summary,
+            caveats: footer_lines(snapshot, width),
+        }
+    }
+
+    /// How tall the whole body is: the table with every row in it, the panel, the caveats.
+    fn height(&self) -> u16 {
+        TABLE_CHROME + self.total as u16 + self.panel_height() + self.caveats.len() as u16
+    }
+
+    fn panel_height(&self) -> u16 {
+        PANEL_CHROME + self.panel_rows.len() as u16 + self.panel_summary.len() as u16
+    }
 }
 
 /// Draw the figures: the session table cut to what [`fit`] allowed, then the panel, then the
 /// caveats.
-fn draw_body(frame: &mut Frame, snapshot: &Snapshot, fit: &Fit, area: ratatui::layout::Rect) {
+fn draw_body(frame: &mut Frame, body: &Body, fit: &Fit, area: ratatui::layout::Rect) {
     if area.width < minimum_width() {
         let message = wrap_words(&too_narrow_message(area.width), area.width).join("\n");
         frame.render_widget(Paragraph::new(message), area);
         return;
     }
 
-    // Build the at-risk panel content
-    let (panel_title, panel_rows, panel_summary) = at_risk_panel_content(snapshot, area.width);
-    let panel_height = PANEL_CHROME + panel_rows.len() as u16 + panel_summary.len() as u16;
-
-    let caveats = footer_lines(snapshot, area.width);
     // Every region is exactly the height its content needs, and the slack sits at the bottom.
     // A region that absorbed the slack instead would grow or shrink with the terminal, and what
     // fits would then be decided here as well as in `fit`.
@@ -807,8 +844,8 @@ fn draw_body(frame: &mut Frame, snapshot: &Snapshot, fit: &Fit, area: ratatui::l
     };
     let [table_area, panel_area, caveat_area, _slack] = Layout::vertical([
         Constraint::Length(table_height),
-        Constraint::Length(panel_height),
-        Constraint::Length(caveats.len() as u16),
+        Constraint::Length(body.panel_height()),
+        Constraint::Length(body.caveats.len() as u16),
         Constraint::Min(0),
     ])
     .areas(area);
@@ -818,55 +855,58 @@ fn draw_body(frame: &mut Frame, snapshot: &Snapshot, fit: &Fit, area: ratatui::l
         let title = if fit.hidden > 0 {
             format!(
                 " acmon — {} agent session(s), most child CPU first — {} shown ",
-                snapshot.sessions.len(),
-                fit.shown
+                body.total, fit.shown
             )
         } else {
             format!(
                 " acmon — {} agent session(s), most child CPU first ",
-                snapshot.sessions.len()
+                body.total
             )
         };
-        let workspace_width = workspace_width(area.width);
-        let rows: Vec<Row> = crate::display::in_cost_order(&snapshot.sessions)
-            .into_iter()
-            .take(fit.shown)
-            .map(|session| row_for(session, workspace_width))
-            .collect();
 
         let mut constraints: Vec<Constraint> = FIXED_COLUMNS
             .iter()
             .map(|(_, width)| Constraint::Length(*width))
             .collect();
-        constraints.push(Constraint::Length(workspace_width));
+        constraints.push(Constraint::Length(body.workspace_width));
 
         let mut headers: Vec<&str> = FIXED_COLUMNS.iter().map(|(header, _)| *header).collect();
         headers.push(WORKSPACE_HEADER);
 
-        let table = Table::new(rows, constraints)
-            .header(Row::new(headers))
-            .column_spacing(COLUMN_SPACING)
-            .block(Block::default().borders(Borders::ALL).title(title));
+        let table = Table::new(
+            body.rows
+                .iter()
+                .take(fit.shown)
+                .cloned()
+                .collect::<Vec<_>>(),
+            constraints,
+        )
+        .header(Row::new(headers))
+        .column_spacing(COLUMN_SPACING)
+        .block(Block::default().borders(Borders::ALL).title(title));
 
         frame.render_widget(table, table_area);
     }
 
     // Render at-risk panel
-    let mut panel_content = panel_rows;
-    if !panel_summary.is_empty() {
+    let mut panel_content = body.panel_rows.clone();
+    if !body.panel_summary.is_empty() {
         if !panel_content.is_empty() {
             panel_content.push(String::new()); // Blank line before summary
         }
-        panel_content.extend(panel_summary);
+        panel_content.extend(body.panel_summary.clone());
     }
 
-    let panel = Paragraph::new(panel_content.join("\n"))
-        .block(Block::default().borders(Borders::ALL).title(panel_title));
+    let panel = Paragraph::new(panel_content.join("\n")).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(body.panel_title.clone()),
+    );
 
     frame.render_widget(panel, panel_area);
 
     // Render footer caveats
-    frame.render_widget(Paragraph::new(caveats.join("\n")), caveat_area);
+    frame.render_widget(Paragraph::new(body.caveats.join("\n")), caveat_area);
 }
 
 /// A state, with a marker when the verdict behind it was inferred rather than observed, or
@@ -1239,9 +1279,9 @@ fn pack(cells: &[String], width: u16) -> Vec<String> {
 pub fn meter_row(meters: &Meters, width: u16) -> Vec<String> {
     let gauges = gauges(meters);
 
-    // Stated as the instant it was read at, not as an age. Turning an instant into an age, and
-    // an age into a verdict about the monitor, is #30 — and half of that rule here would put
-    // two different freshness stories on one screen.
+    // Stated as the instant it was read at, not as an age. The age of these figures is the fast
+    // tier's, printed in the tier-age block above with every other tier's — one place turning
+    // stamps into ages, because two would put two different freshness stories on one screen.
     let mut lines = wrap_words(
         &format!(
             "METERS  as of {}",
@@ -1279,11 +1319,609 @@ pub fn meter_row(meters: &Meters, width: u16) -> Vec<String> {
     lines
 }
 
-/// Everything above the figures: the meter row, then whatever has to be said about them.
+/// Everything above the figures: what the monitor is, what this tool cost, and how old each
+/// tier's facts are.
+///
+/// The freshness mark comes **first**, above the gauges and above the figures. A reader who has
+/// taken in a duty cycle and a session table before learning that the monitor died forty minutes
+/// ago has already been misled; and the top of the screen is the one place a clipped screen
+/// cannot lose.
 fn screen_header(screen: &Screen, width: u16) -> Vec<String> {
-    let mut lines = meter_row(&screen.meters, width);
+    let mut lines = Vec::new();
     for notice in &screen.notices {
         lines.extend(wrap_words(notice, width));
+    }
+    lines.extend(meter_row(&screen.meters, width));
+    lines.extend(tier_age_lines(&screen.presence, width));
+    lines
+}
+
+/// One line per tier: when it last ran, how old its facts are, and how often it should run.
+///
+/// Empty when no monitor published anything, because then there is no tier and no age — the
+/// screen says so in its first sentence instead.
+///
+/// Both ages are printed, always. For the fast and medium tiers they agree; for the slow tier they
+/// do not, and that gap is the point (F30): the slow tier reads a slice of workspaces per pass, so
+/// it can have run seconds ago while the oldest workspace it published was read twenty minutes
+/// ago. One number for both would have to be wrong about one of them.
+fn tier_age_lines(presence: &Presence, width: u16) -> Vec<String> {
+    let Some(ages) = presence.ages() else {
+        return Vec::new();
+    };
+
+    let say = |age: &Result<Duration, String>| match age {
+        Ok(age) => format!("{} ago", format_age(*age)),
+        Err(why) => why.clone(),
+    };
+
+    let mut lines = wrap_words(
+        &format!(
+            "TIER AGES  judged against the {} cadence the monitor published. An age is computed \
+             from the stamps in the file, not from anything this display timed.",
+            ages.pace
+        ),
+        width,
+    );
+    for age in &ages.tiers {
+        let overdue = match &age.overdue {
+            Some(_) => "  OVERDUE",
+            None => "",
+        };
+        lines.extend(wrap_words(
+            &format!(
+                "  {:<7} last pass {}, oldest fact {}, expected every {}{overdue}",
+                age.name,
+                say(&age.since_pass),
+                say(&age.since_evidence),
+                format_age(age.interval),
+            ),
+            width,
+        ));
+    }
+    lines
+}
+
+// --- The monitor's facts, drawn at the age the monitor stamped them --------------------------
+//
+// A second producer of the same [`Body`], never a second renderer. What is different here is only
+// where the figures came from and that every one of them carries an age; the columns, the order,
+// the panel and what a short terminal gives up are the same code as for a collection this display
+// made itself.
+//
+// Nothing in this section reads a clock. The instant every age is computed against arrives inside
+// [`Ages`], from the one place the display reads a clock at all.
+
+/// How much room a workspace's own evidence age gets in the panel.
+///
+/// Eleven, to hold `never read` — which is the value that must never be mistaken for a small age,
+/// because a workspace nobody has looked at is not a clean one.
+const PANEL_AGE_WIDTH: u16 = 11;
+
+/// How much room the published panel's path column gets.
+///
+/// Its own function rather than [`panel_path_width`] because this panel carries a column that one
+/// does not, and sharing the width would cut the path by exactly the age column's width without
+/// saying so.
+fn published_panel_path_width(total: u16) -> u16 {
+    let prefix = PANEL_STATE_WIDTH + PANEL_COUNT_WIDTH + PANEL_KIND_WIDTH + PANEL_AGE_WIDTH + 4;
+    let borders = 2;
+    total.saturating_sub(prefix + borders).max(WORKSPACE_MIN)
+}
+
+impl Body {
+    /// The body for facts a monitor published.
+    fn of_published(reading: &PublishedReading, ages: Option<&Ages>, width: u16) -> Body {
+        let workspace_width = workspace_width(width);
+        let now = ages.map(|ages| ages.now);
+        let (panel_title, panel_rows, panel_summary) = published_panel(reading, ages, width);
+        Body {
+            total: reading.fast.sessions.len(),
+            rows: crate::display::published_in_cost_order(&reading.fast.sessions)
+                .into_iter()
+                .map(|row| published_row(row, workspace_width))
+                .collect(),
+            workspace_width,
+            panel_title,
+            panel_rows,
+            panel_summary,
+            caveats: published_caveats(reading, now, width),
+        }
+    }
+}
+
+/// How long before `now` an ISO 8601 stamp was, or why that is not a duration.
+fn age_since(now: Option<SystemTime>, stamp: &str) -> Result<Duration, String> {
+    let Some(now) = now else {
+        return Err("this screen has no instant to age it against".to_string());
+    };
+    let seconds = crate::isotime::unix_seconds_from_iso8601(stamp)
+        .map_err(|why| format!("{stamp:?} cannot be read as a time: {why}"))?;
+    now.duration_since(crate::isotime::time_from_unix_seconds(seconds))
+        .map_err(|_| "stamped in the future — the clock moved backwards".to_string())
+}
+
+/// An age as it is printed beside a fact, or the reason it has none.
+fn age_or_reason(age: &Result<Duration, String>) -> String {
+    match age {
+        Ok(age) => format_age(*age),
+        // Deliberately not blank and deliberately not `0s`. A stamp nobody could read is a fact
+        // of unknown age, which is the one thing this screen may not present as a fresh one.
+        Err(_) => "age unknown".to_string(),
+    }
+}
+
+/// A figure the monitor published, or the reason it published none — never a zero.
+fn published_figure<T, F: Fn(&T) -> String>(
+    figure: &Measured<T>,
+    show: F,
+    remembered: bool,
+) -> String {
+    match (&figure.value, &figure.unavailable) {
+        // The `*` means the same thing here as it does for a collection this display made: the
+        // last reading taken before that session's process exited.
+        (Some(value), _) if remembered => format!("{}*", show(value)),
+        (Some(value), _) => show(value),
+        (None, Some(why)) => why.clone(),
+        (None, None) => "no figure and no reason — a fault in the monitor".to_string(),
+    }
+}
+
+/// A published state, with the same two markers a locally collected one carries.
+fn published_state_cell(row: &SessionRow) -> String {
+    if row.inferred {
+        format!("{}?", row.state)
+    } else if row.unknown_is_structural {
+        format!("{}!", row.state)
+    } else {
+        row.state.clone()
+    }
+}
+
+/// What a published row is called when it has to be named in prose.
+fn published_identify(row: &SessionRow) -> String {
+    match (&row.pid, &row.recorded_as) {
+        (Some(pid), _) => format!("{pid} {}", row.cli),
+        (None, Some(recorded_as)) => format!("{recorded_as} {}", row.cli),
+        (None, None) => format!("an unidentified {} session", row.cli),
+    }
+}
+
+/// One published session's row, in the same columns a locally collected one uses.
+fn published_row(row: &SessionRow, workspace_width: u16) -> Row<'static> {
+    let remembered = row.remembered_at.is_some();
+    let cpu = |millis: &u128| format_cpu(&Duration::from_millis(*millis as u64));
+    let bytes = |count: &u64| format_bytes(count);
+
+    let workspace = match (&row.workspace.value, &row.workspace.unavailable) {
+        (Some(path), _) => shorten_from_the_left(path, workspace_width),
+        (None, Some(why)) => match &row.recorded_as {
+            Some(recorded_as) => {
+                shorten_from_the_left(&format!("{why}: {recorded_as}"), workspace_width)
+            }
+            None => shorten_from_the_left(why, workspace_width),
+        },
+        (None, None) => "no path and no reason — a fault in the monitor".to_string(),
+    };
+
+    Row::new(vec![
+        match row.pid {
+            Some(pid) => pid.to_string(),
+            None => "gone".to_string(),
+        },
+        shorten_with_a_mark(&row.cli, CLI_WIDTH),
+        published_state_cell(row),
+        published_figure(&row.own_cpu_ms, cpu, remembered),
+        published_figure(&row.children_cpu_ms, cpu, remembered),
+        published_figure(&row.current_memory_bytes, bytes, remembered),
+        published_figure(&row.peak_memory_bytes, bytes, remembered),
+        published_figure(&row.bytes_written, bytes, remembered),
+        workspace,
+    ])
+}
+
+/// The at-risk panel, from the slow tier, with its own evidence age and one age per row.
+///
+/// F30 and S13 live here. The panel is the highest-stakes thing on screen and it is fed by the
+/// **slowest** tier, so its age is the slow tier's stamp — the oldest workspace reading in the
+/// file — and never the file's newest write. A workspace committed 50 s ago must not appear
+/// at-risk under a 1 s stamp, and the only way to keep that promise is to print the age the slow
+/// tier actually established, per row, next to the row.
+fn published_panel(
+    reading: &PublishedReading,
+    ages: Option<&Ages>,
+    width: u16,
+) -> (String, Vec<String>, Vec<String>) {
+    let path_width = published_panel_path_width(width);
+    let now = ages.map(|ages| ages.now);
+
+    let Some((slow, _)) = &reading.slow else {
+        return (
+            " at risk — the slow tier has published nothing ".to_string(),
+            Vec::new(),
+            vec![
+                "NOTHING HAS BEEN CHECKED: the monitor has published no slow pass, so no \
+                 workspace's version-control state has been read. This is not a clear result."
+                    .to_string(),
+            ],
+        );
+    };
+
+    let evidence = ages
+        .and_then(|ages| ages.of(crate::schedule::Tier::Slow))
+        .map(|age| age_or_reason(&age.since_evidence))
+        .unwrap_or_else(|| "age unknown".to_string());
+
+    let mut at_risk: Vec<&WorkspaceRow> =
+        slow.workspaces.iter().filter(|row| row.at_risk).collect();
+    // Largest pile of uncommitted work first, as the locally collected panel orders it.
+    at_risk.sort_by(|left, right| {
+        right
+            .uncommitted_entries
+            .unwrap_or(0)
+            .cmp(&left.uncommitted_entries.unwrap_or(0))
+    });
+    let driven: Vec<&WorkspaceRow> = slow
+        .workspaces
+        .iter()
+        .filter(|row| !row.at_risk && row.state == "DIRTY-DRIVEN")
+        .collect();
+
+    let title = format!(
+        " at risk — {} of {} workspaces · slow-tier evidence, oldest {} old ",
+        at_risk.len(),
+        slow.workspaces.len(),
+        evidence
+    );
+
+    let rows: Vec<String> = at_risk
+        .iter()
+        .chain(driven.iter())
+        .map(|row| published_workspace_row(row, path_width, now))
+        .collect();
+
+    let clean = slow
+        .workspaces
+        .iter()
+        .filter(|row| row.state == "CLEAN")
+        .count();
+    let unread = slow
+        .workspaces
+        .iter()
+        .filter(|row| row.observed_at.is_none())
+        .count();
+
+    let mut summary = Vec::new();
+    if at_risk.is_empty() {
+        // "0 at risk" is information only when everything in the denominator was actually read.
+        // A workspace `git` was never asked about is not a clean one, and the reassuring sentence
+        // below is reachable only when every row was accounted for as clean or driven.
+        if slow.workspaces.is_empty() {
+            summary.push(
+                "No workspaces were located, so NOTHING WAS CHECKED — this is not a clear result."
+                    .to_string(),
+            );
+        } else if clean + driven.len() < slow.workspaces.len() {
+            summary.push(format!(
+                "No workspaces at risk among the ones that were read — but {} of {} could not be \
+                 read or have not been read at all, so this is NOT a clear result.",
+                slow.workspaces.len() - clean - driven.len(),
+                slow.workspaces.len()
+            ));
+        } else if !driven.is_empty() {
+            summary.push(
+                "No workspaces at risk — all dirty workspaces have active sessions.".to_string(),
+            );
+        } else {
+            summary.push("No workspaces at risk — all checked workspaces are clean.".to_string());
+        }
+    }
+
+    // Said before anything reassuring. The slow tier reads a slice per pass, so on a machine with
+    // seventy repositories a full refresh takes twenty to thirty minutes — during which "0 at
+    // risk" is a partial result, and a partial result presented as a clear one is the failure
+    // this panel exists to prevent.
+    //
+    // Counted two ways, and both are reported when they disagree: the monitor's own coverage
+    // figure and the rows with no reading of their own. A published count that did not match the
+    // rows would be a fault in the monitor, and it must not be smoothed over here.
+    if slow.never_read > 0 || unread > 0 {
+        summary.push(format!(
+            "{} workspace(s) have never been read, so this panel is NOT exhaustive — the slow \
+             tier reads a slice per pass and has not reached them. They are counted, never \
+             reported as clean.",
+            slow.never_read.max(unread)
+        ));
+        if slow.never_read != unread {
+            summary.push(format!(
+                "BUG: the monitor published {} never-read workspace(s) while {unread} row(s) \
+                 carry no reading of their own.",
+                slow.never_read
+            ));
+        }
+    }
+
+    // What was not listed, grouped by the state the monitor published for it. Grouped for
+    // reading only: nothing here is decided from these words.
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for row in &slow.workspaces {
+        if row.at_risk || row.state == "DIRTY-DRIVEN" {
+            continue;
+        }
+        let label = match &row.unknown_why {
+            Some(why) => format!("{}: {why}", row.state.to_lowercase()),
+            None => row.state.to_lowercase(),
+        };
+        match counts.iter_mut().find(|(seen, _)| *seen == label) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((label, 1)),
+        }
+    }
+    if !counts.is_empty() {
+        summary.push(format!(
+            "Also found: {}.",
+            counts
+                .iter()
+                .map(|(label, count)| format!("{count} {label}"))
+                .collect::<Vec<String>>()
+                .join(", ")
+        ));
+    }
+
+    summary.push(format!(
+        "The slow tier read {} workspace(s) on its last pass and will attempt {} on the next.",
+        slow.read_this_pass, slow.next_slice
+    ));
+
+    match &reading.medium {
+        Some((medium, _)) => {
+            if !medium.sweep_complete {
+                summary.push(
+                    "WARNING: Directory sweep incomplete — this list is partial, not exhaustive."
+                        .to_string(),
+                );
+            }
+            if !medium.unlocated.is_empty() {
+                summary.push(format!(
+                    "Recorded namespaces not located: {}.",
+                    medium.unlocated.len()
+                ));
+            }
+        }
+        None => summary.push(
+            "The medium tier has published nothing, so how exhaustively workspaces were \
+             discovered is not known."
+                .to_string(),
+        ),
+    }
+
+    (title, rows, wrapped_inside_the_panel(&summary, width))
+}
+
+/// Wrap a panel's summary to fit inside its own borders.
+///
+/// Done here rather than left to `ratatui`, which clips a `Paragraph` inside a bordered block
+/// without saying so — and every line in one of these summaries is a statement about what was
+/// *not* checked. A clipped warning is worse than no warning, because the rows above it then look
+/// unqualified. Wrapping here also keeps the line count the layout is given equal to the number of
+/// lines actually drawn.
+fn wrapped_inside_the_panel(summary: &[String], width: u16) -> Vec<String> {
+    let inside = width.saturating_sub(2).max(1);
+    summary
+        .iter()
+        .flat_map(|line| wrap_words(line, inside))
+        .collect()
+}
+
+/// One published workspace, with its own evidence age.
+fn published_workspace_row(row: &WorkspaceRow, path_width: u16, now: Option<SystemTime>) -> String {
+    let count_or_reason = match (&row.unknown_why, row.uncommitted_entries) {
+        // The reason where the count would be. Never `0`, which would read as clean.
+        (Some(why), _) => why.clone(),
+        (None, Some(count)) => count.to_string(),
+        (None, None) => "—".to_string(),
+    };
+    let age = match &row.observed_at {
+        Some(stamp) => age_or_reason(&age_since(now, stamp)),
+        // The words that matter most in this panel. A workspace `git` has never been asked about
+        // has no state, and an empty age column would read as a fresh one.
+        None => "never read".to_string(),
+    };
+
+    format!(
+        "{:<state$} {:<count$} {:<kind$} {:<age_width$} {}",
+        row.state,
+        count_or_reason,
+        if row.linked_worktree {
+            "worktree"
+        } else {
+            "primary"
+        },
+        age,
+        shorten_from_the_left(&row.path, path_width),
+        state = PANEL_STATE_WIDTH as usize,
+        count = PANEL_COUNT_WIDTH as usize,
+        kind = PANEL_KIND_WIDTH as usize,
+        age_width = PANEL_AGE_WIDTH as usize,
+    )
+}
+
+/// Everything that has to be said under a published table.
+///
+/// The same caveats a locally collected screen carries, plus the ones only a monitor can report:
+/// what it announced, what it did not, and which passes overran.
+fn published_caveats(
+    reading: &PublishedReading,
+    now: Option<SystemTime>,
+    width: u16,
+) -> Vec<String> {
+    let rows = &reading.fast.sessions;
+    let mut lines = wrap_words(FLOOR_CAVEAT, width);
+
+    if rows.iter().any(|row| row.inferred) {
+        lines.extend(wrap_words(INFERENCE_MARKER_CAVEAT, width));
+    }
+
+    // Remembered figures, each with its own age. Aged against the fast tier's own stamp, which is
+    // when the monitor took these rows — not against this display's clock, which would fold the
+    // monitor's staleness into every remembered figure's age and hide it.
+    let remembered: Vec<&SessionRow> = rows
+        .iter()
+        .filter(|row| row.remembered_at.is_some())
+        .collect();
+    if !remembered.is_empty() {
+        lines.extend(wrap_words(STALE_MARKER_CAVEAT, width));
+        for row in remembered {
+            let stamp = row
+                .remembered_at
+                .as_ref()
+                .expect("filtered to rows that have one");
+            let age = match age_since(Some(reading.fast_stamp), stamp) {
+                Ok(age) => format!("{} before that pass", format_age(age)),
+                Err(why) => format!("at an unknown time — {why}"),
+            };
+            lines.extend(wrap_words(
+                &format!("  * {}: last read {age}", published_identify(row)),
+                width,
+            ));
+        }
+    }
+
+    let unmeasured = crate::display::published_sessions_without_a_cost(rows);
+    if unmeasured > 0 {
+        lines.extend(wrap_words(
+            &format!(
+                "Rows are ordered by child CPU, descending. {unmeasured} session(s) have no \
+                 child-CPU figure at all, so they are listed FIRST rather than last: an absent \
+                 cost is not a small one, and the bottom of this table is what a terminal too \
+                 short drops."
+            ),
+            width,
+        ));
+    }
+
+    let undetermined: Vec<&SessionRow> = rows
+        .iter()
+        .filter(|row| row.unknown_why.is_some())
+        .collect();
+    if !undetermined.is_empty() {
+        if undetermined.iter().any(|row| row.unknown_is_structural) {
+            lines.extend(wrap_words(LIMIT_MARKER_CAVEAT, width));
+        }
+        for row in undetermined {
+            let why = row
+                .unknown_why
+                .as_ref()
+                .expect("filtered to rows that have one");
+            let marker = if row.unknown_is_structural { "! " } else { "" };
+            lines.extend(wrap_words(
+                &format!("  {marker}{}: {why}.", published_identify(row)),
+                width,
+            ));
+        }
+    }
+
+    // Which tier the liveness evidence actually ages against, in the monitor's own words. The
+    // rows are the fast tier's, but a WAITING rests on transcript silence read by the medium
+    // tier, so a reader who aged it against the fast stamp would be told ten-minute-old silence
+    // was ten seconds old.
+    lines.extend(wrap_words(
+        &format!(
+            "Each session's state rests on transcript activity read by the {} tier, so its \
+             evidence is as old as that tier's age above — not as old as this table's.",
+            reading.fast.silence_read_by
+        ),
+        width,
+    ));
+
+    lines.extend(published_notify_lines(&reading.fast.notify, width));
+
+    for (tier, envelope) in published_envelopes(reading) {
+        if let Some(why) = &envelope.overran {
+            lines.extend(wrap_words(
+                &format!("The {tier} tier's last pass overran: {why}."),
+                width,
+            ));
+        }
+    }
+
+    // The age of the monitor's own figures, said where the gauges are qualified rather than left
+    // to the gauge row, which prints an instant.
+    if let Ok(age) = age_since(now, &reading.fast.pass.started_at) {
+        lines.extend(wrap_words(
+            &format!(
+                "Every figure above was published by pid {} and is {} old; this display measured \
+                 none of it.",
+                reading.writer_pid,
+                format_age(age)
+            ),
+            width,
+        ));
+    }
+
+    lines
+}
+
+/// Every tier's envelope that is present, with the tier's name.
+fn published_envelopes(reading: &PublishedReading) -> Vec<(&'static str, &PassEnvelope)> {
+    TIERS
+        .iter()
+        .filter_map(|tier| {
+            let envelope = match tier {
+                crate::schedule::Tier::Fast => Some(&reading.fast.pass),
+                crate::schedule::Tier::Medium => {
+                    reading.medium.as_ref().map(|(payload, _)| &payload.pass)
+                }
+                crate::schedule::Tier::Slow => {
+                    reading.slow.as_ref().map(|(payload, _)| &payload.pass)
+                }
+            };
+            envelope.map(|envelope| (crate::meter::tier_name(*tier), envelope))
+        })
+        .collect()
+}
+
+/// What the monitor announced, and what it did not.
+///
+/// Never silent about an alert that was decided and never delivered. A monitor that had six
+/// strandings to announce and reached a channel with none of them is a silent cap in the one path
+/// where silence is read as "nothing is wrong".
+fn published_notify_lines(notify: &NotifyRow, width: u16) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(why) = &notify.read_only {
+        lines.extend(wrap_words(
+            &format!(
+                "Nothing was announced: {why}. {} condition(s) on this screen would be announced \
+                 once the monitor is past that.",
+                notify.notable
+            ),
+            width,
+        ));
+        return lines;
+    }
+    if notify.failed > 0 {
+        lines.extend(wrap_words(
+            &format!(
+                "WARNING: {} notification(s) failed to deliver — they will be re-announced on a \
+                 later pass.",
+                notify.failed
+            ),
+            width,
+        ));
+    }
+    if notify.not_attempted > 0 {
+        let why = notify
+            .reason
+            .as_deref()
+            .unwrap_or("and no reason was published for it, which is itself a fault in this tool");
+        lines.extend(wrap_words(
+            &format!(
+                "WARNING: {} alert(s) were NOT SENT at all — {why}. They are not recorded as \
+                 announced, and will be re-announced on a later pass.",
+                notify.not_attempted
+            ),
+            width,
+        ));
     }
     lines
 }
@@ -1297,12 +1935,26 @@ fn no_facts_message(reason: &str) -> String {
     )
 }
 
+/// The prepared body for whichever facts this screen carries, or `None` when it carries none.
+fn body_of(screen: &Screen, width: u16) -> Option<Body> {
+    match &screen.facts {
+        Facts::Own(snapshot) => Some(Body::of_snapshot(snapshot, width)),
+        Facts::Monitor(reading) => Some(Body::of_published(reading, screen.presence.ages(), width)),
+        Facts::None(_) => None,
+    }
+}
+
 /// How tall the whole screen needs to be to hold everything it has to say.
 pub fn screen_height(screen: &Screen, width: u16) -> u16 {
     let header = screen_header(screen, width).len() as u16;
-    let body = match &screen.facts {
-        Ok(snapshot) => required_height(snapshot, width),
-        Err(reason) => wrap_words(&no_facts_message(reason), width).len() as u16,
+    let body = match (&screen.facts, width < minimum_width()) {
+        (Facts::None(reason), _) => wrap_words(&no_facts_message(reason), width).len() as u16,
+        // A terminal too narrow for the numbers gets a refusal in place of the whole body,
+        // whichever collection the figures came from.
+        (_, true) => wrap_words(&too_narrow_message(width), width).len() as u16,
+        _ => body_of(screen, width)
+            .map(|body| body.height())
+            .unwrap_or(0),
     };
     header + body
 }
@@ -1346,11 +1998,6 @@ const TABLE_CHROME: u16 = 3;
 /// What the at-risk panel costs besides its rows: two borders and the blank line above its
 /// summary.
 const PANEL_CHROME: u16 = 3;
-
-fn panel_height(snapshot: &Snapshot, width: u16) -> u16 {
-    let (_, rows, summary) = at_risk_panel_content(snapshot, width);
-    PANEL_CHROME + rows.len() as u16 + summary.len() as u16
-}
 
 /// What has to be said when the terminal is shorter than the screen.
 ///
@@ -1418,8 +2065,8 @@ fn shortfall_lines(
 /// screen (F32) — and neither is the footer, which carries every warning about what was not
 /// announced and what could not be determined. A screen that quietly dropped one of those is
 /// the failure this project exists to remove.
-fn fit(screen: &Screen, snapshot: &Snapshot, width: u16, height: u16) -> Fit {
-    let total = snapshot.sessions.len();
+fn fit(screen: &Screen, body: &Body, width: u16, height: u16) -> Fit {
+    let total = body.total;
     let needs = screen_height(screen, width);
     // A terminal too narrow for the numbers gets a refusal instead of a table, and there are no
     // rows in a refusal to drop.
@@ -1427,9 +2074,8 @@ fn fit(screen: &Screen, snapshot: &Snapshot, width: u16, height: u16) -> Fit {
         return Fit::everything(total);
     }
 
-    let fixed = screen_header(screen, width).len() as u16
-        + panel_height(snapshot, width)
-        + footer_lines(snapshot, width).len() as u16;
+    let fixed =
+        screen_header(screen, width).len() as u16 + body.panel_height() + body.caveats.len() as u16;
 
     // The most rows that fit, costliest first.
     for shown in (1..=total).rev() {
@@ -1471,11 +2117,12 @@ fn fit(screen: &Screen, snapshot: &Snapshot, width: u16, height: u16) -> Fit {
 pub fn draw_screen(frame: &mut Frame, screen: &Screen) {
     let area = frame.area();
     let header = screen_header(screen, area.width);
+    let body = body_of(screen, area.width);
     // A screen with no figures has nothing elastic on it: its whole body is a stated refusal a
     // few lines long, and there is no row in it to drop.
-    let fit = match &screen.facts {
-        Ok(snapshot) => fit(screen, snapshot, area.width, area.height),
-        Err(_) => Fit::everything(0),
+    let fit = match &body {
+        Some(body) => fit(screen, body, area.width, area.height),
+        None => Fit::everything(0),
     };
 
     let [notice_area, header_area, body_area] = Layout::vertical([
@@ -1490,10 +2137,23 @@ pub fn draw_screen(frame: &mut Frame, screen: &Screen) {
     }
     frame.render_widget(Paragraph::new(header.join("\n")), header_area);
 
-    match &screen.facts {
-        Ok(snapshot) => draw_body(frame, snapshot, &fit, body_area),
-        Err(reason) => frame.render_widget(
+    match (&body, &screen.facts) {
+        (Some(body), _) => draw_body(frame, body, &fit, body_area),
+        (None, Facts::None(reason)) => frame.render_widget(
             Paragraph::new(wrap_words(&no_facts_message(reason), body_area.width).join("\n")),
+            body_area,
+        ),
+        // Unreachable: a body is absent exactly when the facts are.
+        (None, _) => frame.render_widget(
+            Paragraph::new(
+                wrap_words(
+                    &no_facts_message(
+                        "this display could not prepare them, which is a fault in it",
+                    ),
+                    body_area.width,
+                )
+                .join("\n"),
+            ),
             body_area,
         ),
     }

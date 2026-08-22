@@ -5,7 +5,11 @@ pub mod collect;
 pub mod deliver;
 pub mod detect;
 pub mod display;
-mod isotime;
+/// Public because `state.json` publishes every instant as ISO 8601 (#25), so **every** reader of
+/// that file needs the same conversion its writer used. Two implementations of the same format
+/// would eventually disagree about a leap year, and the disagreement would surface as a fact of
+/// the wrong age rather than as an error.
+pub mod isotime;
 pub mod launchd;
 pub mod liveness;
 pub mod lock;
