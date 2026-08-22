@@ -1952,6 +1952,13 @@ impl Publication {
                     read_only: None,
                 },
                 silence_read_by: "medium".to_string(),
+                // #28's launch record travels in the fast payload. This display does not draw
+                // it yet — `display::monitor_notice` names drawing it beside a DEAD verdict as
+                // the next step — but the field is on the contract, so the fixture states what
+                // it is rather than leaving the payload unbuildable. A first launch is the
+                // honest value here: nothing has ever run in the directory these tests assemble.
+                launch: acmon::starts::first_launch(fixture_now(), self.writer_pid).record,
+                launch_not_recorded: None,
             })
             .expect("a fast payload serialises"),
             self.fast_pass,
