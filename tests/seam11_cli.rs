@@ -302,11 +302,16 @@ fn agtops_usage_text_documents_both_modes_and_the_absence_of_keybindings() {
 // the few cases where the exit code *is* the behaviour under test — this repo pays the exec
 // tax it measures, and a spawn per assertion would be us doing the thing we complain about.
 
-/// Run a binary with its state directory relocated.
+/// Run a binary with both of its directories relocated.
 ///
 /// The relocation matters now that `amon watch` takes a lock and publishes a state file: a
 /// suite that used the developer's own `~/.local/state/acmon/` would write real state as a side
 /// effect of testing an exit code.
+///
+/// The config directory as well as the state one, because between them they move everything a run
+/// touches (#36) — including `notify.toml`, which is what a run delivers alerts through. A spawned
+/// binary that read the developer's own would be a suite that alerts a human on a machine where one
+/// happens to be configured (#38).
 fn scratch_state_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("acmon-seam11-{}-state", std::process::id()))
 }
@@ -317,6 +322,7 @@ fn run(binary: &str, args: &[&str]) -> (bool, String, String) {
     let output = Command::new(binary)
         .args(args)
         .env(acmon::state::STATE_DIR_VARIABLE, &state_dir)
+        .env(acmon::state::CONFIG_DIR_VARIABLE, state_dir.join("config"))
         .output()
         .unwrap_or_else(|error| panic!("failed to run {binary} {args:?}: {error}"));
 

@@ -5,29 +5,86 @@
 //! class of machine vary by roughly 2x. A test asserting a specific count is a test
 //! that fails for reasons unrelated to correctness.
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
 use acmon::liveness::Thresholds;
+use acmon::state::Paths;
 use acmon::workspace::NamespaceUnmatched;
 use acmon::world::{PathUnavailable, ResourceSource, ResourcesUnavailable, Unmeasured};
-use acmon::{collect, Identity, RealWorld, World};
+use acmon::{collect_as, Identity, NotifyOutcome, Persistence, RealWorld, Role, World};
 
-/// A real world that keeps its remembered state somewhere disposable.
+/// A scratch tree named for this test binary's own run, made once.
 ///
-/// Any test that collects must use this. A collection now stores what it found, and a test
-/// suite that stored it in the developer's own `~/.acmon/state.json` would overwrite the
-/// history the running tool depends on — with a fixture-shaped version of this machine,
-/// silently, on every `cargo test`.
+/// One tree for the whole binary, deliberately. The tests below run concurrently and none of them
+/// reads another's writes back, so sharing it costs nothing — and a shared target is the condition
+/// the atomic replacement exists to survive, so several of them writing at once is a use of the
+/// guarantee rather than a hazard. The nanosecond suffix is what keeps a tree from a previous run
+/// (pids are recycled) out of this one's way.
+fn scratch_root() -> &'static Path {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let root = std::env::temp_dir().join(format!(
+            "acmon-seam3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock after 1970")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    })
+}
+
+/// Both of a world's directories named into a scratch tree.
 ///
-/// One path for the whole binary, deliberately. The tests below run concurrently and none of
-/// them reads the file back, so sharing it costs nothing — and a shared target is the
-/// condition the atomic replacement exists to survive, so several of them writing it at once
-/// is a use of the guarantee rather than a hazard.
-fn world_with_scratch_state() -> RealWorld {
-    RealWorld::with_state_file(
-        std::env::temp_dir().join(format!("acmon-seam3-{}.json", std::process::id())),
+/// `home` is what an unrelocated run would resolve everything from. Every test here passes `None`
+/// — a world with no home in play cannot reach the developer's files even by a path nobody
+/// thought about. The two tests that need a home pass a stand-in one, to prove that naming these
+/// two directories is what takes it out of play.
+fn scratch_paths(root: &Path, home: Option<&str>) -> Paths {
+    Paths::from_values(
+        Some(&root.join("config").to_string_lossy()),
+        Some(&root.join("state").to_string_lossy()),
+        home,
     )
+    .expect("both directories were given explicitly, so no home is needed")
+}
+
+/// The world every test in this file observes this machine through.
+///
+/// Real processes, real workspaces, real transcripts — that is the point of this seam and none of
+/// it changes here. What changes is where the world's own three files are: in a scratch tree, not
+/// in the developer's `~/.config/acmon` and `~/.local/state/acmon`.
+///
+/// `RealWorld::new()` appears nowhere in this file on purpose. A collection through it writes both
+/// the remembered history and the notification dedupe record, and the dedupe record is what stops
+/// a real condition being announced twice — so a suite that wrote it could silence a genuine alert
+/// on the developer's own machine and leave nothing anywhere saying why (#38). Naming both
+/// directories also takes the pre-split `~/.acmon/` out of play (#36), so nothing under the
+/// developer's home is read either.
+fn world() -> RealWorld {
+    RealWorld::with_paths(scratch_paths(scratch_root(), None))
+}
+
+/// A collection over this machine for a reader: figures, no writes, no alerting.
+///
+/// Belt as well as braces. The world above already puts every write in a scratch tree, which is
+/// what makes these tests safe *by construction*; passing the display's role means a test that
+/// only wants the figures also asks for nothing else, which is safe by policy. Relocation is the
+/// guarantee — a role is an argument someone can pass differently tomorrow — so the tests that
+/// prove the relocation itself deliberately use the monitor's role instead.
+fn figures_only(world: &RealWorld) -> acmon::Snapshot {
+    collect_as(
+        world,
+        SystemTime::now(),
+        &Thresholds::default(),
+        Role::Display,
+    )
+    .expect("collection over the real machine should succeed")
 }
 
 /// Helper to format a session identity for error messages.
@@ -40,7 +97,7 @@ fn format_identity(identity: &Identity) -> String {
 
 #[test]
 fn the_real_process_table_contains_the_observing_process() {
-    let world = RealWorld::new();
+    let world = world();
 
     let observation = world
         .process_snapshot()
@@ -59,10 +116,9 @@ fn the_real_process_table_contains_the_observing_process() {
 
 #[test]
 fn collection_over_the_real_machine_yields_only_recognised_clis() {
-    let world = world_with_scratch_state();
+    let world = world();
 
-    let snapshot = collect(&world, SystemTime::now(), &Thresholds::default())
-        .expect("collection over the real machine should succeed");
+    let snapshot = figures_only(&world);
 
     for session in &snapshot.sessions {
         assert!(
@@ -83,7 +139,7 @@ fn an_unreadable_executable_path_is_absent_rather_than_empty() {
     // Many processes on a real machine are not readable by an unprivileged user.
     // Those must carry no path at all rather than an empty string, so a caller
     // cannot mistake "could not read" for "read, and it was blank".
-    let world = RealWorld::new();
+    let world = world();
 
     let observation = world.process_snapshot().expect("enumeration");
 
@@ -102,7 +158,7 @@ fn an_unavailable_path_states_a_reason_that_is_actually_true() {
     // exited, the process really must be gone. The converse is deliberately NOT
     // asserted: a process alive at snapshot time may legitimately have exited by now,
     // so only the direction that cannot race is checked.
-    let world = RealWorld::new();
+    let world = world();
     let observation = world.process_snapshot().expect("enumeration");
 
     for record in &observation.records {
@@ -121,7 +177,7 @@ fn an_unavailable_path_states_a_reason_that_is_actually_true() {
 fn output_width_is_always_usable() {
     // Under a test harness stdout is not a terminal, so this exercises the fallback.
     // Zero would render a table with no columns at all.
-    let world = RealWorld::new();
+    let world = world();
     assert!(world.output_width() > 0, "a width of zero renders nothing");
 }
 
@@ -166,7 +222,7 @@ fn a_converted_cpu_time_agrees_with_what_ps_reports_independently() {
     // mach tick count; read as nanoseconds it is 41.67x too small on this hardware and
     // still internally consistent. Only an independent, coarser reader catches it —
     // here `ps`, which reports in centiseconds.
-    let world = RealWorld::new();
+    let world = world();
     let me = std::process::id() as i32;
 
     burn_own_cpu_for(Duration::from_millis(900));
@@ -204,7 +260,7 @@ fn child_cpu_includes_grandchildren_not_only_direct_children() {
     // the machine running the tests, and proves the chain really was two deep — a shell
     // that exec'd instead of forking would make this a direct-child test wearing a
     // grandchild's name.
-    let world = RealWorld::new();
+    let world = world();
     let me = std::process::id() as i32;
 
     let before = world
@@ -278,7 +334,7 @@ fn a_process_owned_by_another_user_falls_back_to_the_coarser_reader() {
         0,
         "this test describes what an unprivileged reader sees; as root the answer differs"
     );
-    let world = RealWorld::new();
+    let world = world();
 
     let reading = world
         .resources(1)
@@ -302,7 +358,7 @@ fn a_process_owned_by_another_user_falls_back_to_the_coarser_reader() {
 
 #[test]
 fn a_pid_that_has_exited_is_reported_as_exited_rather_than_as_idle() {
-    let world = RealWorld::new();
+    let world = world();
 
     let mut child = Command::new("/usr/bin/true").spawn().expect("spawn");
     let pid = child.id() as i32;
@@ -323,7 +379,7 @@ fn a_working_directory_is_read_in_the_same_pass_as_the_identity() {
     // §4.1: resolving cwd in a second pass produced six "unreadable" entries that were
     // simply dead processes. The value is checked against an independent source — what
     // this process itself believes its directory to be.
-    let world = RealWorld::new();
+    let world = world();
     let independent = std::env::current_dir().expect("this process has a working directory");
 
     let observation = world.process_snapshot().expect("enumeration");
@@ -344,7 +400,7 @@ fn a_working_directory_is_read_in_the_same_pass_as_the_identity() {
 fn an_unreadable_working_directory_is_absent_with_a_reason_never_an_empty_string() {
     // Roughly a third of processes on a real machine belong to another user and are not
     // readable. Those must carry a reason, not an empty string that reads as "root".
-    let world = RealWorld::new();
+    let world = world();
 
     let observation = world.process_snapshot().expect("enumeration");
 
@@ -372,7 +428,7 @@ fn the_recorded_namespaces_on_this_machine_are_listable_and_hold_no_underscores(
     // §4.3's corroboration, re-checked on the machine running the tests rather than
     // taken on trust from the document: if any recorded namespace contained an
     // underscore, the mapping rule would be wrong.
-    let world = RealWorld::new();
+    let world = world();
 
     let recorded = world
         .recorded_namespaces()
@@ -398,10 +454,9 @@ fn every_workspace_attribution_on_this_machine_is_true_in_both_directions() {
     // ones, and an unresolved one must really be absent — the second direction is what
     // catches a matcher that is too strict, which is how the underscore defect
     // presented: a calm "no session here" for a workspace that had one.
-    let world = world_with_scratch_state();
+    let world = world();
     let recorded = world.recorded_namespaces().expect("listable");
-    let snapshot = collect(&world, SystemTime::now(), &Thresholds::default())
-        .expect("collection over the real machine should succeed");
+    let snapshot = figures_only(&world);
 
     for session in &snapshot.sessions {
         let Ok(workspace) = &session.workspace else {
@@ -457,7 +512,7 @@ fn codex_sessions_from_the_real_machine_are_either_empty_or_well_formed() {
     // This machine may have zero recent Codex sessions, or it may have several. An empty
     // result is legitimate and not a failure — the test must not be vacuous in that case.
     // Invariants only: if sessions are returned, their shape must be correct.
-    let world = RealWorld::new();
+    let world = world();
 
     let sessions = world
         .codex_sessions()
@@ -493,7 +548,7 @@ fn every_recorded_namespace_has_an_activity_time_or_a_stated_reason() {
     // value would be the fail-to-zero defect this project exists to remove.
     use acmon::world::ActivityUnavailable;
 
-    let world = RealWorld::new();
+    let world = world();
     let recorded = world
         .recorded_namespaces()
         .expect("the transcript store should be listable");
@@ -541,7 +596,7 @@ fn every_recorded_namespace_has_an_activity_time_or_a_stated_reason() {
 fn a_namespace_that_does_not_exist_returns_not_recorded() {
     use acmon::world::ActivityUnavailable;
 
-    let world = RealWorld::new();
+    let world = world();
 
     // A name that cannot exist: contains characters that would be replaced by the slug
     // mapping, and is long enough to be unlikely to collide.
@@ -561,7 +616,7 @@ fn namespace_activity_agrees_with_an_independent_source() {
     // The activity time must agree with an independent reader: pick a namespace, find the
     // newest .jsonl in it with an independent command, and compare. Only a bound, not
     // exact equality — filesystem time resolution varies.
-    let world = RealWorld::new();
+    let world = world();
     let recorded = world
         .recorded_namespaces()
         .expect("the transcript store should be listable");
@@ -657,7 +712,7 @@ fn codex_sessions_carry_last_activity_within_the_recency_window() {
     // Every CodexSession returned must carry a last_activity, and that time must be
     // within the recency window the implementation uses, since that is the filter that
     // selected it. An empty list is legitimate — say so in a comment.
-    let world = RealWorld::new();
+    let world = world();
 
     let sessions = world
         .codex_sessions()
@@ -689,9 +744,8 @@ fn codex_sessions_carry_last_activity_within_the_recency_window() {
 fn no_session_may_be_stalled_while_its_process_is_resident() {
     // Invariant: a session with a resident process can be ACTIVE, WAITING, or UNKNOWN,
     // but never STALLED. STALLED requires the absence of a process, which is observable.
-    let world = world_with_scratch_state();
-    let snapshot = collect(&world, SystemTime::now(), &Thresholds::default())
-        .expect("collection over the real machine should succeed");
+    let world = world();
+    let snapshot = figures_only(&world);
 
     for session in &snapshot.sessions {
         if let acmon::Identity::Process { pid } = session.identity {
@@ -709,9 +763,8 @@ fn no_session_may_be_stalled_while_its_process_is_resident() {
 fn every_transcript_derived_session_has_process_resident_false() {
     // Invariant: a transcript-derived session exists precisely because its process is
     // gone. The liveness logic depends on this being false to reach the STALLED verdict.
-    let world = world_with_scratch_state();
-    let snapshot = collect(&world, SystemTime::now(), &Thresholds::default())
-        .expect("collection over the real machine should succeed");
+    let world = world();
+    let snapshot = figures_only(&world);
 
     // An empty result is legitimate — this machine may have no transcript-derived
     // sessions. The test proves only that whatever came back has the right shape.
@@ -743,7 +796,7 @@ fn repository_root_of_this_crates_directory_is_this_crate() {
     // work in linked worktrees under `.claude/worktrees/<name>` — so the test establishes
     // the expected value from `CARGO_MANIFEST_DIR/.git` (a file in a linked worktree, a
     // directory in a primary checkout) rather than asserting a location.
-    let world = RealWorld::new();
+    let world = world();
     let cwd = std::env::current_dir().expect("this test process has a working directory");
     let cwd_str = cwd.to_str().expect("a UTF-8 path");
 
@@ -784,7 +837,7 @@ fn repository_root_of_an_ancestorless_path_is_none() {
     // A path with no parent, such as `/`, cannot be inside a repository (unless someone
     // has created a repository at the filesystem root, which is not a real-world case).
     // This tests the termination condition of the ancestor walk.
-    let world = RealWorld::new();
+    let world = world();
 
     let result = world.repository_root("/");
 
@@ -798,7 +851,7 @@ fn repository_root_of_an_ancestorless_path_is_none() {
 fn vcs_facts_of_a_nonexistent_path_is_path_gone() {
     use acmon::vcs::Unreadable;
 
-    let world = RealWorld::new();
+    let world = world();
 
     // A path that cannot exist: contains a component that is unlikely to be real.
     let nonexistent = "/tmp/acmon-test-does-not-exist-e5a8f3b2-9c4d-4e1a-8b7f-3d2c1a0b9e8d";
@@ -816,7 +869,7 @@ fn vcs_facts_of_a_nonexistent_path_is_path_gone() {
 fn vcs_facts_of_a_non_repository_directory_is_not_version_controlled() {
     use acmon::vcs::Unreadable;
 
-    let world = RealWorld::new();
+    let world = world();
 
     // Create a temporary directory that is known not to be a repository.
     let temp_dir = std::env::temp_dir().join("acmon-test-not-a-repo");
@@ -840,7 +893,7 @@ fn vcs_facts_of_this_crate_agrees_with_repository_root() {
     // Invariant: the root reported by vcs_facts must match what repository_root said.
     // The count of uncommitted entries is deliberately NOT asserted — it varies between
     // runs as work progresses.
-    let world = RealWorld::new();
+    let world = world();
     let cwd = std::env::current_dir().expect("this test process has a working directory");
     let cwd_str = cwd.to_str().expect("a UTF-8 path");
 
@@ -996,7 +1049,7 @@ fn observing_a_repository_cannot_write_to_it() {
     // A DIFFERENT timestamp from the control arm — see `make_index_stale`.
     repository.make_index_stale("202001010101.01");
     let before = repository.index_bytes();
-    let facts = RealWorld::new()
+    let facts = world()
         .vcs_facts(&path)
         .expect("the probe repository is readable");
     let after = repository.index_bytes();
@@ -1021,7 +1074,7 @@ fn resolve_namespace_round_trips_this_crates_namespace() {
     // that namespace back to a directory. The result must be this directory.
     use acmon::workspace::{namespace_for, NamespaceResolution};
 
-    let world = RealWorld::new();
+    let world = world();
     let cwd = std::env::current_dir().expect("this test process has a working directory");
     let cwd_str = cwd.to_str().expect("a UTF-8 path");
 
@@ -1048,7 +1101,7 @@ fn resolve_namespace_of_a_nonexistent_namespace_is_no_longer_exists() {
     // a failure.
     use acmon::workspace::NamespaceResolution;
 
-    let world = RealWorld::new();
+    let world = world();
 
     // A name that cannot exist: long and contains characters unlikely to match
     let nonexistent = "does-not-exist-9f3e8a7b-2c1d-4e5f-6a7b-8c9d0e1f2a3b";
@@ -1066,7 +1119,7 @@ fn resolve_namespace_of_a_nonexistent_namespace_is_no_longer_exists() {
 fn sweep_finds_this_crate_and_reports_complete() {
     // Sweeping this crate's parent directory must find this crate, and must report
     // complete == true.
-    let world = RealWorld::new();
+    let world = world();
     let cwd = std::env::current_dir().expect("this test process has a working directory");
     let parent = cwd
         .parent()
@@ -1099,7 +1152,7 @@ fn sweep_finds_this_crate_and_reports_complete() {
 fn sweep_of_empty_roots_returns_complete_with_no_repositories() {
     // Sweeping an empty list of roots must return no repositories and complete == true.
     // An empty answer must still be a complete one.
-    let world = RealWorld::new();
+    let world = world();
 
     let sweep = world.sweep_for_repositories(&[]);
 
@@ -1120,7 +1173,7 @@ fn sweep_never_descends_into_a_repository() {
     // of this crate's parent is far smaller than the number of directories inside this
     // crate. Count them independently with std::fs to get a figure that does not recompute
     // the way the sweep does.
-    let world = RealWorld::new();
+    let world = world();
     let cwd = std::env::current_dir().expect("this test process has a working directory");
     let cwd_str = cwd.to_str().expect("a UTF-8 path");
     let parent = cwd
@@ -1166,7 +1219,7 @@ fn sweep_never_descends_into_a_repository() {
 #[test]
 fn every_path_in_a_sweep_is_absolute_and_unique() {
     // Every path in a sweep result must be absolute, and no path may be returned twice.
-    let world = RealWorld::new();
+    let world = world();
     let cwd = std::env::current_dir().expect("this test process has a working directory");
     let parent = cwd
         .parent()
@@ -1197,7 +1250,7 @@ fn vcs_facts_batch_returns_results_in_order() {
     // and assert positions 0 and 1 are equal Ok results and position 2 is Err(PathGone).
     use acmon::vcs::Unreadable;
 
-    let world = RealWorld::new();
+    let world = world();
     let cwd = std::env::current_dir().expect("this test process has a working directory");
     let cwd_str = cwd.to_str().expect("a UTF-8 path");
     let nonexistent = "/tmp/acmon-test-vcs-batch-does-not-exist-a1b2c3d4";
@@ -1266,7 +1319,7 @@ fn a_sweep_that_exhausts_its_budget_reports_incomplete_coverage() {
         std::fs::create_dir(root.join(format!("d{index}"))).expect("a child directory");
     }
 
-    let world = RealWorld::new();
+    let world = world();
     let sweep = world.sweep_for_repositories(&[root.to_string_lossy().into_owned()]);
 
     // Clean up before asserting, so a failure does not leave thousands of directories behind.
@@ -1284,5 +1337,362 @@ fn a_sweep_that_exhausts_its_budget_reports_incomplete_coverage() {
          exercise the bound at all",
         sweep.directories_visited,
         acmon::real_world::SWEEP_BUDGET
+    );
+}
+
+// --- What a collection here may and may not touch (#38) -----------------------------------------
+//
+// The two tests below are about the suite rather than about the machine, and they are here because
+// this is the file that collects against the real machine. Both work against a **stand-in** home
+// directory built in `TMPDIR`: a tree shaped exactly like a developer's, with the three files a run
+// resolves and a notification channel configured. Nothing here reads or writes the real
+// `~/.config/acmon`, `~/.local/state/acmon` or `~/.acmon` — asserting about those would make the
+// suite fail whenever a real `amon watch` happened to be running, which on this machine it usually
+// is.
+
+/// A stand-in for a developer's home: every file a run resolves, and a channel that leaves a mark.
+///
+/// Built rather than borrowed, for the same reason `ProbeRepository` above is: proving that a
+/// relocated collection cannot reach a machine's own files means having a machine's own files to
+/// aim at, and aiming at the developer's is the harm being prevented.
+struct StandInMachine {
+    home: PathBuf,
+    /// `~/.local/state/acmon/notified.json` — the notification dedupe record.
+    notified: PathBuf,
+    /// `~/.local/state/acmon/memory.json` — the remembered history.
+    memory: PathBuf,
+    /// `~/.acmon/state.json` — the pre-split history, which nothing may ever write (#36).
+    pre_split: PathBuf,
+    /// The file the configured channel appends every payload it is handed to.
+    ///
+    /// `cat` rather than `touch`: a mark that proved only that *something* ran could have been
+    /// left by anything, whereas a mark holding the payload came from a delivery.
+    mark: PathBuf,
+    /// The `local_command` written into the stand-in's `notify.toml`.
+    command: String,
+}
+
+impl StandInMachine {
+    fn create(name: &str) -> StandInMachine {
+        let home = scratch_root().join(name);
+        let _ = std::fs::remove_dir_all(&home);
+        let config = home.join(".config").join("acmon");
+        let state = home.join(".local").join("state").join("acmon");
+        let pre_split_dir = home.join(".acmon");
+        for directory in [&config, &state, &pre_split_dir] {
+            std::fs::create_dir_all(directory).expect("a directory in the stand-in home");
+        }
+
+        let mark = home.join("delivered-through-the-configured-channel");
+        let command = format!("/bin/cat >> {}", mark.display());
+        std::fs::write(
+            config.join("notify.toml"),
+            format!("local_command = \"{command}\"\n"),
+        )
+        .expect("configure the stand-in's channel");
+
+        // Distinctive, valid contents: a record and a history a run would read and honour, so that
+        // "unchanged" below means "a real file a real run would have rewritten", not "a scrap of
+        // text nothing was ever going to touch".
+        let notified = state.join("notified.json");
+        std::fs::write(
+            &notified,
+            acmon::notify::serialise(&acmon::notify::AnnouncementRecord {
+                sessions: Vec::new(),
+                workspaces: vec![(
+                    "/stand-in/announced-workspace".to_string(),
+                    acmon::notify::AnnouncedWorkspaceState::DirtyStranded,
+                )],
+            }),
+        )
+        .expect("write the stand-in's dedupe record");
+
+        let memory = state.join("memory.json");
+        std::fs::write(&memory, remembering("/stand-in/remembered-workspace"))
+            .expect("write the stand-in's history");
+
+        let pre_split = pre_split_dir.join("state.json");
+        std::fs::write(&pre_split, remembering("/stand-in/pre-split-workspace"))
+            .expect("write the stand-in's pre-split history");
+
+        StandInMachine {
+            home,
+            notified,
+            memory,
+            pre_split,
+            mark,
+            command,
+        }
+    }
+
+    /// A world resolving this machine's files the way an unrelocated run does.
+    ///
+    /// No directory named, so everything comes from the home — including the pre-split `~/.acmon`.
+    /// This is the arm that establishes the files below are the ones a run really uses.
+    fn as_that_machine(&self) -> RealWorld {
+        RealWorld::with_paths(
+            Paths::from_values(None, None, Some(&self.home.to_string_lossy()))
+                .expect("a home was given"),
+        )
+    }
+
+    /// A world built the way every test in this file builds one — with this machine's home still
+    /// there to be found.
+    ///
+    /// Strictly weaker than `world()`, which passes no home at all: this one has somewhere to go
+    /// wrong, which is the point. Its own scratch tree is separate from the shared one so that the
+    /// files it writes are this test's alone.
+    fn as_a_test_does(&self) -> RealWorld {
+        RealWorld::with_paths(scratch_paths(
+            &self.home.join("what-a-test-writes-instead"),
+            Some(&self.home.to_string_lossy()),
+        ))
+    }
+
+    /// Where a world built by `as_a_test_does` keeps its own state.
+    fn scratch_state_dir(&self) -> PathBuf {
+        self.home.join("what-a-test-writes-instead").join("state")
+    }
+
+    /// A workspace on this machine holding uncommitted work with nothing driving it, remembered in
+    /// the state a test's world reads — so a collection through that world has an alert to deliver.
+    ///
+    /// This is what stops the arm below being a hope. A collection with nothing notable to say asks
+    /// no channel anything at all, so a mark that never appeared would prove only that the machine
+    /// happened to be quiet. An untracked file is uncommitted work by this tool's own definition,
+    /// and a repository nobody is working in is stranded, which is the condition #9 alerts on.
+    fn with_something_worth_announcing(&self) -> String {
+        let workspace = self.home.join("stranded-workspace");
+        std::fs::create_dir_all(&workspace).expect("the workspace directory");
+        let initialised = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&workspace)
+            .status()
+            .expect("git is installed");
+        assert!(
+            initialised.success(),
+            "the stranded workspace has to be a repository, or nothing about it is notable"
+        );
+        std::fs::write(
+            workspace.join("work-nobody-committed.txt"),
+            "uncommitted work\n",
+        )
+        .expect("leave uncommitted work in it");
+
+        let path = workspace.to_string_lossy().into_owned();
+        let state = self.scratch_state_dir();
+        std::fs::create_dir_all(&state).expect("the scratch state directory");
+        std::fs::write(state.join("memory.json"), remembering(&path))
+            .expect("remember the workspace where a test's world will read it");
+        path
+    }
+
+    /// The three files that must be byte-for-byte identical after a test has collected.
+    fn own_files(&self) -> Vec<(&'static str, PathBuf, Vec<u8>)> {
+        [
+            ("the dedupe record", self.notified.clone()),
+            ("the remembered history", self.memory.clone()),
+            ("the pre-split history", self.pre_split.clone()),
+        ]
+        .into_iter()
+        .map(|(what, path)| {
+            let bytes = std::fs::read(&path).expect("a file the stand-in machine just wrote");
+            (what, path, bytes)
+        })
+        .collect()
+    }
+}
+
+/// One workspace, remembered — enough to make a state file that parses and is not empty.
+fn remembering(path: &str) -> String {
+    let now = SystemTime::now();
+    acmon::memory::serialise(&acmon::Memory {
+        workspaces: vec![acmon::memory::RememberedWorkspace {
+            path: path.to_string(),
+            first_seen: now,
+            last_seen: now,
+            settled_since: None,
+        }],
+        sessions: Vec::new(),
+    })
+}
+
+/// A monitor-role collection over this machine leaves the machine's own files alone.
+///
+/// The monitor's role deliberately: it is the role that writes, and the one every test in this file
+/// used to get by default. What makes this safe is not the role but where the world's directories
+/// point, and this test is the proof of that — it collects as a monitor, checks the writes really
+/// happened, and then checks they happened somewhere disposable.
+#[test]
+fn a_monitor_role_collection_writes_into_its_scratch_tree_and_not_into_the_machines_own_files() {
+    let machine = StandInMachine::create("relocated-writes");
+
+    // Provocation first. Without it, every "unchanged" assertion below could hold because the
+    // paths this test watches are not the ones a run resolves at all — a test that cannot fail.
+    let announced_by_that_machine =
+        acmon::notify::serialise(&acmon::notify::AnnouncementRecord::empty());
+    machine
+        .as_that_machine()
+        .write_notified(&announced_by_that_machine)
+        .expect("a world resolving that home must be able to write its dedupe record");
+    assert_eq!(
+        std::fs::read_to_string(&machine.notified).expect("readable"),
+        announced_by_that_machine,
+        "a write through a world resolving that home did not land in the file this test watches, \
+         so nothing below would prove anything about a relocated world"
+    );
+
+    let before = machine.own_files();
+
+    let snapshot = collect_as(
+        &machine.as_a_test_does(),
+        SystemTime::now(),
+        &Thresholds::default(),
+        Role::Monitor,
+    )
+    .expect("collection over the real machine should succeed");
+
+    // Assert the writes happened before believing anything about where they went: a collection
+    // that failed to write would leave every file below untouched for the wrong reason.
+    assert_eq!(
+        snapshot.remembered.persisted,
+        Persistence::Stored,
+        "a monitor-role collection stores its history, or this proves nothing"
+    );
+    assert_eq!(
+        snapshot.remembered.notified.persisted,
+        Persistence::Stored,
+        "and stores its dedupe record"
+    );
+    for file in ["memory.json", "notified.json"] {
+        let written = machine.scratch_state_dir().join(file);
+        assert!(
+            written.exists(),
+            "the collection's {file} must be in its own scratch state directory, at {}",
+            written.display()
+        );
+    }
+
+    for (what, path, bytes) in before {
+        assert_eq!(
+            std::fs::read(&path).expect("still readable"),
+            bytes,
+            "{what} at {} was written by a test collection",
+            path.display()
+        );
+    }
+}
+
+/// A channel configured on the machine running the suite cannot be reached from a test.
+///
+/// The second criterion of #38, and the reason it is worded the way it is: this suite was safe only
+/// because the machine it was written on has no `notify.toml`. The day one appears, `cargo test`
+/// delivers real notifications and — worse — records real conditions as already announced, so the
+/// monitor stays quiet about them and nothing anywhere says why.
+///
+/// Both arms use the same configured channel, and it is a real one: `sh -c` runs the command with
+/// the payload on its stdin, exactly as a delivery to a developer's notifier would.
+#[test]
+fn no_test_can_deliver_through_a_channel_configured_on_the_machine_it_runs_on() {
+    const PAYLOAD: &str = "seam 3 probe payload — no test may ever deliver this";
+    let machine = StandInMachine::create("configured-channel");
+    assert!(
+        !machine.mark.exists(),
+        "the mark must start absent, or its presence later says nothing"
+    );
+
+    // Provocation arm: on that machine, unrelocated, the channel is found and delivered through.
+    let as_that_machine = machine.as_that_machine();
+    let configured = as_that_machine.read_notify_config();
+    assert_eq!(
+        configured.local_command.as_deref(),
+        Some(machine.command.as_str()),
+        "a world resolving that home must find the channel configured in it, or the arm below \
+         proves only that a channel nobody could see delivered nothing"
+    );
+    let report = as_that_machine.notify_local_batch(&machine.command, &[PAYLOAD.to_string()]);
+    assert_eq!(
+        report.outcomes,
+        vec![NotifyOutcome::Delivered],
+        "and delivering through it must succeed, or the mark could be absent for its own reasons"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&machine.mark).expect("the channel's command left its mark"),
+        PAYLOAD,
+        "the mark carries the payload, so a mark is evidence of a delivery and not of a stray \
+         process"
+    );
+
+    std::fs::remove_file(&machine.mark).expect("clear the mark before the arm that matters");
+
+    // Subject arm: the world a test builds, on that same machine, with its `notify.toml` still
+    // sitting in the home this world was given. Naming the two directories is what takes it out of
+    // play, and no channel is configured in the scratch config directory.
+    let stranded = machine.with_something_worth_announcing();
+    let as_a_test_does = machine.as_a_test_does();
+    let seen_by_a_test = as_a_test_does.read_notify_config();
+    assert_eq!(
+        seen_by_a_test.local_command, None,
+        "a test's world must see no local channel, however the machine under it is configured"
+    );
+    assert_eq!(seen_by_a_test.remote_url, None, "nor a remote one");
+    assert_eq!(
+        seen_by_a_test.unusable, None,
+        "and it must report a config that is absent rather than one it could not read — the two \
+         are different states and only one of them is a fault"
+    );
+
+    // The monitor's role on purpose: the role that delivers, asked to collect the real machine.
+    let snapshot = collect_as(
+        &as_a_test_does,
+        SystemTime::now(),
+        &Thresholds::default(),
+        Role::Monitor,
+    )
+    .expect("collection over the real machine should succeed");
+
+    assert_eq!(
+        snapshot.remembered.notify_health.config.local_command, None,
+        "the run itself must report that it had no local channel to deliver through"
+    );
+    // And it really did run as a monitor with something to say. A collection that returned early,
+    // or one with nothing notable in it, would also leave no mark and would prove nothing about the
+    // channel.
+    assert_eq!(
+        snapshot.remembered.notified.persisted,
+        Persistence::Stored,
+        "a monitor-role collection records what it announced, so this run did reach the step \
+         where a delivery would have happened"
+    );
+    let stranded_now = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.path == stranded)
+        .unwrap_or_else(|| {
+            panic!(
+                "the remembered workspace {stranded} was not re-checked, so this run had nothing \
+                 to announce and the absent mark below means nothing; got {:?}",
+                snapshot
+                    .workspaces
+                    .iter()
+                    .map(|w| &w.path)
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        stranded_now.state,
+        acmon::vcs::WorkspaceState::DirtyStranded,
+        "and it holds uncommitted work with nothing driving it, which is what makes it notable"
+    );
+    assert!(
+        snapshot.remembered.notify_health.notable > 0,
+        "so the run had at least one alert in hand when it reached the delivery step"
+    );
+
+    assert!(
+        !machine.mark.exists(),
+        "a test collection delivered through the channel configured on the machine running it — \
+         the mark at {} was left behind",
+        machine.mark.display()
     );
 }

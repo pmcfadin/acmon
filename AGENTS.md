@@ -78,6 +78,15 @@ written here goes stale. Carried-forward notes GitHub would not tell you:
   new location has none, and the run says on screen that it did; nothing is moved, deleted, or
   written there ever. Naming either directory takes `~/.acmon/` out of play entirely, which is what
   makes a relocated run isolated rather than nearly isolated.
+- **No test may build a `RealWorld` with either directory left where it resolves by default, and no
+  test may spawn a binary with only one of the two variables set.** `RealWorld::with_paths` is the
+  only constructor that relocates, and `naming_memory`, `naming_notify_config` and
+  `naming_detectors` are **modifiers** on top of it — they used to be constructors, each of which
+  resolved the other two files from the environment, which is how every collection in seam 3 came to
+  write the developer's own `notified.json` on each `cargo suite` (#38). The config directory matters
+  as much as the state one: `notify.toml` lives there, so a test whose world or spawned binary
+  resolves it from the real home can deliver a real notification and record a real condition as
+  already announced — suppressing the alert the monitor would otherwise send.
 - The collection's ~2.5 s against a one-second budget **is fixed**, by tiering rather than by
   making anything faster: `amon watch` now measures its own cost at **0.37–0.47% of one core**
   over the trailing minute, inside NF9's 1%. A fast pass is ~49 ms, a medium pass ~207 ms, and

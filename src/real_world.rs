@@ -155,52 +155,73 @@ impl RealWorld {
         }
     }
 
-    /// The same world, keeping its memory in a named file instead of the usual one.
-    pub fn with_state_file(path: impl Into<std::path::PathBuf>) -> Self {
-        let path = path.into();
+    /// The same world with one of its files re-located, keeping the other two where they were.
+    ///
+    /// Private, and the three public modifiers below are its only callers, so that "name one file
+    /// outright" cannot be spelled anywhere without going through a world whose directories are
+    /// already settled.
+    fn naming(self, relocate: impl FnOnce(&mut OwnFiles)) -> Self {
+        let RealWorld {
+            observer_pid,
+            timebase,
+            files,
+            notify_request_budget,
+        } = self;
         RealWorld {
-            files: own_files().map(|files| OwnFiles {
-                memory: files.paths.locate_memory(Some(&path.to_string_lossy())),
-                ..files
+            observer_pid,
+            timebase,
+            notify_request_budget,
+            files: files.map(|mut files| {
+                relocate(&mut files);
+                files
             }),
-            ..RealWorld::new()
         }
+    }
+
+    /// The same world, keeping its memory in a named file instead of the usual one.
+    ///
+    /// A **modifier** rather than a constructor, and that is the whole of #38. As a constructor it
+    /// resolved the other two files from the environment, so a test that moved the memory file
+    /// somewhere disposable still had its notification dedupe record — and its notification
+    /// *config* — pointed at the developer's own directories. Every collection in
+    /// `tests/seam3_real_world.rs` wrote the real `notified.json` for exactly that reason. The
+    /// three below are the same shape for the same reason: relocating one file while leaving the
+    /// rest is the mistake #36 deleted `with_state_dir` for, and it grows back the moment there is
+    /// a constructor that does it.
+    pub fn naming_memory(self, path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        self.naming(|files| files.memory = files.paths.locate_memory(Some(&path.to_string_lossy())))
     }
 
     /// The same world, reading notification config from a named file.
-    pub fn with_notify_config(path: impl Into<std::path::PathBuf>) -> Self {
+    pub fn naming_notify_config(self, path: impl Into<std::path::PathBuf>) -> Self {
         let path = path.into();
-        RealWorld {
-            files: own_files().map(|files| OwnFiles {
-                notify_config: files
-                    .paths
-                    .locate_notify_config(Some(&path.to_string_lossy())),
-                ..files
-            }),
-            ..RealWorld::new()
-        }
+        self.naming(|files| {
+            files.notify_config = files
+                .paths
+                .locate_notify_config(Some(&path.to_string_lossy()))
+        })
     }
 
     /// The same world, reading detector config from a named file.
-    pub fn with_detectors(path: impl Into<std::path::PathBuf>) -> Self {
+    pub fn naming_detectors(self, path: impl Into<std::path::PathBuf>) -> Self {
         let path = path.into();
-        RealWorld {
-            files: own_files().map(|files| OwnFiles {
-                detectors: files.paths.locate_detectors(Some(&path.to_string_lossy())),
-                ..files
-            }),
-            ..RealWorld::new()
-        }
+        self.naming(|files| {
+            files.detectors = files.paths.locate_detectors(Some(&path.to_string_lossy()))
+        })
     }
 
     /// The same world, giving each notification — and each run's alerting step — less time.
     ///
     /// For tests about what happens when a channel will not answer. At the real budget of
     /// [`crate::deliver::REQUEST_BUDGET`] every such test would sit for ten seconds a case.
-    pub fn with_notify_request_budget(budget: Duration) -> Self {
+    ///
+    /// A modifier for the same reason as the three above: as a constructor it decided a budget and
+    /// silently decided the developer's own directories along with it.
+    pub fn with_notify_request_budget(self, budget: Duration) -> Self {
         RealWorld {
             notify_request_budget: budget,
-            ..RealWorld::new()
+            ..self
         }
     }
 

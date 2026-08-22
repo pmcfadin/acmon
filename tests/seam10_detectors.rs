@@ -30,6 +30,26 @@ fn scratch_detectors(name: &str, contents: Option<&str>) -> std::path::PathBuf {
     path
 }
 
+/// A world reading its detector configuration from a named file, with both its directories somewhere
+/// disposable.
+///
+/// Naming the detector file is not enough on its own: while this was a constructor it resolved the
+/// other two files from the environment, so a world reading a scratch `detectors.toml` still had the
+/// developer's own state directory for its notification dedupe record (#38). Both directories are
+/// named here as well, which also takes the pre-split `~/.acmon/` out of play (#36).
+fn world_reading_detectors(path: &std::path::Path) -> RealWorld {
+    let own = std::env::temp_dir().join(format!("acmon-seam10-{}-own", std::process::id()));
+    RealWorld::with_paths(
+        acmon::state::Paths::from_values(
+            Some(&own.join("config").to_string_lossy()),
+            Some(&own.join("state").to_string_lossy()),
+            None,
+        )
+        .expect("both directories were given explicitly"),
+    )
+    .naming_detectors(path)
+}
+
 // --- Core: user detectors are recognised ---
 
 #[test]
@@ -47,7 +67,7 @@ exe_contains = ["/cursor-agent/versions/"]
         ),
     );
 
-    let config = RealWorld::with_detectors(&detector_file).read_detector_config();
+    let config = world_reading_detectors(&detector_file).read_detector_config();
 
     assert_eq!(
         config.unusable, None,
@@ -93,7 +113,7 @@ exe_ends_with = ["/bin/claude-override"]
         ),
     );
 
-    let config = RealWorld::with_detectors(&detector_file).read_detector_config();
+    let config = world_reading_detectors(&detector_file).read_detector_config();
 
     assert_eq!(config.unusable, None);
 
@@ -123,7 +143,7 @@ exe_ends_with = ["/bin/claude-override"]
 #[test]
 fn a_machine_with_no_detector_config_uses_the_embedded_defaults() {
     let path = scratch_detectors("absent", None);
-    let config = RealWorld::with_detectors(&path).read_detector_config();
+    let config = world_reading_detectors(&path).read_detector_config();
 
     assert_eq!(
         config.unusable, None,
@@ -157,7 +177,7 @@ exe_contains = ]]not toml
 "#,
         ),
     );
-    let config = RealWorld::with_detectors(&path).read_detector_config();
+    let config = world_reading_detectors(&path).read_detector_config();
 
     let why = config
         .unusable
@@ -201,7 +221,7 @@ id = "cursor-agent"
 "#,
         ),
     );
-    let config = RealWorld::with_detectors(&path).read_detector_config();
+    let config = world_reading_detectors(&path).read_detector_config();
 
     let why = config
         .unusable
@@ -243,7 +263,7 @@ exe_ends_with = ["/bin/another"]
 "#,
         ),
     );
-    let config = RealWorld::with_detectors(&path).read_detector_config();
+    let config = world_reading_detectors(&path).read_detector_config();
 
     assert_eq!(config.unusable, None);
     assert!(
@@ -266,7 +286,7 @@ exe_ends_with = ["/bin/another"]
 fn an_empty_user_detector_file_is_treated_as_no_additions() {
     // A file with no [[detector]] entries at all — just an empty array.
     let path = scratch_detectors("empty", Some("detector = []\n"));
-    let config = RealWorld::with_detectors(&path).read_detector_config();
+    let config = world_reading_detectors(&path).read_detector_config();
 
     assert_eq!(
         config.unusable, None,
@@ -426,7 +446,7 @@ exe_contains = ["/cursor-agent/versions/"]
     );
 
     // Read it.
-    let _ = RealWorld::with_detectors(&path).read_detector_config();
+    let _ = world_reading_detectors(&path).read_detector_config();
 
     // The file should still exist and have exactly the contents we wrote.
     let contents = std::fs::read_to_string(&path)

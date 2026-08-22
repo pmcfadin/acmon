@@ -401,6 +401,29 @@ fn scratch_state(name: &str) -> PathBuf {
     directory
 }
 
+/// A world whose two directories are both named into a scratch tree of this seam's own.
+///
+/// The `RealWorld` tests below only read a config file or run a command, but a world built with
+/// either directory left where it resolves by default is pointed at the developer's own
+/// `~/.local/state/acmon` — and one collection added to a test later is all it takes for that to
+/// matter (#38). Naming both also takes the pre-split `~/.acmon/` out of play (#36).
+fn relocated_world() -> acmon::RealWorld {
+    let own = std::env::temp_dir().join(format!("acmon-seam9-{}-own", std::process::id()));
+    acmon::RealWorld::with_paths(
+        Paths::from_values(
+            Some(&own.join("config").to_string_lossy()),
+            Some(&own.join("state").to_string_lossy()),
+            None,
+        )
+        .expect("both directories were given explicitly"),
+    )
+}
+
+/// The same world, reading its notification configuration from a named file.
+fn world_reading_config(path: &std::path::Path) -> acmon::RealWorld {
+    relocated_world().naming_notify_config(path)
+}
+
 /// The record an earlier run would have left for a session announced as WAITING.
 fn session_announced_waiting() -> AnnouncementRecord {
     AnnouncementRecord {
@@ -1826,7 +1849,7 @@ fn scratch_config(name: &str, contents: Option<&str>) -> std::path::PathBuf {
 #[test]
 fn a_machine_with_no_notification_config_is_not_reported_as_broken() {
     let path = scratch_config("absent", None);
-    let config = acmon::RealWorld::with_notify_config(&path).read_notify_config();
+    let config = world_reading_config(&path).read_notify_config();
 
     assert_eq!(
         config.unusable, None,
@@ -1847,7 +1870,7 @@ fn a_malformed_notification_config_carries_the_specific_error() {
         "malformed",
         Some("local_command = \nremote_url = ]]not toml"),
     );
-    let config = acmon::RealWorld::with_notify_config(&path).read_notify_config();
+    let config = world_reading_config(&path).read_notify_config();
 
     let why = config
         .unusable
@@ -1877,7 +1900,7 @@ fn a_well_formed_notification_config_is_read_and_reports_no_problem() {
         "valid",
         Some("local_command = \"terminal-notifier -message -\"\nremote_url = \"https://example.invalid/hook\"\n"),
     );
-    let config = acmon::RealWorld::with_notify_config(&path).read_notify_config();
+    let config = world_reading_config(&path).read_notify_config();
 
     assert_eq!(config.unusable, None);
     assert_eq!(
@@ -1900,7 +1923,7 @@ fn a_configured_but_blank_channel_counts_as_absent_rather_than_as_a_command() {
         "blank",
         Some("local_command = \"   \"\nremote_url = \"\"\n"),
     );
-    let config = acmon::RealWorld::with_notify_config(&path).read_notify_config();
+    let config = world_reading_config(&path).read_notify_config();
 
     assert_eq!(config.unusable, None, "a blank value is not malformed");
     assert!(
@@ -1928,7 +1951,7 @@ const SHORT_BUDGET: Duration = Duration::from_millis(250);
 #[test]
 fn many_local_deliveries_do_not_cost_one_wait_each() {
     const PER_DELIVERY: &str = "sleep 0.4";
-    let world = acmon::RealWorld::new();
+    let world = relocated_world();
 
     // One delivery first, to establish what a single wait costs on this machine right now —
     // and to assert it succeeded before any timing is believed.
@@ -1963,7 +1986,7 @@ fn a_local_command_that_never_exits_is_reported_as_a_failure_rather_than_waited_
     // Before this ticket the wait was unbounded. A notifier that never exits — a helper waiting
     // on a dialog, a command left in the config that reads stdin forever — stopped the
     // collection returning at all, and a monitor that has not returned is not monitoring.
-    let world = acmon::RealWorld::with_notify_request_budget(SHORT_BUDGET);
+    let world = relocated_world().with_notify_request_budget(SHORT_BUDGET);
 
     let started = std::time::Instant::now();
     let outcome = world.notify_local("sleep 30", "Workspace /w is STRANDED");
@@ -1991,7 +2014,7 @@ fn a_run_whose_local_channel_hangs_states_what_it_did_not_send() {
     // notable states than one run's budget can carry. What must not happen is a run that sits
     // for alert-count times the budget, and what must not happen instead is a run that quietly
     // forgets the alerts it never sent.
-    let world = acmon::RealWorld::with_notify_request_budget(SHORT_BUDGET);
+    let world = relocated_world().with_notify_request_budget(SHORT_BUDGET);
     let payloads = alerts(12);
 
     let report = world.notify_local_batch("sleep 30", &payloads);

@@ -1476,7 +1476,18 @@ fn a_collection_leaves_the_git_index_of_an_observed_repository_untouched() {
         .modified()
         .expect("its modification time is readable");
 
-    let world = acmon::RealWorld::new();
+    // Both directories named into a scratch tree, so this world's own three files are nowhere near
+    // the developer's (#38). Nothing here writes any of them, and that is precisely why it is worth
+    // doing by construction rather than by noticing.
+    let own = scratch("observed-repo-own");
+    let world = acmon::RealWorld::with_paths(
+        Paths::from_values(
+            Some(&own.join("config").to_string_lossy()),
+            Some(&own.join("state").to_string_lossy()),
+            None,
+        )
+        .expect("both directories were given explicitly"),
+    );
     let facts = world.vcs_facts(repository.to_str().expect("utf-8"));
     assert!(
         facts.is_ok(),

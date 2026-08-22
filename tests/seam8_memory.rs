@@ -1063,6 +1063,27 @@ fn scratch(name: &str) -> std::path::PathBuf {
     directory
 }
 
+/// A real world whose memory file is at `path`, and whose two directories are somewhere disposable.
+///
+/// The tests below are about a named memory file — `ACMON_STATE`'s own case, and the one where the
+/// file has to be somewhere a directory cannot even be created. Naming it is not enough on its own:
+/// while `RealWorld::with_state_file` was a *constructor* it resolved the other two files from the
+/// environment, so a world with a scratch memory file still had the developer's own state directory
+/// for its notification dedupe record (#38). Both directories are named here as well, which also
+/// takes the pre-split `~/.acmon/` out of play (#36).
+fn world_remembering_in(path: &std::path::Path) -> acmon::RealWorld {
+    let own = std::env::temp_dir().join(format!("acmon-seam8-{}-own", std::process::id()));
+    acmon::RealWorld::with_paths(
+        acmon::state::Paths::from_values(
+            Some(&own.join("config").to_string_lossy()),
+            Some(&own.join("state").to_string_lossy()),
+            None,
+        )
+        .expect("both directories were given explicitly"),
+    )
+    .naming_memory(path)
+}
+
 /// A state file big enough that a partial write would be observable — a torn 200-byte file is
 /// easy to miss, a torn 100 kB one is not.
 fn a_large_memory(entries: usize) -> Memory {
@@ -1083,7 +1104,7 @@ fn a_large_memory(entries: usize) -> Memory {
 fn the_state_file_is_created_along_with_the_directory_it_lives_in() {
     let directory = scratch("creates");
     let path = directory.join("state.json");
-    let world = acmon::RealWorld::with_state_file(&path);
+    let world = world_remembering_in(&path);
 
     assert_eq!(
         world.read_state(),
@@ -1116,7 +1137,7 @@ fn a_concurrent_reader_never_observes_a_half_written_state_file() {
     let path = directory.join("state.json");
     std::fs::create_dir_all(&directory).expect("scratch directory");
 
-    let writer_world = acmon::RealWorld::with_state_file(&path);
+    let writer_world = world_remembering_in(&path);
     // Two sizes, alternating, so a stale read is distinguishable from a torn one: a reader
     // that never saw both entry counts would prove nothing about the writes overlapping.
     let small = memory::serialise(&a_large_memory(40));
@@ -1131,7 +1152,7 @@ fn a_concurrent_reader_never_observes_a_half_written_state_file() {
 
     std::thread::scope(|scope| {
         let reader = scope.spawn(|| {
-            let reader_world = acmon::RealWorld::with_state_file(&path);
+            let reader_world = world_remembering_in(&path);
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 match reader_world.read_state() {
                     StateRead::Found(text) => {
@@ -1200,7 +1221,7 @@ fn a_state_file_that_cannot_be_written_reports_where_and_why() {
     let blocking_file = directory.join("not-a-directory");
     std::fs::write(&blocking_file, b"in the way").expect("write the obstacle");
 
-    let world = acmon::RealWorld::with_state_file(blocking_file.join("state.json"));
+    let world = world_remembering_in(&blocking_file.join("state.json"));
 
     let refused = world
         .write_state("{}")

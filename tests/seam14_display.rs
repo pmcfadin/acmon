@@ -2916,6 +2916,10 @@ fn agtop_refuses_the_screen_when_there_is_no_terminal_to_take() {
 
     let output = Process::new(env!("CARGO_BIN_EXE_agtop"))
         .env(acmon::state::STATE_DIR_VARIABLE, directory.join("state"))
+        // The config directory too, as every other spawn here does: between them the two move
+        // everything a run touches (#36), and a run that read the developer's own `notify.toml`
+        // would be a test reaching a channel configured on the machine it happens to run on (#38).
+        .env(acmon::state::CONFIG_DIR_VARIABLE, directory.join("config"))
         .output()
         .expect("running agtop");
 
